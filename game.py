@@ -210,6 +210,24 @@ class LockDamVisualizer:
         pygame.draw.line(self.screen, self.WATER_SHIMMER,
                          (inner_x, lk_y), (inner_x + inner_w, lk_y), 2)
         self._lane_divider(inner_x, inner_w, lk_y)
+        
+        # Turbulent water effects when filling or draining
+        if self.lock_dam.is_filling or self.lock_dam.is_draining:
+            t = self.time * 4
+            for i in range(20):
+                # Deterministic positions with oscillation
+                rx = (math.sin(i * 1.5 + t) * 0.5 + 0.5) * inner_w
+                ry = (math.cos(i * 2.3 + t * 0.7) * 0.5 + 0.5) * 35
+                bx = inner_x + int(rx)
+                by = lk_y + int(ry)
+                if by < self._water_bot_y:
+                    size = 1 + int(2 * (math.sin(t * 2 + i) * 0.5 + 0.5))
+                    pygame.draw.circle(self.screen, (220, 245, 255), (bx, by), size)
+                # Extra white surface streaks
+                sx = inner_x + ( (i * 17 + t * 40) % inner_w )
+                sw = 10 + 5 * math.sin(i + t)
+                if lk_y < self._water_bot_y:
+                    pygame.draw.line(self.screen, (240, 250, 255), (sx, lk_y + 1), (sx + sw, lk_y + 1), 2)
 
         # Concrete cap and walls
         pygame.draw.rect(self.screen, self.CONCRETE,
@@ -635,9 +653,14 @@ class LockDamVisualizer:
             self.screen.blit(
                 self.fnt_sm.render(f"{label}: {'OPEN' if open_ else 'CLOSED'}", True, col),
                 (gx + 10, gy + 24 + gi * 22))
+        # Show fill/drain status
+        status_text = f"Chamber: {self.lock_dam.lock_chamber_level:.1f} m"
+        if self.lock_dam.is_filling:
+            status_text += " (Filling...)"
+        elif self.lock_dam.is_draining:
+            status_text += " (Draining...)"
         self.screen.blit(
-            self.fnt_sm.render(
-                f"Chamber: {self.lock_dam.lock_chamber_level:.1f} m", True, (100, 200, 255)),
+            self.fnt_sm.render(status_text, True, (100, 200, 255)),
             (gx + 10, gy + 68))
 
         if self.incidents:
@@ -724,6 +747,7 @@ class LockDamVisualizer:
             else:
                 running = self.handle_input()
                 self.time += 1 / 60
+                self.lock_dam.update(1 / 60)
                 self._spawn_if_needed()
                 self._update_agents()
 

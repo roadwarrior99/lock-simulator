@@ -8,20 +8,37 @@ class LockAndDam:
         self.is_draining = False
         self.upstream_gates_open = False
         self.downstream_gates_open = False
-    
+        self.fill_rate = 0.4  # m/s
+
     def fill_chamber(self):
-        """Fill lock chamber to upstream level"""
-        if not self.is_draining:
-            self.is_filling = True
-            self.lock_chamber_level = self.upstream_level
-            self.is_filling = False
-    
+        """Start filling lock chamber to upstream level"""
+        self.is_filling = True
+        self.is_draining = False
+
     def drain_chamber(self):
-        """Drain lock chamber to downstream level"""
-        if not self.is_filling:
-            self.is_draining = True
-            self.lock_chamber_level = self.downstream_level
-            self.is_draining = False
+        """Start draining lock chamber to downstream level"""
+        self.is_draining = True
+        self.is_filling = False
+
+    def update(self, dt):
+        """Gradually change water level if filling or draining."""
+        if self.is_filling:
+            if self.lock_chamber_level < self.upstream_level:
+                self.lock_chamber_level += self.fill_rate * dt
+                if self.lock_chamber_level >= self.upstream_level:
+                    self.lock_chamber_level = self.upstream_level
+                    self.is_filling = False
+            else:
+                self.is_filling = False
+
+        if self.is_draining:
+            if self.lock_chamber_level > self.downstream_level:
+                self.lock_chamber_level -= self.fill_rate * dt
+                if self.lock_chamber_level <= self.downstream_level:
+                    self.lock_chamber_level = self.downstream_level
+                    self.is_draining = False
+            else:
+                self.is_draining = False
     
     def open_upstream_gates(self):
         """Open upstream gates"""
