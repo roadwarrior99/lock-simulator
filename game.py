@@ -71,8 +71,8 @@ class LockDamVisualizer:
         self.canal     = Canal("Main Canal")
         self.agents    = []
 
-        self.lock_start = 250    # upstream gate (sim coords)
-        self.lock_end   = 750    # downstream gate
+        self.lock_start = 350    # upstream gate (sim coords)
+        self.lock_end   = 650    # downstream gate
 
         # ── Shore-view layout constants ───────────────────────────────────────
         # sim x ∈ [0, 1000]  →  screen x ∈ [50, 1150]
@@ -99,14 +99,56 @@ class LockDamVisualizer:
         self._boat_counter   = 0
         self._next_direction = 1     # alternates each spawn
 
+        # ── Weather ───────────────────────────────────────────────────────────
+        self.clouds = []
+        for _ in range(12):
+            self.clouds.append({
+                'x': random.uniform(-100, 1100),
+                'y': random.uniform(10, 140),
+                'w': random.uniform(80, 180),
+                'h': random.uniform(40, 70),
+                'speed': random.uniform(0.05, 0.15)
+            })
+        self.rain_active = False
+        self.weather_timer = random.randint(1000, 3000)
+        self.rain_drops = []
+        for _ in range(160):
+            self.rain_drops.append({
+                'x': random.randint(0, self.width),
+                'y': random.randint(0, self.height),
+                's': random.randint(5, 12)
+            })
+        self.lightning_timer = 0
+        self.lightning_bolt = None
+
+        # ── Nature ────────────────────────────────────────────────────────────
+        self.trees = []
+        # Pre-calculate tree positions in sim-space
+        for x in range(40, 310, 80): # Upstream
+            self.trees.append({'x': x, 'type': 'up'})
+        for x in range(690, 960, 80): # Downstream
+            self.trees.append({'x': x, 'type': 'down'})
+
+        self.birds = []
+        for _ in range(6):
+            self.birds.append({
+                'x': random.uniform(0, self.width),
+                'y': random.uniform(50, 150),
+                'vx': random.uniform(0.5, 1.5),
+                'vy': random.uniform(-0.2, 0.2),
+                'state': 'flying', # 'flying', 'homing', 'sleeping'
+                'target_tree': None,
+                'wing_phase': random.uniform(0, math.pi * 2)
+            })
+
         # Fonts
         self.fnt_lg = pygame.font.Font(None, 42)
         self.fnt_md = pygame.font.Font(None, 28)
         self.fnt_sm = pygame.font.Font(None, 22)
 
         # Seed two initial boats
-        self._spawn_boat( 1,  50)
-        self._spawn_boat(-1, 880)
+        self._spawn_boat( 1,  100)
+        self._spawn_boat(-1, 900)
 
     # ── Coordinate helpers ────────────────────────────────────────────────────
 
@@ -139,11 +181,20 @@ class LockDamVisualizer:
 
     def _get_ambient_mult(self):
         h = self.game_time
-        if 8.0 <= h < 16.0: return 1.0
-        if 16.0 <= h < 20.0: return 1.0 - (h - 16.0) / 4.0 * 0.7  # Dims to 0.3
-        if 20.0 <= h or h < 5.0: return 0.3
-        if 5.0 <= h < 8.0: return 0.3 + (h - 5.0) / 3.0 * 0.7  # Brightens to 1.0
-        return 1.0
+        if 8.0 <= h < 16.0: 
+            mult = 1.0
+        elif 16.0 <= h < 20.0: 
+            mult = 1.0 - (h - 16.0) / 4.0 * 0.7  # Dims to 0.3
+        elif 20.0 <= h or h < 5.0: 
+            mult = 0.3
+        elif 5.0 <= h < 8.0: 
+            mult = 0.3 + (h - 5.0) / 3.0 * 0.7  # Brightens to 1.0
+        else:
+            mult = 1.0
+        
+        if self.rain_active:
+            mult *= 0.75  # Darker when raining
+        return mult
 
     def _get_sky_colors(self):
         h = self.game_time
@@ -199,6 +250,72 @@ class LockDamVisualizer:
     def _draw_sky(self, bottom_y):
         top, bot = self._get_sky_colors()
         self._gradient_rect(top, bot, (0, 0, self.width, bottom_y))
+        self._draw_clouds(bottom_y)
+
+    def _draw_clouds(self, sky_h):
+        mult = self._get_ambient_mult()
+        cloud_v = 240 if not self.rain_active else 150
+        cloud_col = self._dim((cloud_v, cloud_v, cloud_v), mult)
+        
+        for c in self.clouds:
+            cx, cy = int(c['x']), int(c['y'])
+            cw, ch = int(c['w']), int(c['h'])
+            # Only draw if cloud is within sky area
+            if cy > sky_h: continue
+            
+            # Simple puffy cloud using 3 ellipses
+            pygame.draw.ellipse(self.screen, cloud_col, (cx, cy, cw, ch))
+            pygame.draw.ellipse(self.screen, cloud_col, (cx + cw//4, cy - ch//2, cw//2, ch))
+            pygame.draw.ellipse(self.screen, cloud_col, (cx + cw//2, cy, cw//2, ch))
+
+    def _draw_birds(self):
+        mult = self._get_ambient_mult()
+        bird_col = self._dim((20, 20, 20), mult)
+        for b in self.birds:
+            if b['state'] == 'sleeping':
+                continue
+            
+            bx, by = b['x'], b['y']
+            # Wing flap
+            wing = math.sin(self.time * 15 + b['wing_phase']) * 4
+            pygame.draw.line(self.screen, bird_col, (bx, by), (bx - 4, by - 2 + wing), 1)
+            pygame.draw.line(self.screen, bird_col, (bx, by), (bx + 4, by - 2 + wing), 1)
+
+    def _draw_tree(self, sx, sy):
+        mult = self._get_ambient_mult()
+        trunk_col = self._dim((101, 67, 33), mult)
+        leaf_col = self._dim((34, 139, 34), mult)
+        
+        # Trunk
+        pygame.draw.rect(self.screen, trunk_col, (sx - 3, sy - 15, 6, 15))
+        # Canopy
+        pygame.draw.circle(self.screen, leaf_col, (sx, sy - 22), 12)
+        pygame.draw.circle(self.screen, leaf_col, (sx - 8, sy - 18), 9)
+        pygame.draw.circle(self.screen, leaf_col, (sx + 8, sy - 18), 9)
+
+    def _draw_rain(self):
+        if not self.rain_active:
+            return
+        mult = self._get_ambient_mult()
+        # Rain is less visible at night
+        alpha = int(180 * mult)
+        rain_col = (180, 200, 255, alpha)
+        
+        rain_surf = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        for d in self.rain_drops:
+            pygame.draw.line(rain_surf, rain_col, (d['x'], d['y']), (d['x'] - 2, d['y'] + 8), 1)
+        self.screen.blit(rain_surf, (0, 0))
+
+    def _draw_lightning(self):
+        if self.lightning_timer > 0 and self.lightning_bolt:
+            # Flash effect
+            flash_alpha = min(150, self.lightning_timer * 30)
+            flash_surf = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+            flash_surf.fill((255, 255, 255, flash_alpha))
+            self.screen.blit(flash_surf, (0, 0))
+            
+            # Bolt
+            pygame.draw.lines(self.screen, (255, 255, 255), False, self.lightning_bolt, 2)
 
     def _draw_water_band(self, x, y, w):
         h = self._water_bot_y - y
@@ -268,7 +385,7 @@ class LockDamVisualizer:
         
         # Turbulent water effects when filling or draining
         if self.lock_dam.is_filling or self.lock_dam.is_draining:
-            t = self.time * 4
+            t = self.time * 2
             bubble_col = self._interp_col((220, 245, 255), (50, 60, 80), 1.0 - mult)
             streak_col = self._interp_col((240, 250, 255), (70, 80, 100), 1.0 - mult)
             for i in range(20):
@@ -306,6 +423,13 @@ class LockDamVisualizer:
                               self.lock_dam.upstream_gates_open, faces_right=True)
         self._draw_miter_gate(lk_ex - wall_t, wall_top, self._water_bot_y,
                               self.lock_dam.downstream_gates_open, faces_right=False)
+
+        # Trees
+        for tree in self.trees:
+            sx = self._sx(tree['x'])
+            if tree['type'] == 'up': sy = up_y - 38
+            else: sy = dn_y - 38
+            self._draw_tree(sx, sy)
 
         # Boats
         for ag in self.agents:
@@ -597,6 +721,100 @@ class LockDamVisualizer:
 
     # ── Agent simulation ──────────────────────────────────────────────────────
 
+    def _update_weather(self, dt):
+        # Move clouds
+        for c in self.clouds:
+            c['x'] += c['speed']
+            if c['x'] > self.width + 100:
+                c['x'] = -200
+                c['y'] = random.uniform(10, 140)
+
+        # Weather state transitions
+        self.weather_timer -= 1
+        if self.weather_timer <= 0:
+            self.rain_active = not self.rain_active
+            if self.rain_active:
+                self.weather_timer = random.randint(1200, 2400) # Rain lasts 20-40s
+            else:
+                self.weather_timer = random.randint(3600, 9000) # Clear lasts 1-2.5m
+
+        # Update rain drops
+        if self.rain_active:
+            for d in self.rain_drops:
+                d['y'] += d['s']
+                d['x'] -= 2 # slanted rain
+                if d['y'] > self.height:
+                    d['y'] = -10
+                    d['x'] = random.randint(0, self.width + 100)
+            
+            # Lightning logic
+            if self.lightning_timer > 0:
+                self.lightning_timer -= 1
+                if self.lightning_timer == 0:
+                    self.lightning_bolt = None
+            elif random.random() < 0.003: # ~1 strike every 5-6 seconds on avg during rain
+                self.lightning_timer = random.randint(5, 12)
+                bx = random.randint(100, self.width - 100)
+                by = 0
+                self.lightning_bolt = [(bx, by)]
+                for _ in range(6):
+                    by += random.randint(40, 100)
+                    bx += random.randint(-50, 50)
+                    self.lightning_bolt.append((bx, by))
+
+    def _update_nature(self, dt):
+        h = self.game_time
+        is_day = 6.0 <= h < 19.5
+        
+        for b in self.birds:
+            if is_day:
+                if b['state'] == 'sleeping' or b['state'] == 'homing':
+                    b['state'] = 'flying'
+                    b['vx'] = random.uniform(0.5, 1.5)
+                    b['vy'] = random.uniform(-0.3, 0.3)
+                
+                # Normal flight
+                b['x'] += b['vx']
+                b['y'] += b['vy']
+                
+                # Randomly change direction slightly
+                if random.random() < 0.01:
+                    b['vx'] = random.uniform(0.5, 1.5)
+                    b['vy'] = random.uniform(-0.3, 0.3)
+                
+                # Screen wrap
+                if b['x'] > self.width + 20:
+                    b['x'] = -20
+                    b['y'] = random.uniform(50, 150)
+                elif b['x'] < -20:
+                    b['x'] = self.width + 20
+                    b['y'] = random.uniform(50, 150)
+            else:
+                # Night time - go to sleep
+                if b['state'] == 'flying':
+                    b['state'] = 'homing'
+                    b['target_tree'] = random.choice(self.trees)
+                
+                if b['state'] == 'homing':
+                    # Find target screen coords
+                    tree = b['target_tree']
+                    tx = self._sx(tree['x'])
+                    ty = 0
+                    if tree['type'] == 'up': ty = self._wy(self.lock_dam.upstream_level) - 45
+                    elif tree['type'] == 'chamber': ty = self._wy(self.lock_dam.lock_chamber_level) - 45
+                    else: ty = self._wy(self.lock_dam.downstream_level) - 45
+                    
+                    dx = tx - b['x']
+                    dy = ty - b['y']
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    if dist < 3:
+                        b['state'] = 'sleeping'
+                        b['x'], b['y'] = tx, ty
+                    else:
+                        speed = 3.0
+                        b['x'] += (dx / dist) * speed
+                        b['y'] += (dy / dist) * speed
+
     def _spawn_boat(self, direction, position=None):
         self._boat_counter += 1
         h = self.game_time
@@ -678,6 +896,7 @@ class LockDamVisualizer:
         # Boats inside the lock stopping at a closed gate use the inner wall face
         # so they don't visually clip into the concrete.
         wt = self._wall_t_sim
+        gate_gap = 12
         if d == 1:
             gate_order = [
                 (self.lock_start,      self.lock_dam.upstream_gates_open),   # entry — outer face
@@ -693,16 +912,16 @@ class LockDamVisualizer:
             if open_:
                 continue
             if d == 1:
-                if boat.position + boat.length <= gate_x < new_pos + boat.length:
-                    boat.position = gate_x - boat.length
+                if boat.position + boat.length <= gate_x - gate_gap < new_pos + boat.length:
+                    boat.position = gate_x - boat.length - gate_gap
                     return
             else:
-                if boat.position >= gate_x > new_pos:
-                    boat.position = gate_x
+                if boat.position >= gate_x + gate_gap > new_pos:
+                    boat.position = gate_x + gate_gap
                     return
 
         # ── Same-lane boat blocking (same direction only) ────────────────────────
-        gap = 5
+        gap = 25
         if d == 1:
             ahead = sorted(
                 [o for o in all_active if o is not ag
@@ -921,6 +1140,8 @@ class LockDamVisualizer:
                 # Advance game time: (seconds * hours/minute) / 60 seconds/minute = hours
                 self.game_time = (self.game_time + (dt * self.time_scale) / 60.0) % 24
                 self.lock_dam.update(dt)
+                self._update_weather(dt)
+                self._update_nature(dt)
                 self._spawn_if_needed()
                 self._update_agents()
 
@@ -928,6 +1149,10 @@ class LockDamVisualizer:
             self.screen.fill(self.SKY_BOTTOM)
 
             self.draw_shore_view()
+
+            self._draw_birds()
+            self._draw_rain()
+            self._draw_lightning()
 
             self.draw_ui()
 
