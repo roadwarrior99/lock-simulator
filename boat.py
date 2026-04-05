@@ -52,3 +52,7 @@ class Yacht(Boat):
 class Barge(Boat):
     def __init__(self, name, length=60):
         super().__init__(name, length, 10, 3, "barge")
+
+class PaddleBoat(Boat):
+    def __init__(self, name):
+        super().__init__(name, 35, 12, 2.5, "paddleboat")

@@ -3,7 +3,7 @@ import sys
 import math
 import random
 from lock_and_dam import LockAndDam
-from boat import Yacht, Barge, Kayak
+from boat import Yacht, Barge, Kayak, PaddleBoat
 from waterway import Canal
 
 
@@ -63,6 +63,7 @@ class LockDamVisualizer:
             "Yacht": (230, 230, 230),
             "Barge": (175, 135,  75),
             "Kayak": (235,  95,  35),
+            "PaddleBoat": (180, 60, 60),
         }
 
         # ── Simulation ────────────────────────────────────────────────────────
@@ -70,8 +71,8 @@ class LockDamVisualizer:
         self.canal     = Canal("Main Canal")
         self.agents    = []
 
-        self.lock_start = 500    # upstream gate (sim coords)
-        self.lock_end   = 700    # downstream gate
+        self.lock_start = 250    # upstream gate (sim coords)
+        self.lock_end   = 750    # downstream gate
 
         # ── Shore-view layout constants ───────────────────────────────────────
         # sim x ∈ [0, 1000]  →  screen x ∈ [50, 1150]
@@ -104,7 +105,7 @@ class LockDamVisualizer:
         self.fnt_sm = pygame.font.Font(None, 22)
 
         # Seed two initial boats
-        self._spawn_boat( 1, 150)
+        self._spawn_boat( 1,  50)
         self._spawn_boat(-1, 880)
 
     # ── Coordinate helpers ────────────────────────────────────────────────────
@@ -312,10 +313,10 @@ class LockDamVisualizer:
                 self._draw_boat_shore(ag, up_y, dn_y, lk_y, lk_sx, lk_ex)
 
         # Water level labels
-        self._wl_label(lk_sx // 2, up_y, "Upstream", self.lock_dam.upstream_level)
-        self._wl_label(lk_ex + (self.width - lk_ex) // 2, dn_y,
+        self._wl_label((self._sx_offset + lk_sx) // 2, up_y, "Upstream", self.lock_dam.upstream_level)
+        self._wl_label((lk_ex + self._sx(1000)) // 2, dn_y,
                        "Downstream", self.lock_dam.downstream_level)
-        self._wl_label(lk_sx + lk_w // 2, lk_y,
+        self._wl_label((lk_sx + lk_ex) // 2, lk_y,
                        "Chamber", self.lock_dam.lock_chamber_level)
 
     def _draw_miter_gate(self, gate_x, wall_top, floor_y, is_open, faces_right):
@@ -473,6 +474,68 @@ class LockDamVisualizer:
                 # Nav light on tug
                 pygame.draw.circle(self.screen, self.WHITE, (tx + tug_w//2, ty_tug), 2)
 
+        elif vtype == "paddleboat":
+            # Chunky rectangular hull with rounded bow
+            bow_w = max(10, bw // 4)
+            if ag.direction == 1:
+                pts = [(bx, ty), (bx + bw - bow_w, ty), (bx + bw, hull_y), (bx + bw - bow_w, by), (bx, by)]
+            else:
+                pts = [(bx + bow_w, ty), (bx + bw, ty), (bx + bw, by), (bx + bow_w, by), (bx, hull_y)]
+            pygame.draw.polygon(self.screen, hull_col, pts)
+            pygame.draw.polygon(self.screen, outline,  pts, 2)
+
+            # Cabin - large and central
+            cab_w, cab_h = bw // 1.5, bh - 6
+            cx_off = (bw - cab_w) // 2
+            pygame.draw.rect(self.screen, self._dim((220, 210, 190), mult), (bx + cx_off, hull_y - cab_h // 2, cab_w, cab_h))
+            pygame.draw.rect(self.screen, outline, (bx + cx_off, hull_y - cab_h // 2, cab_w, cab_h), 1)
+
+            # Windows (glowing at night)
+            win_col = (255, 240, 150) if is_dark else self._dim((100, 150, 200), mult)
+            for i in range(4):
+                wx = bx + cx_off + 4 + i * (cab_w - 8) // 4
+                pygame.draw.rect(self.screen, win_col, (wx, hull_y - cab_h // 2 + 3, (cab_w - 12) // 4, cab_h - 6))
+
+            # Paddle wheel in the back
+            wheel_w, wheel_h = max(12, bw // 6), bh + 4
+            if ag.direction == 1:
+                wx = bx - wheel_w + 2
+            else:
+                wx = bx + bw - 2
+            
+            # Animation for wheel
+            wheel_rot = self.time * 8 if ag.is_moving else 0
+            wheel_col = self._dim((80, 40, 20), mult)
+            pygame.draw.rect(self.screen, wheel_col, (wx, hull_y - wheel_h // 2, wheel_w, wheel_h))
+            pygame.draw.rect(self.screen, outline, (wx, hull_y - wheel_h // 2, wheel_w, wheel_h), 1)
+            # Spokes/Blades
+            for i in range(4):
+                angle = wheel_rot + i * (math.pi / 2)
+                offset = int(math.sin(angle) * (wheel_h // 2 - 2))
+                pygame.draw.line(self.screen, outline, (wx + 2, hull_y + offset), (wx + wheel_w - 2, hull_y + offset), 1)
+
+            # Smoke stacks
+            stack_col = self._dim((40, 40, 40), mult)
+            for i in range(2):
+                sx = bx + cx_off + (cab_w // 3) * (i + 1) - 2
+                sy = hull_y - cab_h // 2 - 8
+                pygame.draw.rect(self.screen, stack_col, (sx, sy, 4, 10))
+                # Animated smoke
+                if ag.is_moving:
+                    for s in range(3):
+                        st = (self.time * 2 + s * 0.5) % 1.5
+                        smoke_size = 2 + st * 4
+                        smoke_alpha = int(255 * (1 - st / 1.5))
+                        smoke_surf = pygame.Surface((smoke_size * 2, smoke_size * 2), pygame.SRCALPHA)
+                        pygame.draw.circle(smoke_surf, (150, 150, 150, smoke_alpha), (smoke_size, smoke_size), smoke_size)
+                        self.screen.blit(smoke_surf, (sx + 2 - smoke_size, sy - 5 - st * 20))
+
+            if is_dark:
+                # Nav lights
+                lx = bx + bw - 4 if ag.direction == 1 else bx + 4
+                l_col = self.GREEN if ag.direction == 1 else self.RED
+                pygame.draw.circle(self.screen, l_col, (lx, hull_y - 2), 2)
+
         else: # Default trapezoid
             bow_cut = max(4, bw // 5)
             if ag.direction == 1:
@@ -541,11 +604,11 @@ class LockDamVisualizer:
         is_night = h < 6.0 or h > 20.0
         
         if is_night:
-            # 90% Barge, 10% Yacht, 0% Kayak
-            cls = random.choices([Barge, Yacht], weights=[0.9, 0.1])[0]
+            # 70% Barge, 20% PaddleBoat, 10% Yacht, 0% Kayak
+            cls = random.choices([Barge, PaddleBoat, Yacht], weights=[0.7, 0.2, 0.1])[0]
         else:
             # Equal probability during the day
-            cls = random.choice([Yacht, Barge, Kayak])
+            cls = random.choice([Yacht, Barge, Kayak, PaddleBoat])
 
         name = f"{cls.__name__[0]}{self._boat_counter}"
         boat = cls(name)
