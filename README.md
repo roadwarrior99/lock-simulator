@@ -4,12 +4,14 @@ A pygame-based lock and dam operator game. Boats with simple AI navigate a two-l
 
 ## Gameplay
 
-Boats spawn automatically from both ends of the canal and queue at the lock gates. You control the lock — fill or drain the chamber to match water levels, then open the appropriate gate to let boats through.
+Boats spawn automatically from both ends of the canal and queue at the lock gates. You control the lock — fill or drain the chamber to match water levels, then open the appropriate gate to let boats through. A lock operator character automatically walks along the wall to tie and untie boats as needed.
+
+The world runs on a day/night cycle with dynamic weather — expect moving clouds, rain, and lightning. Boat traffic composition changes at night (no kayaks after dark).
 
 **Incidents** end your run or cost you points:
 - **Crash** — two boats in the same lane collide
 - **Surge** — a gate is opened when the water level differential exceeds 2 m
-- **Game over** — both gates are left open simultaneously for more than 3 seconds
+- **Game over** — both gates are left open simultaneously for more than 1 second
 
 ## Controls
 
@@ -19,6 +21,7 @@ Boats spawn automatically from both ends of the canal and queue at the lock gate
 | `H` | Toggle downstream gate |
 | `F` | Fill lock chamber (raises to upstream level) |
 | `D` | Drain lock chamber (lowers to downstream level) |
+| `V` | Toggle operator POV view |
 | `R` | Restart (after game over) |
 | `Q` | Quit (after game over) |
 
@@ -39,6 +42,5 @@ python game.py # Runs the game
 |-------------------|-------------|
 | `game.py`         | Main game loop, rendering, and boat AI |
 | `lock_and_dam.py` | Lock chamber model (gates, fill/drain) |
-| `boat.py`         | Boat classes: `Kayak`, `Yacht`, `Barge` |
+| `boat.py`         | Boat classes: `Kayak`, `Yacht`, `Barge`, `PaddleBoat` |
 | `waterway.py`     | Waterway/canal model |
-| `tests/`          | Automated safety logic tests |

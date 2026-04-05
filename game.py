@@ -552,16 +552,188 @@ class LockDamVisualizer:
                 boat_h = int(boat.beam * pov_scale)
                 
                 if screen_lx + boat_w > 0 and screen_lx < self.width:
-                    # Hull
-                    pygame.draw.rect(self.screen, boat_col, (int(screen_lx), int(boat_y), int(boat_w), int(boat_h)), border_radius=int(boat_h/4))
-                    # Cabin
-                    if boat.vessel_type != "kayak":
-                        cabin_w = boat_w * 0.4
-                        cabin_h = boat_h * 0.6
-                        pygame.draw.rect(self.screen, self._dim(self.WHITE, mult), 
-                                         (int(screen_cx - cabin_w/2), int(boat_y + (boat_h - cabin_h)/2), int(cabin_w), int(cabin_h)), 
-                                         border_radius=5)
-                    
+                    lx  = int(screen_lx)
+                    rx  = int(screen_lx + boat_w)
+                    bw  = rx - lx
+                    ty  = int(boat_y)
+                    by  = int(boat_y + boat_h)
+                    bh  = by - ty
+                    is_dark = self.game_time < 6.5 or self.game_time > 18.5
+                    outline = self._dim(self.DARK_GRAY, mult)
+                    vtype = boat.vessel_type
+
+                    # deck_y: line separating hull (below) from superstructure (above)
+                    deck_y = ty + bh * 2 // 5
+
+                    if vtype == "kayak":
+                        # Slim double-ended hull — tapers to points at both ends
+                        mid_y = (ty + by) // 2
+                        pts = [(lx, mid_y),
+                               (lx + bw // 5, ty), (rx - bw // 5, ty),
+                               (rx, mid_y),
+                               (rx - bw // 5, by), (lx + bw // 5, by)]
+                        pygame.draw.polygon(self.screen, boat_col, pts)
+                        pygame.draw.polygon(self.screen, outline, pts, 1)
+                        # cockpit
+                        ck = bw // 8
+                        pygame.draw.ellipse(self.screen, self._dim((40, 25, 15), mult),
+                                            (lx + bw // 2 - ck, mid_y - ck // 2, ck * 2, ck))
+
+                    elif vtype == "yacht":
+                        bow_cut = max(8, bw // 4)
+                        # Hull — pointed bow, flat stern
+                        if ag.direction == 1:
+                            hull_pts = [(lx, deck_y), (lx, by),
+                                        (rx - bow_cut, by), (rx, deck_y + bh // 4),
+                                        (rx - bow_cut // 2, deck_y)]
+                        else:
+                            hull_pts = [(rx, deck_y), (rx, by),
+                                        (lx + bow_cut, by), (lx, deck_y + bh // 4),
+                                        (lx + bow_cut // 2, deck_y)]
+                        pygame.draw.polygon(self.screen, boat_col, hull_pts)
+                        pygame.draw.polygon(self.screen, outline, hull_pts, 2)
+                        # boot stripe
+                        boot_col = self._dim((180, 30, 30), mult)
+                        pygame.draw.line(self.screen, boot_col, (lx, by - 3), (rx, by - 3), 2)
+                        # cabin
+                        cab_w = bw * 2 // 5
+                        cab_h = bh * 2 // 5
+                        cab_x = lx + bw // 4 if ag.direction == 1 else lx + bw // 3
+                        cab_y = deck_y - cab_h
+                        cab_col = self._dim((220, 220, 215), mult)
+                        pygame.draw.rect(self.screen, cab_col, (cab_x, cab_y, cab_w, cab_h))
+                        pygame.draw.rect(self.screen, outline, (cab_x, cab_y, cab_w, cab_h), 1)
+                        win_col = (255, 240, 140) if is_dark else self._dim((100, 155, 210), mult)
+                        ww = max(3, cab_w // 5)
+                        for i in range(3):
+                            pygame.draw.rect(self.screen, win_col,
+                                             (cab_x + 3 + i * (cab_w // 3), cab_y + 3, ww, cab_h - 6))
+                        # mast
+                        mast_x = cab_x + cab_w // 3
+                        mast_col = self._dim((190, 175, 150), mult)
+                        pygame.draw.line(self.screen, mast_col,
+                                         (mast_x, cab_y), (mast_x, cab_y - bh // 3), 2)
+                        if is_dark:
+                            l_col = self.GREEN if ag.direction == 1 else self.RED
+                            bow_lx = rx - 3 if ag.direction == 1 else lx + 3
+                            pygame.draw.circle(self.screen, self._dim(l_col, mult), (bow_lx, deck_y), 2)
+                            pygame.draw.circle(self.screen, self._dim(self.WHITE, mult), (mast_x, cab_y - bh//3), 2)
+
+                    elif vtype == "barge":
+                        # Flat low-freeboard hull
+                        pygame.draw.rect(self.screen, boat_col, (lx, deck_y, bw, by - deck_y))
+                        pygame.draw.rect(self.screen, outline, (lx, deck_y, bw, by - deck_y), 2)
+                        # Cargo holds
+                        cargo_col = self._dim((80, 62, 45), mult)
+                        seg_w = (bw - 6) // 3
+                        cargo_h = bh * 2 // 5
+                        for i in range(3):
+                            cx_ = lx + 3 + i * seg_w
+                            pygame.draw.rect(self.screen, cargo_col,
+                                             (cx_, deck_y - cargo_h, seg_w - 2, cargo_h))
+                            pygame.draw.rect(self.screen, outline,
+                                             (cx_, deck_y - cargo_h, seg_w - 2, cargo_h), 1)
+                        # Tug at stern
+                        tug_w = max(12, bw // 5)
+                        tug_h = bh * 3 // 5
+                        tug_col = self._dim((55, 55, 55), mult)
+                        tx_ = lx - tug_w + 2 if ag.direction == 1 else rx - 2
+                        tug_y = deck_y - tug_h
+                        pygame.draw.rect(self.screen, tug_col, (tx_, tug_y, tug_w, tug_h + (by - deck_y)))
+                        pygame.draw.rect(self.screen, outline, (tx_, tug_y, tug_w, tug_h + (by - deck_y)), 1)
+                        tc_col = (255, 195, 90) if is_dark else self._dim((210, 55, 55), mult)
+                        tc_w = tug_w * 2 // 3
+                        tc_h = tug_h * 2 // 3
+                        pygame.draw.rect(self.screen, tc_col,
+                                         (tx_ + (tug_w - tc_w) // 2, tug_y + 2, tc_w, tc_h))
+                        # smokestack
+                        stk_x = tx_ + tug_w // 2 - 1
+                        pygame.draw.rect(self.screen, self._dim((30, 30, 30), mult),
+                                         (stk_x, tug_y - 6, 3, 8))
+                        if is_dark:
+                            pygame.draw.circle(self.screen, self._dim(self.WHITE, mult),
+                                               (tx_ + tug_w // 2, tug_y - 2), 2)
+
+                    elif vtype == "paddleboat":
+                        bow_cut = max(10, bw // 5)
+                        # Hull
+                        if ag.direction == 1:
+                            hull_pts = [(lx, deck_y), (lx, by),
+                                        (rx - bow_cut, by), (rx, deck_y + bh // 4),
+                                        (rx - bow_cut // 2, deck_y)]
+                        else:
+                            hull_pts = [(rx, deck_y), (rx, by),
+                                        (lx + bow_cut, by), (lx, deck_y + bh // 4),
+                                        (lx + bow_cut // 2, deck_y)]
+                        pygame.draw.polygon(self.screen, boat_col, hull_pts)
+                        pygame.draw.polygon(self.screen, outline, hull_pts, 2)
+                        # Deck 1
+                        cab_w  = bw * 3 // 5
+                        cab_x  = lx + (bw - cab_w) // 2
+                        d1_h   = bh * 2 // 7
+                        d1_y   = deck_y - d1_h
+                        cab_c1 = self._dim((215, 205, 185), mult)
+                        pygame.draw.rect(self.screen, cab_c1, (cab_x, d1_y, cab_w, d1_h))
+                        pygame.draw.rect(self.screen, outline, (cab_x, d1_y, cab_w, d1_h), 1)
+                        # Deck 2
+                        d2_w   = cab_w * 4 // 5
+                        d2_x   = cab_x + (cab_w - d2_w) // 2
+                        d2_h   = bh * 2 // 7
+                        d2_y   = d1_y - d2_h
+                        cab_c2 = self._dim((230, 222, 205), mult)
+                        pygame.draw.rect(self.screen, cab_c2, (d2_x, d2_y, d2_w, d2_h))
+                        pygame.draw.rect(self.screen, outline, (d2_x, d2_y, d2_w, d2_h), 1)
+                        win_col = (255, 240, 140) if is_dark else self._dim((100, 150, 200), mult)
+                        ww = max(3, cab_w // 8)
+                        for i in range(4):
+                            pygame.draw.rect(self.screen, win_col,
+                                             (cab_x + 4 + i * (cab_w // 4), d1_y + 3, ww, d1_h - 6))
+                        for i in range(3):
+                            pygame.draw.rect(self.screen, win_col,
+                                             (d2_x + 4 + i * (d2_w // 3), d2_y + 3, ww, d2_h - 6))
+                        # Paddle wheel at stern
+                        pw_w = max(10, bw // 6)
+                        pw_h = bh * 2 // 3
+                        pw_x  = lx - pw_w + 2 if ag.direction == 1 else rx - 2
+                        pw_y  = deck_y - pw_h // 2
+                        pw_col = self._dim((75, 38, 18), mult)
+                        pygame.draw.rect(self.screen, pw_col, (pw_x, pw_y, pw_w, pw_h))
+                        pygame.draw.rect(self.screen, outline, (pw_x, pw_y, pw_w, pw_h), 1)
+                        wrot = self.time * 8 if ag.is_moving else 0
+                        for i in range(4):
+                            oy_ = int(math.sin(wrot + i * math.pi / 2) * (pw_h // 2 - 2))
+                            pygame.draw.line(self.screen, outline,
+                                             (pw_x + 2, pw_y + pw_h // 2 + oy_),
+                                             (pw_x + pw_w - 2, pw_y + pw_h // 2 + oy_), 1)
+                        # Smokestacks
+                        for i in range(2):
+                            sx_ = d2_x + (d2_w // 3) * (i + 1) - 2
+                            sy_ = d2_y - 9
+                            pygame.draw.rect(self.screen, self._dim((35, 35, 35), mult), (sx_, sy_, 4, 10))
+                            if ag.is_moving:
+                                for s in range(3):
+                                    st = (self.time * 2 + s * 0.5) % 1.5
+                                    sm = int(2 + st * 4)
+                                    sa = int(255 * (1 - st / 1.5))
+                                    ss = pygame.Surface((sm * 2, sm * 2), pygame.SRCALPHA)
+                                    pygame.draw.circle(ss, (150, 150, 150, sa), (sm, sm), sm)
+                                    self.screen.blit(ss, (sx_ + 2 - sm, sy_ - 4 - int(st * 18)))
+                        if is_dark:
+                            l_col = self.GREEN if ag.direction == 1 else self.RED
+                            bow_lx = rx - 3 if ag.direction == 1 else lx + 3
+                            pygame.draw.circle(self.screen, self._dim(l_col, mult), (bow_lx, deck_y), 2)
+
+                    # Waterline shimmer below all boats
+                    pygame.draw.line(self.screen, self._dim(self.WATER_SHIMMER, mult),
+                                     (lx - 2, by), (rx + 2, by), 2)
+
+                    # Name tag
+                    lbl = self.fnt_sm.render(boat.name, True, self._dim(self.WHITE, mult))
+                    tag = pygame.Surface((lbl.get_width() + 6, lbl.get_height() + 3), pygame.SRCALPHA)
+                    tag.fill((0, 0, 0, 130))
+                    self.screen.blit(tag, (lx, ty - lbl.get_height() - 6))
+                    self.screen.blit(lbl, (lx + 3, ty - lbl.get_height() - 5))
+
                     # Permanent ropes for tied boats
                     if ag.tied_down:
                         rope_col = self._dim((180, 170, 130), mult)
