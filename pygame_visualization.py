@@ -269,7 +269,8 @@ class LockDamVisualizer:
         bx   = self._sx(boat.position)
         bw   = max(self._sx(boat.position + boat.length) - bx, 8)
 
-        surf_y = up_y if bx < lk_sx else (dn_y if bx > lk_ex else lk_y)
+        cx     = boat.position + boat.length / 2   # sim-space centre
+        surf_y = up_y if cx < self.lock_start else (dn_y if cx > self.lock_end else lk_y)
         hull_y = self._lane_y(ag, surf_y)
         bh     = max(int(boat.beam * 2.2), 8)
 
