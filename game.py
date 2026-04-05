@@ -117,6 +117,14 @@ class LockDamVisualizer:
         """Water level (m) → screen y (surface)."""
         return int(self._wl_base - level * self._wl_scale)
 
+    def _get_speed_mult(self):
+        h = self.game_time
+        if 8.0 <= h < 18.0: return 1.0
+        if 18.0 <= h < 22.0: return 1.0 - (h - 18.0) / 4.0 * 0.4  # Dims to 0.6
+        if 22.0 <= h or h < 4.0: return 0.6
+        if 4.0 <= h < 8.0: return 0.6 + (h - 4.0) / 4.0 * 0.4  # Brightens to 1.0
+        return 1.0
+
     def _interp_col(self, c1, c2, t):
         t = max(0.0, min(1.0, t))
         return (
@@ -528,7 +536,17 @@ class LockDamVisualizer:
 
     def _spawn_boat(self, direction, position=None):
         self._boat_counter += 1
-        cls  = random.choice([Yacht, Barge, Kayak])
+        h = self.game_time
+        # Spawning restrictions: no Kayaks at night, minimal Yachts.
+        is_night = h < 6.0 or h > 20.0
+        
+        if is_night:
+            # 90% Barge, 10% Yacht, 0% Kayak
+            cls = random.choices([Barge, Yacht], weights=[0.9, 0.1])[0]
+        else:
+            # Equal probability during the day
+            cls = random.choice([Yacht, Barge, Kayak])
+
         name = f"{cls.__name__[0]}{self._boat_counter}"
         boat = cls(name)
         boat.position = (-120 if direction == 1 else 1100) if position is None else position
@@ -587,7 +605,10 @@ class LockDamVisualizer:
     def _step_agent(self, ag, all_active):
         d    = ag.direction
         boat = ag.boat
-        new_pos = boat.position + d * ag.speed
+        
+        # Apply night-time speed reduction
+        v_mult = self._get_speed_mult()
+        new_pos = boat.position + d * ag.speed * v_mult
 
         # ── Gate blocking ─────────────────────────────────────────────────────
         # Boats approaching from outside stop at the outer wall face.
