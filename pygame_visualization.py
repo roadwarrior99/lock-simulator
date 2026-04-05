@@ -80,10 +80,13 @@ class LockDamVisualizer:
         self._water_bot_y = 540
 
         # ── Gameplay ──────────────────────────────────────────────────────────
-        self.score        = 0
-        self.incidents    = []    # list of message strings
-        self.flash_timer  = 0    # red-flash countdown (frames)
-        self.flash_color  = self.RED
+        self.score             = 0
+        self.incidents         = []    # list of message strings
+        self.flash_timer       = 0     # incident flash countdown (frames)
+        self.flash_color       = self.RED
+        self.game_over         = False
+        self.both_gates_timer  = 0     # frames both gates have been open simultaneously
+        self.BOTH_GATES_LIMIT  = 180   # 3 seconds at 60 fps
 
         # ── Spawning ──────────────────────────────────────────────────────────
         self.spawn_timer     = 0
@@ -92,6 +95,7 @@ class LockDamVisualizer:
         self._next_direction = 1     # alternates each spawn
 
         # Fonts
+        self.fnt_lg = pygame.font.Font(None, 42)
         self.fnt_md = pygame.font.Font(None, 28)
         self.fnt_sm = pygame.font.Font(None, 22)
 
@@ -644,6 +648,47 @@ class LockDamVisualizer:
             self.screen.blit(overlay, (0, 0))
             self.flash_timer = max(0, self.flash_timer - 1)
 
+    def _check_both_gates(self):
+        """Track how long both gates are open; trigger game over if too long."""
+        if self.lock_dam.upstream_gates_open and self.lock_dam.downstream_gates_open:
+            self.both_gates_timer += 1
+            # Pulse the flash intensity so it visibly escalates
+            pulse = int(60 + 50 * math.sin(self.time * 12))
+            overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+            overlay.fill((220, 30, 30, pulse))
+            self.screen.blit(overlay, (0, 0))
+            # Countdown warning
+            secs_left = max(0, (self.BOTH_GATES_LIMIT - self.both_gates_timer) / 60)
+            warn = self.fnt_lg.render(
+                f"BOTH GATES OPEN — close one!  {secs_left:.1f}s", True, (255, 80, 80))
+            wx = self.width // 2 - warn.get_width() // 2
+            bg = pygame.Surface((warn.get_width() + 16, warn.get_height() + 8), pygame.SRCALPHA)
+            bg.fill((0, 0, 0, 160))
+            self.screen.blit(bg, (wx - 8, self.height // 2 - warn.get_height() // 2 - 4))
+            self.screen.blit(warn, (wx, self.height // 2 - warn.get_height() // 2))
+            if self.both_gates_timer >= self.BOTH_GATES_LIMIT:
+                self.game_over = True
+        else:
+            self.both_gates_timer = 0
+
+    def _draw_game_over(self):
+        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 200))
+        self.screen.blit(overlay, (0, 0))
+
+        title = self.fnt_lg.render("GAME OVER", True, (220, 50, 50))
+        reason = self.fnt_md.render(
+            "Both gates left open — the lock surged.", True, (200, 180, 180))
+        score_txt = self.fnt_md.render(
+            f"Final score: {self.score} boat{'s' if self.score != 1 else ''} passed",
+            True, (255, 230, 100))
+        restart = self.fnt_sm.render("Press R to restart  |  Q to quit", True, (160, 160, 200))
+
+        cx = self.width // 2
+        cy = self.height // 2
+        for i, surf in enumerate([title, reason, score_txt, restart]):
+            self.screen.blit(surf, (cx - surf.get_width() // 2, cy - 70 + i * 40))
+
     # ── Utility ───────────────────────────────────────────────────────────────
 
     def _boat_color(self, boat):
@@ -654,12 +699,23 @@ class LockDamVisualizer:
     def run(self):
         running = True
         while running:
-            running = self.handle_input()
-            self.time += 1 / 60
+            # ── Event handling ────────────────────────────────────────────────
+            if self.game_over:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_q:
+                            running = False
+                        elif event.key == pygame.K_r:
+                            self.__init__()   # full restart
+            else:
+                running = self.handle_input()
+                self.time += 1 / 60
+                self._spawn_if_needed()
+                self._update_agents()
 
-            self._spawn_if_needed()
-            self._update_agents()
-
+            # ── Rendering ─────────────────────────────────────────────────────
             self.screen.fill(self.SKY_BOTTOM)
 
             if self.view_mode == "shore":
@@ -668,6 +724,12 @@ class LockDamVisualizer:
                 self.draw_lock_view()
 
             self.draw_ui()
+
+            if not self.game_over:
+                self._check_both_gates()
+            else:
+                self._draw_game_over()
+
             pygame.display.flip()
             self.clock.tick(60)
 
