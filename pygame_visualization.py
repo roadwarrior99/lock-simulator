@@ -78,6 +78,8 @@ class LockDamVisualizer:
         self._wl_base     = 430   # screen-y at water level 0 m
         self._wl_scale    = 5     # px per metre (higher water = lower y)
         self._water_bot_y = 540
+        _wall_t_px        = 20    # lock wall thickness in pixels (must match draw_shore_view)
+        self._wall_t_sim  = _wall_t_px / self._sx_scale  # wall thickness in sim units
 
         # ── Gameplay ──────────────────────────────────────────────────────────
         self.score             = 0
@@ -130,6 +132,7 @@ class LockDamVisualizer:
     # Separation must exceed the tallest boat's full hull height to avoid visual overlap.
     _LANE_OFF    = {1: 28, -1: 82}
     _DIVIDER_OFF = 55   # midpoint between the two lanes
+    _WALL_T_PX   = 18   # lock wall thickness in pixels (must match draw_shore_view)
 
     def _in_lock(self, boat):
         return boat.position < self.lock_end and boat.position + boat.length > self.lock_start
@@ -267,8 +270,8 @@ class LockDamVisualizer:
         bw   = max(self._sx(boat.position + boat.length) - bx, 8)
 
         surf_y = up_y if bx < lk_sx else (dn_y if bx > lk_ex else lk_y)
-        hull_y = self._lane_y(ag, surf_y)   # vertical centre for this lane
-        bh     = max(int(boat.beam * 2.2), 8)   # keep hull within lane bounds
+        hull_y = self._lane_y(ag, surf_y)
+        bh     = max(int(boat.beam * 2.2), 8)
 
         if ag.state == "crashed":
             hull_col = self.RED
@@ -276,6 +279,20 @@ class LockDamVisualizer:
         else:
             hull_col = self._boat_color(boat)
             outline  = self.DARK_GRAY
+
+        # Clip drawing to the boat's region so hulls never paint over lock walls.
+        # Region is determined by which side of the lock the boat's centre sits on.
+        wt  = self._WALL_T_PX
+        cx  = boat.position + boat.length / 2
+        if cx < self.lock_start:
+            clip = pygame.Rect(0, 0, lk_sx, self.height)
+        elif cx > self.lock_end:
+            clip = pygame.Rect(lk_ex, 0, self.width - lk_ex, self.height)
+        else:
+            clip = pygame.Rect(lk_sx + wt, 0, lk_ex - lk_sx - 2 * wt, self.height)
+
+        prev_clip = self.screen.get_clip()
+        self.screen.set_clip(clip)
 
         # Trapezoid hull — bow tapers to leading edge
         bow_cut = max(4, bw // 5)
@@ -300,6 +317,8 @@ class LockDamVisualizer:
         tag.fill((255, 255, 255, 190))
         self.screen.blit(tag, (bx,     ty - lbl.get_height() - 6))
         self.screen.blit(lbl, (bx + 3, ty - lbl.get_height() - 5))
+
+        self.screen.set_clip(prev_clip)
 
     def _wl_label(self, cx, surf_y, title, level):
         t1 = self.fnt_sm.render(title, True, self.WHITE)
@@ -487,23 +506,29 @@ class LockDamVisualizer:
         new_pos = boat.position + d * ag.speed
 
         # ── Gate blocking ─────────────────────────────────────────────────────
+        # Boats approaching from outside stop at the outer wall face.
+        # Boats inside the lock stopping at a closed gate use the inner wall face
+        # so they don't visually clip into the concrete.
+        wt = self._wall_t_sim
         if d == 1:
-            gate_order = [(self.lock_start, self.lock_dam.upstream_gates_open),
-                          (self.lock_end,   self.lock_dam.downstream_gates_open)]
+            gate_order = [
+                (self.lock_start,      self.lock_dam.upstream_gates_open),   # entry — outer face
+                (self.lock_end - wt,   self.lock_dam.downstream_gates_open), # exit  — inner face
+            ]
         else:
-            gate_order = [(self.lock_end,   self.lock_dam.downstream_gates_open),
-                          (self.lock_start, self.lock_dam.upstream_gates_open)]
+            gate_order = [
+                (self.lock_end,        self.lock_dam.downstream_gates_open), # entry — outer face
+                (self.lock_start + wt, self.lock_dam.upstream_gates_open),   # exit  — inner face
+            ]
 
         for gate_x, open_ in gate_order:
             if open_:
                 continue
             if d == 1:
-                # Block if front hasn't passed gate but would after this step
                 if boat.position + boat.length <= gate_x < new_pos + boat.length:
                     boat.position = gate_x - boat.length
                     return
             else:
-                # Block if front (left edge) is right of gate but would cross it
                 if boat.position >= gate_x > new_pos:
                     boat.position = gate_x
                     return
