@@ -35,7 +35,6 @@ class LockDamVisualizer:
         self.screen = pygame.display.set_mode((self.width, self.height))
         pygame.display.set_caption("Lock & Dam Operator")
         self.clock  = pygame.time.Clock()
-        self.view_mode = "shore"   # "shore" | "lock"
         self.time = 0.0
 
         # ── Palette ───────────────────────────────────────────────────────────
@@ -327,92 +326,6 @@ class LockDamVisualizer:
         self.screen.blit(t1, (cx - t1.get_width() // 2, surf_y - 36))
         self.screen.blit(t2, (cx - t2.get_width() // 2, surf_y - 20))
 
-    # ── Lock perspective view ─────────────────────────────────────────────────
-
-    def draw_lock_view(self):
-        """View from the lock house looking along the channel."""
-        t   = self.time
-        cam = (self.lock_start + self.lock_end) / 2   # camera sim-position
-
-        # Sky
-        self._gradient_rect((75, 130, 210), (155, 195, 240),
-                            (0, 0, self.width, 400))
-        for ci, (cx, cy, cr) in enumerate([(180, 75, 55), (480, 55, 75),
-                                            (820, 90, 45), (1050, 70, 60)]):
-            ox = int(18 * math.sin(t * 0.25 + ci * 1.4))
-            pygame.draw.ellipse(self.screen, (220, 230, 248),
-                                (cx + ox - cr, cy - 18, cr * 2, 36))
-            pygame.draw.ellipse(self.screen, (240, 245, 255),
-                                (cx + ox - cr + 12, cy - 28, int(cr * 1.6), 36))
-
-        horizon = 400
-        pygame.draw.line(self.screen, (195, 215, 245), (0, horizon), (self.width, horizon), 2)
-        self._gradient_rect((50, 128, 198), (18, 65, 145),
-                            (0, horizon, self.width, self.height - horizon))
-
-        for row in range(6):
-            ry = horizon + 18 + row * 38
-            for wx in range(0, self.width, int(38 + row * 18)):
-                oy = int(4 * math.sin(t * 2.2 + wx * 0.04 + row))
-                seg = int(14 + row * 8)
-                pygame.draw.line(self.screen, (75, 155, 215),
-                                 (wx, ry + oy), (wx + seg, ry + oy), 1)
-
-        for bx, bw in [(0, 75), (self.width - 75, 75)]:
-            pygame.draw.rect(self.screen, self.GRASS, (bx, horizon - 35, bw, 38))
-            pygame.draw.rect(self.screen, self.DIRT,  (bx, horizon + 3,  bw, 22))
-
-        # Boats in perspective
-        visible = sorted(
-            [ag for ag in self.agents if ag.state != "done"],
-            key=lambda a: -abs((a.boat.position + a.boat.length / 2) - cam)
-        )
-        for ag in visible:
-            boat = ag.boat
-            dist = (boat.position + boat.length / 2) - cam
-            if abs(dist) > 520:
-                continue
-            scale = max(0.08, 1 - abs(dist) / 520)
-            scx   = self.width // 2 + int(dist * 2.5 * scale)
-            bw2   = max(10, int(boat.length * scale * 2.8))
-            bh2   = max(6,  int(boat.beam   * scale * 8))
-            bx2   = scx - bw2 // 2
-            by2   = horizon - bh2
-            bow   = max(3, bw2 // 6)
-            hull  = self.RED if ag.state == "crashed" else self._boat_color(boat)
-            if ag.direction == 1:
-                pts = [(bx2, by2), (bx2 + bw2 - bow, by2),
-                       (bx2 + bw2, by2 + bh2 // 2),
-                       (bx2 + bw2 - bow, by2 + bh2), (bx2, by2 + bh2)]
-            else:
-                pts = [(bx2 + bow, by2), (bx2 + bw2, by2),
-                       (bx2, by2 + bh2 // 2),
-                       (bx2 + bw2, by2 + bh2), (bx2 + bow, by2 + bh2)]
-            pygame.draw.polygon(self.screen, hull,           pts)
-            pygame.draw.polygon(self.screen, self.DARK_GRAY, pts, 1)
-            lbl = self.fnt_sm.render(boat.name, True, self.WHITE)
-            self.screen.blit(lbl, (bx2, by2 - 16))
-
-        # Gate structures in perspective
-        for gate_pos, gate_open, gate_name in [
-            (self.lock_start, self.lock_dam.upstream_gates_open,   "Upstream Gate"),
-            (self.lock_end,   self.lock_dam.downstream_gates_open, "Downstream Gate"),
-        ]:
-            dist = gate_pos - cam
-            if abs(dist) > 500:
-                continue
-            scale = max(0.12, 1 - abs(dist) / 500)
-            gx    = self.width // 2 + int(dist * 2.2)
-            gh    = int(160 * scale)
-            gw    = int(16  * scale)
-            gt    = horizon - gh
-            color = self.GREEN if gate_open else self.RED
-            pygame.draw.rect(self.screen, self.CONCRETE, (gx - gw * 4, gt, gw * 8, gh + 28))
-            pygame.draw.rect(self.screen, color,         (gx - gw, gt, gw * 2, gh))
-            pygame.draw.rect(self.screen, self.DARK_GRAY, (gx - gw, gt, gw * 2, gh), 2)
-            lbl = self.fnt_sm.render(gate_name, True, self.WHITE)
-            self.screen.blit(lbl, (gx - lbl.get_width() // 2, gt - 18))
-
     # ── Input ─────────────────────────────────────────────────────────────────
 
     def handle_input(self):
@@ -420,9 +333,7 @@ class LockDamVisualizer:
             if event.type == pygame.QUIT:
                 return False
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_v:
-                    self.view_mode = "lock" if self.view_mode == "shore" else "shore"
-                elif event.key == pygame.K_g:
+                if event.key == pygame.K_g:
                     self._toggle_upstream_gate()
                 elif event.key == pygame.K_h:
                     self._toggle_downstream_gate()
@@ -615,12 +526,9 @@ class LockDamVisualizer:
             self.fnt_md.render("Lock & Dam Operator", True, (170, 195, 255)), (16, 13))
         pygame.draw.line(self.screen, (70, 110, 195), (16, 34), (pw + 6, 34), 1)
 
-        mode_col = (90, 245, 140) if self.view_mode == "shore" else (255, 195, 90)
         rows = [
-            (f"View: {self.view_mode.capitalize()}",  mode_col),
             (f"Score: {self.score} boats passed",      (255, 238, 140)),
             ("",                                        None),
-            ("[V]    Toggle view",                      (170, 170, 255)),
             ("[G]    Upstream gate",                    (170, 170, 255)),
             ("[H]    Downstream gate",                  (170, 170, 255)),
             ("[F]    Fill chamber",                     (170, 170, 255)),
@@ -744,10 +652,7 @@ class LockDamVisualizer:
             # ── Rendering ─────────────────────────────────────────────────────
             self.screen.fill(self.SKY_BOTTOM)
 
-            if self.view_mode == "shore":
-                self.draw_shore_view()
-            else:
-                self.draw_lock_view()
+            self.draw_shore_view()
 
             self.draw_ui()
 
