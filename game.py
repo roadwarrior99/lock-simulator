@@ -725,14 +725,17 @@ class LockDamVisualizer:
 
         pygame.draw.line(self.screen, (70, 110, 195), (16, 34), (pw + 6, 34), 1)
 
+        fill_col  = (170, 170, 255) if not self.lock_dam.downstream_gates_open else (100, 100, 130)
+        drain_col = (170, 170, 255) if not self.lock_dam.upstream_gates_open else (100, 100, 130)
+
         rows = [
             (f"Score: {self.score} boats passed",      (255, 238, 140)),
             (time_str,                                  time_col),
             ("",                                        None),
             ("[G]    Upstream gate",                    (170, 170, 255)),
             ("[H]    Downstream gate",                  (170, 170, 255)),
-            ("[F]    Fill chamber",                     (170, 170, 255)),
-            ("[D]    Drain chamber",                    (170, 170, 255)),
+            ("[F]    Fill chamber",                     fill_col),
+            ("[D]    Drain chamber",                    drain_col),
         ]
         for j, (txt, col) in enumerate(rows):
             if txt:

@@ -12,18 +12,22 @@ class LockAndDam:
 
     def fill_chamber(self):
         """Start filling lock chamber to upstream level"""
-        self.is_filling = True
-        self.is_draining = False
+        if not self.downstream_gates_open:
+            self.is_filling = True
+            self.is_draining = False
 
     def drain_chamber(self):
         """Start draining lock chamber to downstream level"""
-        self.is_draining = True
-        self.is_filling = False
+        if not self.upstream_gates_open:
+            self.is_draining = True
+            self.is_filling = False
 
     def update(self, dt):
         """Gradually change water level if filling or draining."""
         if self.is_filling:
-            if self.lock_chamber_level < self.upstream_level:
+            if self.downstream_gates_open:
+                self.is_filling = False
+            elif self.lock_chamber_level < self.upstream_level:
                 self.lock_chamber_level += self.fill_rate * dt
                 if self.lock_chamber_level >= self.upstream_level:
                     self.lock_chamber_level = self.upstream_level
@@ -32,31 +36,15 @@ class LockAndDam:
                 self.is_filling = False
 
         if self.is_draining:
-            if self.lock_chamber_level > self.downstream_level:
+            if self.upstream_gates_open:
+                self.is_draining = False
+            elif self.lock_chamber_level > self.downstream_level:
                 self.lock_chamber_level -= self.fill_rate * dt
                 if self.lock_chamber_level <= self.downstream_level:
                     self.lock_chamber_level = self.downstream_level
                     self.is_draining = False
             else:
                 self.is_draining = False
-    
-    def open_upstream_gates(self):
-        """Open upstream gates"""
-        if not (self.is_filling or self.is_draining):
-            self.upstream_gates_open = True
-    
-    def close_upstream_gates(self):
-        """Close upstream gates"""
-        self.upstream_gates_open = False
-    
-    def open_downstream_gates(self):
-        """Open downstream gates"""
-        if not (self.is_filling or self.is_draining):
-            self.downstream_gates_open = True
-    
-    def close_downstream_gates(self):
-        """Close downstream gates"""
-        self.downstream_gates_open = False
     
     def get_status(self):
         """Return current lock status"""
