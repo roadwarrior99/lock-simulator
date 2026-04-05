@@ -4,9 +4,17 @@ class Boat:
         self.length = length  # meters
         self.beam = beam      # meters
         self.draft = draft    # meters
+        self.weight = 0
+        self.max_weight = 1000
+        self.max_speed = 100
+        self.max_draft = 100
+        self.max_beam = 100
         self.vessel_type = vessel_type
         self.speed = 0
+        self.direction = 1
         self.position = 0
+        self.state = "active"
+
     
     def can_fit_in_lock(self, lock_length, lock_width, lock_depth):
         """Check if boat can fit in lock chamber"""

@@ -87,7 +87,7 @@ class LockDamVisualizer:
         self.flash_color       = self.RED
         self.game_over         = False
         self.both_gates_timer  = 0     # frames both gates have been open simultaneously
-        self.BOTH_GATES_LIMIT  = 180   # 3 seconds at 60 fps
+        self.BOTH_GATES_LIMIT  = 60   # 3 seconds at 60 fps
 
         # ── Spawning ──────────────────────────────────────────────────────────
         self.spawn_timer     = 0
