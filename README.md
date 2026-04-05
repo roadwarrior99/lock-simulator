@@ -39,5 +39,6 @@ python game.py # Runs the game
 |-------------------|-------------|
 | `game.py`         | Main game loop, rendering, and boat AI |
 | `lock_and_dam.py` | Lock chamber model (gates, fill/drain) |
-| `boat.py`         | Boat classes: `Kayak`, `Yacht`, `Barge`, `ContainerShip` |
+| `boat.py`         | Boat classes: `Kayak`, `Yacht`, `Barge` |
 | `waterway.py`     | Waterway/canal model |
+| `tests/`          | Automated safety logic tests |
