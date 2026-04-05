@@ -52,7 +52,3 @@ class Yacht(Boat):
 class Barge(Boat):
     def __init__(self, name, length=60):
         super().__init__(name, length, 10, 3, "barge")
-
-class ContainerShip(Boat):
-    def __init__(self, name, length=300):
-        super().__init__(name, length, 45, 15, "container_ship")

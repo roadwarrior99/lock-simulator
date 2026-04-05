@@ -19,6 +19,7 @@ class Agent:
         self.direction = direction   # +1 = downstream (L→R), -1 = upstream (R→L)
         self.state     = "active"    # "active" | "crashed" | "done"
         self.speed     = random.uniform(0.9, 1.6)
+        self.is_moving = False
         self.ttl       = None        # frames until removal after crash
 
 
@@ -264,8 +265,9 @@ class LockDamVisualizer:
             pygame.draw.polygon(self.screen, shadow, pts, 2)
 
     def _draw_boat_shore(self, ag, up_y, dn_y, lk_y, lk_sx, lk_ex):
-        boat = ag.boat
-        bx   = self._sx(boat.position)
+        boat  = ag.boat
+        vtype = boat.vessel_type
+        bx    = self._sx(boat.position)
         bw   = max(self._sx(boat.position + boat.length) - bx, 8)
 
         cx     = boat.position + boat.length / 2   # sim-space centre
@@ -281,9 +283,7 @@ class LockDamVisualizer:
             outline  = self.DARK_GRAY
 
         # Clip drawing to the boat's region so hulls never paint over lock walls.
-        # Region is determined by which side of the lock the boat's centre sits on.
         wt  = self._WALL_T_PX
-        cx  = boat.position + boat.length / 2
         if cx < self.lock_start:
             clip = pygame.Rect(0, 0, lk_sx, self.height)
         elif cx > self.lock_end:
@@ -294,23 +294,94 @@ class LockDamVisualizer:
         prev_clip = self.screen.get_clip()
         self.screen.set_clip(clip)
 
-        # Trapezoid hull — bow tapers to leading edge
-        bow_cut = max(4, bw // 5)
+        # ── Wake ──────────────────────────────────────────────────────────────
+        if ag.state == "active" and ag.is_moving:
+            wake_len = 20 + ag.speed * 10
+            wake_col = (200, 220, 240, 100)
+            wake_surf = pygame.Surface((wake_len, bh + 10), pygame.SRCALPHA)
+            
+            # For barges, the wake starts behind the tug boat.
+            wx = bx
+            if vtype == "barge":
+                tug_w = max(14, bw // 5)
+                wx -= (tug_w - 2) if ag.direction == 1 else -(bw + tug_w - 2)
+            else:
+                wx = bx if ag.direction == 1 else bx + bw
+
+            if ag.direction == 1:
+                pygame.draw.polygon(wake_surf, wake_col, [(0, 5), (wake_len, 0), (wake_len, bh+10), (0, bh+5)])
+                self.screen.blit(wake_surf, (wx - wake_len, hull_y - bh//2 - 5))
+            else:
+                pygame.draw.polygon(wake_surf, wake_col, [(wake_len, 5), (0, 0), (0, bh+10), (wake_len, bh+5)])
+                self.screen.blit(wake_surf, (wx, hull_y - bh//2 - 5))
+
+        # ── Hull ──────────────────────────────────────────────────────────────
         ty = hull_y - bh // 2
         by = hull_y + bh // 2
-        if ag.direction == 1:
-            pts = [(bx, ty), (bx + bw - bow_cut, ty),
-                   (bx + bw, hull_y),
-                   (bx + bw - bow_cut, by), (bx, by)]
-        else:
-            pts = [(bx + bow_cut, ty), (bx + bw, ty),
-                   (bx, hull_y),
-                   (bx + bw, by), (bx + bow_cut, by)]
-        pygame.draw.polygon(self.screen, hull_col, pts)
-        pygame.draw.polygon(self.screen, outline,  pts, 2)
+
+        if vtype == "kayak":
+            # Double pointed
+            pts = [(bx, hull_y), (bx + bw // 2, ty), (bx + bw, hull_y), (bx + bw // 2, by)]
+            pygame.draw.polygon(self.screen, hull_col, pts)
+            pygame.draw.polygon(self.screen, outline,  pts, 1)
+            # Cockpit
+            pygame.draw.ellipse(self.screen, self.BLACK, (bx + bw//2 - 2, hull_y - 2, 4, 4))
+
+        elif vtype == "yacht":
+            bow_cut = max(6, bw // 4)
+            if ag.direction == 1:
+                pts = [(bx, ty), (bx + bw - bow_cut, ty), (bx + bw, hull_y), (bx + bw - bow_cut, by), (bx, by)]
+            else:
+                pts = [(bx + bow_cut, ty), (bx + bw, ty), (bx + bw, by), (bx + bow_cut, by), (bx, hull_y)]
+            pygame.draw.polygon(self.screen, hull_col, pts)
+            pygame.draw.polygon(self.screen, outline,  pts, 2)
+            # Cabin
+            cab_w, cab_h = bw // 2, bh - 4
+            cx_off = (bw - cab_w) // 3 if ag.direction == 1 else (bw - cab_w) // 1.5
+            pygame.draw.rect(self.screen, (200, 200, 200), (bx + cx_off, hull_y - cab_h // 2, cab_w, cab_h))
+            pygame.draw.rect(self.screen, outline, (bx + cx_off, hull_y - cab_h // 2, cab_w, cab_h), 1)
+            # Windows
+            win_w = max(2, cab_w // 4)
+            for i in range(3):
+                pygame.draw.rect(self.screen, (100, 150, 200), (bx + cx_off + 2 + i * (win_w + 2), hull_y - cab_h // 2 + 2, win_w, cab_h - 4))
+
+        elif vtype == "barge":
+            pygame.draw.rect(self.screen, hull_col, (bx, ty, bw, bh))
+            pygame.draw.rect(self.screen, outline,  (bx, ty, bw, bh), 2)
+            # Cargo
+            for i in range(3):
+                cargo_x = bx + 5 + i * (bw - 10) // 3
+                pygame.draw.rect(self.screen, (100, 80, 60), (cargo_x, ty + 3, (bw - 10) // 3 - 2, bh - 6))
+            
+            # Tug boat (pushing from behind)
+            tug_w = max(14, bw // 5)
+            tug_h = bh - 2
+            if ag.direction == 1:
+                tx = bx - tug_w + 2
+            else:
+                tx = bx + bw - 2
+            
+            ty_tug = hull_y - tug_h // 2
+            pygame.draw.rect(self.screen, (55, 55, 55), (tx, ty_tug, tug_w, tug_h))
+            pygame.draw.rect(self.screen, self.BLACK, (tx, ty_tug, tug_w, tug_h), 1)
+            # Tug cabin
+            tc_w, tc_h = tug_w // 2, tug_h - 4
+            tc_x = tx + (tug_w - tc_w) // 2
+            pygame.draw.rect(self.screen, (220, 60, 60), (tc_x, ty_tug + 2, tc_w, tc_h))
+            # Tug smokestack
+            pygame.draw.rect(self.screen, self.BLACK, (tc_x + tc_w - 4, ty_tug, 2, 4))
+
+        else: # Default trapezoid
+            bow_cut = max(4, bw // 5)
+            if ag.direction == 1:
+                pts = [(bx, ty), (bx + bw - bow_cut, ty), (bx + bw, hull_y), (bx + bw - bow_cut, by), (bx, by)]
+            else:
+                pts = [(bx + bow_cut, ty), (bx + bw, ty), (bx, hull_y), (bx + bw, by), (bx + bow_cut, by)]
+            pygame.draw.polygon(self.screen, hull_col, pts)
+            pygame.draw.polygon(self.screen, outline,  pts, 2)
 
         pygame.draw.line(self.screen, self.WATER_SHIMMER,
-                         (bx - 5, hull_y), (bx + bw + 5, hull_y), 1)
+                         (bx - 2, hull_y), (bx + bw + 2, hull_y), 1)
 
         lbl = self.fnt_sm.render(boat.name, True, self.BLACK)
         tag = pygame.Surface((lbl.get_width() + 6, lbl.get_height() + 3), pygame.SRCALPHA)
@@ -388,9 +459,16 @@ class LockDamVisualizer:
 
     def _update_agents(self):
         active = [ag for ag in self.agents if ag.state == "active"]
+        
+        # Track previous positions to determine movement
+        old_pos = {id(ag): ag.boat.position for ag in active}
 
         for ag in active:
             self._step_agent(ag, active)
+
+        # Update movement flag
+        for ag in active:
+            ag.is_moving = abs(ag.boat.position - old_pos.get(id(ag), ag.boat.position)) > 0.001
 
         # Crash detection: same-direction boats share a lane and can collide.
         # Opposite-direction boats are always in separate lanes — no collision.
