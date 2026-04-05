@@ -251,6 +251,9 @@ class LockDamVisualizer:
     def _in_lock(self, boat):
         return boat.position < self.lock_end and boat.position + boat.length > self.lock_start
 
+    def _fully_in_lock(self, boat):
+        return boat.position >= self.lock_start and (boat.position + boat.length) <= self.lock_end
+
     def _lane_y(self, ag, surf_y):
         """Vertical centre for the boat hull — always direction-based, no lane merging."""
         return surf_y + self._LANE_OFF[ag.direction]
@@ -883,9 +886,9 @@ class LockDamVisualizer:
         tying_tasks = []
         untying_tasks = []
         for ag in self.agents:
-            if ag.state == "active" and self._in_lock(ag.boat):
-                # Tying: Stopped, not tied
-                if not ag.is_moving and not ag.tied_down:
+            if ag.state == "active":
+                # Tying: Stopped, not tied, MUST be fully inside
+                if self._fully_in_lock(ag.boat) and not ag.is_moving and not ag.tied_down:
                     tying_tasks.append(ag)
                 # Untying: Tied, ready to go (exit gate open)
                 if ag.tied_down:
@@ -915,9 +918,19 @@ class LockDamVisualizer:
         # 3. Execute task
         if op['target_boat']:
             target_ag = op['target_boat']
-            # Boat might have left or something (though shouldn't if tied)
             # Check if task is still valid
-            if target_ag.state != "active" or not self._in_lock(target_ag.boat):
+            is_valid = target_ag.state == "active"
+            if is_valid:
+                if op['task'] == 'tie':
+                    # Must stay stopped and mostly inside to tie
+                    if target_ag.is_moving or not self._in_lock(target_ag.boat):
+                        is_valid = False
+                else: # untie
+                    # Must stay in lock to untie
+                    if not self._in_lock(target_ag.boat):
+                        is_valid = False
+            
+            if not is_valid:
                 op['target_boat'] = None
                 return
 
@@ -952,8 +965,9 @@ class LockDamVisualizer:
                     # Both gates open? Wait at the best spot.
                     op['state'] = 'waiting'
             else:
-                # On the correct side, walk to boat center
+                # On the correct side, walk to boat center (clamped to lock wall)
                 target_x = target_ag.boat.position + target_ag.boat.length / 2
+                target_x = max(self.lock_start, min(self.lock_end, target_x))
                 dx = target_x - op['x']
                 if abs(dx) > 1.0:
                     op['state'] = 'walking'
