@@ -20,6 +20,8 @@ class Agent:
         self.state     = "active"    # "active" | "crashed" | "done"
         self.speed     = random.uniform(0.9, 1.6)
         self.is_moving = False
+        self.tied_down = False
+        self.tied_side = None        # 0=top, 1=bottom
         self.ttl       = None        # frames until removal after crash
 
 
@@ -140,6 +142,19 @@ class LockDamVisualizer:
                 'target_tree': None,
                 'wing_phase': random.uniform(0, math.pi * 2)
             })
+
+        # ── Operator & Views ──────────────────────────────────────────────────
+        self.view_mode = "shore" # "shore" or "operator"
+        self.operator = {
+            'x': self.lock_start + 10,
+            'target_x': self.lock_start + 10,
+            'state': 'idle', # 'idle', 'walking', 'tying', 'untying', 'crossing'
+            'side': 0, # 0 = top, 1 = bottom
+            'target_side': 0,
+            'rope_progress': 0.0, # 0.0 to 1.0 (thrown)
+            'target_boat': None, # agent being tied/untied
+            'task': None # 'tie', 'untie', or None
+        }
 
         # Fonts
         self.fnt_lg = pygame.font.Font(None, 42)
@@ -415,6 +430,9 @@ class LockDamVisualizer:
                          (lk_sx, wall_top, wall_t, self._water_bot_y - wall_top))
         pygame.draw.rect(self.screen, conc_col,
                          (lk_ex - wall_t, wall_top, wall_t, self._water_bot_y - wall_top))
+        # Bottom concrete wall cap
+        pygame.draw.rect(self.screen, conc_col,
+                         (lk_sx, self._water_bot_y, lk_w, 20))
         pygame.draw.rect(self.screen, conc_dark,
                          (inner_x, self._water_bot_y, inner_w, 10))
 
@@ -442,6 +460,143 @@ class LockDamVisualizer:
                        "Downstream", self.lock_dam.downstream_level)
         self._wl_label((lk_sx + lk_ex) // 2, lk_y,
                        "Chamber", self.lock_dam.lock_chamber_level)
+
+        # ── Ropes and Operator (Shore View) ───────────────────────────────────
+        # Draw permanent ropes for all tied boats
+        rope_col = self._dim((200, 190, 150), mult)
+        for ag in self.agents:
+            if ag.state == "active" and ag.tied_down and self._in_lock(ag.boat):
+                bx = self._sx(ag.boat.position + ag.boat.length / 2)
+                by = self._lane_y(ag, lk_y)
+                if ag.tied_side == 0:
+                    ry = wall_top - 2
+                else:
+                    ry = self._water_bot_y + 2
+                pygame.draw.line(self.screen, rope_col, (bx, ry), (bx, by), 2)
+
+        op = self.operator
+        ox = self._sx(op['x'])
+        oy = wall_top - 5 if op['side'] == 0 else self._water_bot_y + 10
+            
+        body_col = self._dim((60, 80, 200), mult) # blue uniform
+        pygame.draw.circle(self.screen, body_col, (ox, oy), 5) # body
+        pygame.draw.circle(self.screen, self._dim((240, 200, 180), mult), (ox, oy - 8), 4) # head
+        
+        # Active task rope (throwing/pulling)
+        if op['state'] in ('tying', 'untying') and op['target_boat']:
+            target_ag = op['target_boat']
+            boat_bx = self._sx(target_ag.boat.position + target_ag.boat.length / 2)
+            boat_by = self._lane_y(target_ag, lk_y)
+            curr_bx = ox + (boat_bx - ox) * op['rope_progress']
+            curr_by = oy + (boat_by - oy) * op['rope_progress']
+            pygame.draw.line(self.screen, rope_col, (ox, oy), (int(curr_bx), int(curr_by)), 2)
+
+    def draw_operator_view(self):
+        """A pseudo-first-person POV looking down from the lock wall."""
+        mult = self._get_ambient_mult()
+        # Sky background (above opposite wall)
+        self._draw_sky(200)
+        self._draw_clouds(200)
+
+        # Opposite concrete wall (horizon-ish)
+        conc_col = self._dim(self.CONCRETE, mult)
+        conc_dark = self._dim(self.CONCRETE_DARK, mult)
+        pygame.draw.rect(self.screen, conc_col, (0, 200, self.width, 100))
+        for cy in range(210, 300, 20):
+            pygame.draw.line(self.screen, conc_dark, (0, cy), (self.width, cy), 2)
+
+        # Water in the chamber
+        # Level relative to "full" (10m)
+        lvl = self.lock_dam.lock_chamber_level
+        # Water takes up middle space. 
+        # As it drains, it moves lower on screen, revealing more opposite wall?
+        # Let's keep it simple: static water area, but boat moves within it.
+        water_y = 300
+        water_h = 400
+        self._gradient_rect(self._dim(self.LOCK_WATER_TOP, mult), 
+                            self._dim(self.WATER_BOT, mult), 
+                            (0, water_y, self.width, water_h))
+
+        # Turbulent water if filling/draining
+        if self.lock_dam.is_filling or self.lock_dam.is_draining:
+            t = self.time * 3
+            bubble_col = self._interp_col((220, 245, 255), (50, 60, 80), 1.0 - mult)
+            for i in range(30):
+                bx = (math.sin(i * 0.7 + t) * 0.5 + 0.5) * self.width
+                by = water_y + (math.cos(i * 1.1 + t * 0.5) * 0.5 + 0.5) * water_h
+                pygame.draw.circle(self.screen, bubble_col, (int(bx), int(by)), random.randint(2, 5))
+
+        # Boats and ropes in POV
+        op = self.operator
+        pov_scale = 15
+        
+        for ag in self.agents:
+            if ag.state != "done" and self._in_lock(ag.boat):
+                boat = ag.boat
+                boat_col = self._dim(self._boat_color(boat), mult)
+                
+                # Horizontal position relative to operator
+                rel_x = (boat.position + boat.length / 2) - op['x']
+                screen_cx = self.width // 2 + rel_x * pov_scale
+                boat_w = boat.length * pov_scale
+                screen_lx = screen_cx - boat_w // 2
+                
+                # Vertical position (depends on water level and lane)
+                # lane_y_off: closer to our wall (higher y) or opposite wall (lower y)
+                side_of_boat = 1 if ag.direction == -1 else 0
+                lane_y_off = 120 if side_of_boat == op['side'] else 20
+                boat_y = water_y + (10 - lvl) * 25 + lane_y_off
+                boat_h = int(boat.beam * pov_scale)
+                
+                if screen_lx + boat_w > 0 and screen_lx < self.width:
+                    # Hull
+                    pygame.draw.rect(self.screen, boat_col, (int(screen_lx), int(boat_y), int(boat_w), int(boat_h)), border_radius=int(boat_h/4))
+                    # Cabin
+                    if boat.vessel_type != "kayak":
+                        cabin_w = boat_w * 0.4
+                        cabin_h = boat_h * 0.6
+                        pygame.draw.rect(self.screen, self._dim(self.WHITE, mult), 
+                                         (int(screen_cx - cabin_w/2), int(boat_y + (boat_h - cabin_h)/2), int(cabin_w), int(cabin_h)), 
+                                         border_radius=5)
+                    
+                    # Permanent ropes for tied boats
+                    if ag.tied_down:
+                        rope_col = self._dim((180, 170, 130), mult)
+                        target_by = boat_y + boat_h // 2
+                        if ag.tied_side == op['side']:
+                            # Tied to our wall
+                            pygame.draw.line(self.screen, rope_col, (int(screen_cx), self.height), (int(screen_cx), int(target_by)), 4)
+                        else:
+                            # Tied to opposite wall
+                            pygame.draw.line(self.screen, rope_col, (int(screen_cx), water_y), (int(screen_cx), int(target_by)), 4)
+
+        # Active task rope (throwing/pulling)
+        if op['target_boat'] and op['rope_progress'] > 0:
+            target_ag = op['target_boat']
+            rel_x = (target_ag.boat.position + target_ag.boat.length / 2) - op['x']
+            screen_cx = self.width // 2 + rel_x * pov_scale
+            
+            # Vertical pos of target boat
+            side_of_boat = 1 if target_ag.direction == -1 else 0
+            lane_y_off = 120 if side_of_boat == op['side'] else 20
+            boat_y = water_y + (10 - lvl) * 25 + lane_y_off
+            boat_h = int(target_ag.boat.beam * pov_scale)
+            target_by = boat_y + boat_h // 2
+            
+            rope_col = self._dim((180, 170, 130), mult)
+            curr_rx = self.width // 2 + (screen_cx - self.width // 2) * op['rope_progress']
+            curr_ry = self.height - (self.height - target_by) * op['rope_progress']
+            pygame.draw.line(self.screen, rope_col, (self.width // 2, self.height), (int(curr_rx), int(curr_ry)), 8)
+
+        # Foreground: The wall the operator is standing on
+        pygame.draw.rect(self.screen, conc_col, (0, 700, self.width, 100))
+        pygame.draw.line(self.screen, conc_dark, (0, 705), (self.width, 705), 4)
+
+        # POV Text
+        txt = self.fnt_md.render("FIRST-PERSON VIEW: LOCK OPERATOR", True, self.WHITE)
+        self.screen.blit(txt, (self.width // 2 - txt.get_width() // 2, 30))
+        inst = self.fnt_sm.render("Press V to return to Shore View", True, (200, 200, 200))
+        self.screen.blit(inst, (self.width // 2 - inst.get_width() // 2, 60))
 
     def _draw_miter_gate(self, gate_x, wall_top, floor_y, is_open, faces_right):
         mult = self._get_ambient_mult()
@@ -701,6 +856,8 @@ class LockDamVisualizer:
                     self.lock_dam.fill_chamber()
                 elif event.key == pygame.K_d:
                     self.lock_dam.drain_chamber()
+                elif event.key == pygame.K_v:
+                    self.view_mode = "operator" if self.view_mode == "shore" else "shore"
         return True
 
     def _toggle_upstream_gate(self):
@@ -718,6 +875,135 @@ class LockDamVisualizer:
                 self._surge_incident(
                     f"SURGE: downstream gate — {diff:.1f} m differential!")
         self.lock_dam.downstream_gates_open = not self.lock_dam.downstream_gates_open
+
+    def _update_operator(self, dt):
+        op = self.operator
+        
+        # 1. Identify tasks
+        tying_tasks = []
+        untying_tasks = []
+        for ag in self.agents:
+            if ag.state == "active" and self._in_lock(ag.boat):
+                # Tying: Stopped, not tied
+                if not ag.is_moving and not ag.tied_down:
+                    tying_tasks.append(ag)
+                # Untying: Tied, ready to go (exit gate open)
+                if ag.tied_down:
+                    ready = False
+                    if ag.direction == 1: # Downstream
+                        if self.lock_dam.downstream_gates_open:
+                            ready = True
+                    else: # Upstream
+                        if self.lock_dam.upstream_gates_open:
+                            ready = True
+                    if ready:
+                        untying_tasks.append(ag)
+
+        # 2. Pick a task if none active
+        if op['target_boat'] is None:
+            if untying_tasks: # Prioritize untying so boats can leave
+                op['target_boat'] = untying_tasks[0]
+                op['task'] = 'untie'
+                op['rope_progress'] = 1.0 # Start with rope attached
+            elif tying_tasks:
+                op['target_boat'] = tying_tasks[0]
+                op['task'] = 'tie'
+                op['rope_progress'] = 0.0
+            else:
+                op['task'] = None
+        
+        # 3. Execute task
+        if op['target_boat']:
+            target_ag = op['target_boat']
+            # Boat might have left or something (though shouldn't if tied)
+            # Check if task is still valid
+            if target_ag.state != "active" or not self._in_lock(target_ag.boat):
+                op['target_boat'] = None
+                return
+
+            # Determine side for the boat: +1 downstream is top side (0), -1 upstream is bottom side (1)
+            boat_side = 0 if target_ag.direction == 1 else 1
+            
+            if op['side'] != boat_side:
+                # Need to cross to the other wall via a closed gate
+                u_open = self.lock_dam.upstream_gates_open
+                d_open = self.lock_dam.downstream_gates_open
+                u_dist = abs(op['x'] - self.lock_start)
+                d_dist = abs(op['x'] - self.lock_end)
+                
+                gate_x = None
+                if not u_open and not d_open:
+                    gate_x = self.lock_start if u_dist < d_dist else self.lock_end
+                elif not u_open:
+                    gate_x = self.lock_start
+                elif not d_open:
+                    gate_x = self.lock_end
+                
+                if gate_x is not None:
+                    dx = gate_x - op['x']
+                    if abs(dx) > 1.0:
+                        op['state'] = 'walking'
+                        op['x'] += 1.2 if dx > 0 else -1.2
+                    else:
+                        # Cross the gate!
+                        op['state'] = 'crossing'
+                        op['side'] = boat_side
+                else:
+                    # Both gates open? Wait at the best spot.
+                    op['state'] = 'waiting'
+            else:
+                # On the correct side, walk to boat center
+                target_x = target_ag.boat.position + target_ag.boat.length / 2
+                dx = target_x - op['x']
+                if abs(dx) > 1.0:
+                    op['state'] = 'walking'
+                    op['x'] += 1.2 if dx > 0 else -1.2
+                else:
+                    # At boat, perform tie or untie
+                    if op['task'] == 'tie':
+                        op['state'] = 'tying'
+                        if op['rope_progress'] < 1.0:
+                            op['rope_progress'] = min(1.0, op['rope_progress'] + 0.05)
+                        else:
+                            target_ag.tied_down = True
+                            target_ag.tied_side = op['side']
+                            op['target_boat'] = None # Task finished
+                    elif op['task'] == 'untie':
+                        op['state'] = 'untying'
+                        if op['rope_progress'] > 0.0:
+                            op['rope_progress'] = max(0.0, op['rope_progress'] - 0.05)
+                        else:
+                            target_ag.tied_down = False
+                            target_ag.tied_side = None
+                            op['target_boat'] = None # Task finished
+        else:
+            # No task: Return to idle position on top side (0) near upstream gate
+            if op['side'] != 0:
+                # Need to cross back
+                u_open = self.lock_dam.upstream_gates_open
+                d_open = self.lock_dam.downstream_gates_open
+                gate_x = self.lock_start if not u_open else (self.lock_end if not d_open else None)
+                if gate_x is not None:
+                    dx = gate_x - op['x']
+                    if abs(dx) > 1.0:
+                        op['state'] = 'walking'
+                        op['x'] += 1.2 if dx > 0 else -1.2
+                    else:
+                        op['side'] = 0
+                else:
+                    op['state'] = 'idle'
+            else:
+                target_x = self.lock_start + 10
+                dx = target_x - op['x']
+                if abs(dx) > 1.0:
+                    op['state'] = 'walking'
+                    op['x'] += 0.8 if dx > 0 else -0.8
+                else:
+                    op['state'] = 'idle'
+            
+            # Gradually retract rope if visible
+            if op['rope_progress'] > 0:
+                op['rope_progress'] = max(0.0, op['rope_progress'] - 0.05)
 
     # ── Agent simulation ──────────────────────────────────────────────────────
 
@@ -884,6 +1170,10 @@ class LockDamVisualizer:
         self.agents = [ag for ag in self.agents if ag.state != "done"]
 
     def _step_agent(self, ag, all_active):
+        if ag.tied_down:
+            ag.is_moving = False
+            return
+
         d    = ag.direction
         boat = ag.boat
         
@@ -991,7 +1281,7 @@ class LockDamVisualizer:
 
     def draw_ui(self):
         # ── Left control panel ────────────────────────────────────────────────
-        pw, ph = 258, 232
+        pw, ph = 258, 256
         panel = pygame.Surface((pw, ph), pygame.SRCALPHA)
         panel.fill((8, 12, 28, 172))
         self.screen.blit(panel, (8, 8))
@@ -1018,6 +1308,7 @@ class LockDamVisualizer:
             ("[H]    Downstream gate",                  (170, 170, 255)),
             ("[F]    Fill chamber",                     fill_col),
             ("[D]    Drain chamber",                    drain_col),
+            ("[V]    Toggle POV View",                  (255, 255, 100)),
         ]
         for j, (txt, col) in enumerate(rows):
             if txt:
@@ -1142,13 +1433,17 @@ class LockDamVisualizer:
                 self.lock_dam.update(dt)
                 self._update_weather(dt)
                 self._update_nature(dt)
+                self._update_operator(dt)
                 self._spawn_if_needed()
                 self._update_agents()
 
             # ── Rendering ─────────────────────────────────────────────────────
             self.screen.fill(self.SKY_BOTTOM)
 
-            self.draw_shore_view()
+            if self.view_mode == "shore":
+                self.draw_shore_view()
+            else:
+                self.draw_operator_view()
 
             self._draw_birds()
             self._draw_rain()
