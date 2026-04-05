@@ -36,7 +36,9 @@ class LockDamVisualizer:
         self.screen = pygame.display.set_mode((self.width, self.height))
         pygame.display.set_caption("Lock & Dam Operator")
         self.clock  = pygame.time.Clock()
-        self.time = 0.0
+        self.time   = 0.0
+        self.game_time = 8.0   # 24-hour clock (8:00 AM)
+        self.time_scale = 5.0  # Hours of game time per real minute
 
         # ── Palette ───────────────────────────────────────────────────────────
         self.SKY_TOP        = ( 85, 140, 220)
@@ -115,6 +117,43 @@ class LockDamVisualizer:
         """Water level (m) → screen y (surface)."""
         return int(self._wl_base - level * self._wl_scale)
 
+    def _interp_col(self, c1, c2, t):
+        t = max(0.0, min(1.0, t))
+        return (
+            int(c1[0] + (c2[0] - c1[0]) * t),
+            int(c1[1] + (c2[1] - c1[1]) * t),
+            int(c1[2] + (c2[2] - c1[2]) * t)
+        )
+
+    def _dim(self, color, mult):
+        return (int(color[0] * mult), int(color[1] * mult), int(color[2] * mult))
+
+    def _get_ambient_mult(self):
+        h = self.game_time
+        if 8.0 <= h < 16.0: return 1.0
+        if 16.0 <= h < 20.0: return 1.0 - (h - 16.0) / 4.0 * 0.7  # Dims to 0.3
+        if 20.0 <= h or h < 5.0: return 0.3
+        if 5.0 <= h < 8.0: return 0.3 + (h - 5.0) / 3.0 * 0.7  # Brightens to 1.0
+        return 1.0
+
+    def _get_sky_colors(self):
+        h = self.game_time
+        night_top, night_bot = (5, 5, 20), (10, 10, 40)
+        day_top,   day_bot   = self.SKY_TOP, self.SKY_BOTTOM
+        sunset_top, sunset_bot = (50, 40, 100), (180, 80, 60)
+        if 5.0 <= h < 8.0: # Dawn
+            t = (h - 5.0) / 3.0
+            return self._interp_col(night_top, day_top, t), self._interp_col(night_bot, day_bot, t)
+        if 8.0 <= h < 16.0: # Day
+            return day_top, day_bot
+        if 16.0 <= h < 20.0: # Dusk
+            t = (h - 16.0) / 4.0
+            return self._interp_col(day_top, sunset_top, t), self._interp_col(day_bot, sunset_bot, t)
+        if 20.0 <= h < 22.0: # Evening
+            t = (h - 20.0) / 2.0
+            return self._interp_col(sunset_top, night_top, t), self._interp_col(sunset_bot, night_bot, t)
+        return night_top, night_bot
+
     # ── Drawing primitives ────────────────────────────────────────────────────
 
     def _gradient_rect(self, c1, c2, rect):
@@ -149,23 +188,27 @@ class LockDamVisualizer:
             pygame.draw.line(self.screen, dash_col, (dx, dy), (dx + 12, dy), 1)
 
     def _draw_sky(self, bottom_y):
-        self._gradient_rect(self.SKY_TOP, self.SKY_BOTTOM, (0, 0, self.width, bottom_y))
+        top, bot = self._get_sky_colors()
+        self._gradient_rect(top, bot, (0, 0, self.width, bottom_y))
 
     def _draw_water_band(self, x, y, w):
         h = self._water_bot_y - y
         if h <= 0 or w <= 0:
             return
-        self._gradient_rect(self.WATER_TOP, self.WATER_BOT, (x, y, w, h))
-        pygame.draw.line(self.screen, self.WATER_SHIMMER, (x, y), (x + w, y), 2)
+        mult = self._get_ambient_mult()
+        self._gradient_rect(self._dim(self.WATER_TOP, mult), self._dim(self.WATER_BOT, mult), (x, y, w, h))
+        pygame.draw.line(self.screen, self._dim(self.WATER_SHIMMER, mult), (x, y), (x + w, y), 2)
 
     def _draw_bank_strip(self, x, top_y, w):
-        pygame.draw.rect(self.screen, self.DIRT,       (x, top_y - 12, w, 12))
-        pygame.draw.rect(self.screen, self.GRASS,      (x, top_y - 26, w, 14))
-        pygame.draw.rect(self.screen, self.GRASS_DARK, (x, top_y - 38, w, 12))
+        mult = self._get_ambient_mult()
+        pygame.draw.rect(self.screen, self._dim(self.DIRT, mult),       (x, top_y - 12, w, 12))
+        pygame.draw.rect(self.screen, self._dim(self.GRASS, mult),      (x, top_y - 26, w, 14))
+        pygame.draw.rect(self.screen, self._dim(self.GRASS_DARK, mult), (x, top_y - 38, w, 12))
 
     def _draw_channel_floor(self, x, w):
-        pygame.draw.rect(self.screen, self.DIRT,  (x, self._water_bot_y,      w, 16))
-        pygame.draw.rect(self.screen, self.GRASS, (x, self._water_bot_y + 16, w, 16))
+        mult = self._get_ambient_mult()
+        pygame.draw.rect(self.screen, self._dim(self.DIRT, mult),  (x, self._water_bot_y,      w, 16))
+        pygame.draw.rect(self.screen, self._dim(self.GRASS, mult), (x, self._water_bot_y + 16, w, 16))
 
     # ── Shore view ────────────────────────────────────────────────────────────
 
@@ -182,6 +225,8 @@ class LockDamVisualizer:
         self._draw_sky(min(up_y, dn_y) - 40)
 
         # Upstream channel
+        mult = self._get_ambient_mult()
+        shimmer_col = self._dim(self.WATER_SHIMMER, mult)
         self._draw_water_band(0, up_y, lk_sx)
         self._lane_divider(0, lk_sx, up_y)
         self._draw_bank_strip(0, up_y, lk_sx)
@@ -189,7 +234,7 @@ class LockDamVisualizer:
         t = self.time * 1.8
         for wx in range(0, lk_sx - 10, 35):
             oy = int(3 * math.sin(t + wx * 0.06))
-            pygame.draw.line(self.screen, self.WATER_SHIMMER,
+            pygame.draw.line(self.screen, shimmer_col,
                              (wx + 5, up_y + oy), (wx + 25, up_y + oy), 1)
 
         # Downstream channel
@@ -199,21 +244,24 @@ class LockDamVisualizer:
         self._draw_channel_floor(lk_ex, self.width - lk_ex)
         for wx in range(lk_ex + 5, self.width - 10, 35):
             oy = int(2 * math.sin(t + wx * 0.06))
-            pygame.draw.line(self.screen, self.WATER_SHIMMER,
+            pygame.draw.line(self.screen, shimmer_col,
                              (wx, dn_y + oy), (wx + 20, dn_y + oy), 1)
 
         # Lock chamber — water fill
+        mult = self._get_ambient_mult()
         inner_x = lk_sx + wall_t
         inner_w = lk_w - 2 * wall_t
-        self._gradient_rect(self.LOCK_WATER_TOP, self.WATER_BOT,
+        self._gradient_rect(self._dim(self.LOCK_WATER_TOP, mult), self._dim(self.WATER_BOT, mult),
                             (inner_x, lk_y, inner_w, self._water_bot_y - lk_y))
-        pygame.draw.line(self.screen, self.WATER_SHIMMER,
+        pygame.draw.line(self.screen, self._dim(self.WATER_SHIMMER, mult),
                          (inner_x, lk_y), (inner_x + inner_w, lk_y), 2)
         self._lane_divider(inner_x, inner_w, lk_y)
         
         # Turbulent water effects when filling or draining
         if self.lock_dam.is_filling or self.lock_dam.is_draining:
             t = self.time * 4
+            bubble_col = self._interp_col((220, 245, 255), (50, 60, 80), 1.0 - mult)
+            streak_col = self._interp_col((240, 250, 255), (70, 80, 100), 1.0 - mult)
             for i in range(20):
                 # Deterministic positions with oscillation
                 rx = (math.sin(i * 1.5 + t) * 0.5 + 0.5) * inner_w
@@ -222,24 +270,26 @@ class LockDamVisualizer:
                 by = lk_y + int(ry)
                 if by < self._water_bot_y:
                     size = 1 + int(2 * (math.sin(t * 2 + i) * 0.5 + 0.5))
-                    pygame.draw.circle(self.screen, (220, 245, 255), (bx, by), size)
+                    pygame.draw.circle(self.screen, bubble_col, (bx, by), size)
                 # Extra white surface streaks
                 sx = inner_x + ( (i * 17 + t * 40) % inner_w )
                 sw = 10 + 5 * math.sin(i + t)
                 if lk_y < self._water_bot_y:
-                    pygame.draw.line(self.screen, (240, 250, 255), (sx, lk_y + 1), (sx + sw, lk_y + 1), 2)
+                    pygame.draw.line(self.screen, streak_col, (sx, lk_y + 1), (sx + sw, lk_y + 1), 2)
 
         # Concrete cap and walls
-        pygame.draw.rect(self.screen, self.CONCRETE,
+        conc_col = self._dim(self.CONCRETE, mult)
+        conc_dark = self._dim(self.CONCRETE_DARK, mult)
+        pygame.draw.rect(self.screen, conc_col,
                          (lk_sx, wall_top, lk_w, lk_y - wall_top))
         for cy in range(wall_top + 10, lk_y, 14):
-            pygame.draw.line(self.screen, self.CONCRETE_DARK,
+            pygame.draw.line(self.screen, conc_dark,
                              (lk_sx, cy), (lk_sx + lk_w, cy), 1)
-        pygame.draw.rect(self.screen, self.CONCRETE,
+        pygame.draw.rect(self.screen, conc_col,
                          (lk_sx, wall_top, wall_t, self._water_bot_y - wall_top))
-        pygame.draw.rect(self.screen, self.CONCRETE,
+        pygame.draw.rect(self.screen, conc_col,
                          (lk_ex - wall_t, wall_top, wall_t, self._water_bot_y - wall_top))
-        pygame.draw.rect(self.screen, self.CONCRETE_DARK,
+        pygame.draw.rect(self.screen, conc_dark,
                          (inner_x, self._water_bot_y, inner_w, 10))
 
         # Gates
@@ -261,8 +311,10 @@ class LockDamVisualizer:
                        "Chamber", self.lock_dam.lock_chamber_level)
 
     def _draw_miter_gate(self, gate_x, wall_top, floor_y, is_open, faces_right):
+        mult = self._get_ambient_mult()
         mid_y  = (wall_top + floor_y) // 2
         color  = self.GREEN if is_open else self.RED
+        color  = self._dim(color, mult)
         shadow = (max(0, color[0] - 60), max(0, color[1] - 60), max(0, color[2] - 60))
         leaf_w = 12
         if is_open:
@@ -299,6 +351,11 @@ class LockDamVisualizer:
         else:
             hull_col = self._boat_color(boat)
             outline  = self.DARK_GRAY
+
+        mult = self._get_ambient_mult()
+        hull_col = self._dim(hull_col, mult)
+        outline = self._dim(outline, mult)
+        is_dark = self.game_time < 6.5 or self.game_time > 18.5
 
         # Clip drawing to the boat's region so hulls never paint over lock walls.
         wt  = self._WALL_T_PX
@@ -344,6 +401,9 @@ class LockDamVisualizer:
             pygame.draw.polygon(self.screen, outline,  pts, 1)
             # Cockpit
             pygame.draw.ellipse(self.screen, self.BLACK, (bx + bw//2 - 2, hull_y - 2, 4, 4))
+            if is_dark:
+                lx = bx + bw if ag.direction == 1 else bx
+                pygame.draw.circle(self.screen, (255, 255, 200), (lx, hull_y), 2)
 
         elif vtype == "yacht":
             bow_cut = max(6, bw // 4)
@@ -356,20 +416,31 @@ class LockDamVisualizer:
             # Cabin
             cab_w, cab_h = bw // 2, bh - 4
             cx_off = (bw - cab_w) // 3 if ag.direction == 1 else (bw - cab_w) // 1.5
-            pygame.draw.rect(self.screen, (200, 200, 200), (bx + cx_off, hull_y - cab_h // 2, cab_w, cab_h))
+            pygame.draw.rect(self.screen, self._dim((200, 200, 200), mult), (bx + cx_off, hull_y - cab_h // 2, cab_w, cab_h))
             pygame.draw.rect(self.screen, outline, (bx + cx_off, hull_y - cab_h // 2, cab_w, cab_h), 1)
             # Windows
             win_w = max(2, cab_w // 4)
+            win_col = (255, 240, 150) if is_dark else self._dim((100, 150, 200), mult)
             for i in range(3):
-                pygame.draw.rect(self.screen, (100, 150, 200), (bx + cx_off + 2 + i * (win_w + 2), hull_y - cab_h // 2 + 2, win_w, cab_h - 4))
+                pygame.draw.rect(self.screen, win_col, (bx + cx_off + 2 + i * (win_w + 2), hull_y - cab_h // 2 + 2, win_w, cab_h - 4))
+            
+            if is_dark:
+                # Nav lights
+                lx = bx + bw - 4 if ag.direction == 1 else bx + 4
+                l_col = self.GREEN if ag.direction == 1 else self.RED
+                pygame.draw.circle(self.screen, l_col, (lx, hull_y - 2), 2)
+                # Stern
+                sx = bx + 2 if ag.direction == 1 else bx + bw - 2
+                pygame.draw.circle(self.screen, self.WHITE, (sx, hull_y - 2), 2)
 
         elif vtype == "barge":
             pygame.draw.rect(self.screen, hull_col, (bx, ty, bw, bh))
             pygame.draw.rect(self.screen, outline,  (bx, ty, bw, bh), 2)
             # Cargo
+            cargo_col = self._dim((100, 80, 60), mult)
             for i in range(3):
                 cargo_x = bx + 5 + i * (bw - 10) // 3
-                pygame.draw.rect(self.screen, (100, 80, 60), (cargo_x, ty + 3, (bw - 10) // 3 - 2, bh - 6))
+                pygame.draw.rect(self.screen, cargo_col, (cargo_x, ty + 3, (bw - 10) // 3 - 2, bh - 6))
             
             # Tug boat (pushing from behind)
             tug_w = max(14, bw // 5)
@@ -380,14 +451,19 @@ class LockDamVisualizer:
                 tx = bx + bw - 2
             
             ty_tug = hull_y - tug_h // 2
-            pygame.draw.rect(self.screen, (55, 55, 55), (tx, ty_tug, tug_w, tug_h))
-            pygame.draw.rect(self.screen, self.BLACK, (tx, ty_tug, tug_w, tug_h), 1)
+            pygame.draw.rect(self.screen, self._dim((55, 55, 55), mult), (tx, ty_tug, tug_w, tug_h))
+            pygame.draw.rect(self.screen, self._dim(self.BLACK, mult), (tx, ty_tug, tug_w, tug_h), 1)
             # Tug cabin
             tc_w, tc_h = tug_w // 2, tug_h - 4
             tc_x = tx + (tug_w - tc_w) // 2
-            pygame.draw.rect(self.screen, (220, 60, 60), (tc_x, ty_tug + 2, tc_w, tc_h))
+            tc_col = (255, 200, 100) if is_dark else self._dim((220, 60, 60), mult)
+            pygame.draw.rect(self.screen, tc_col, (tc_x, ty_tug + 2, tc_w, tc_h))
             # Tug smokestack
-            pygame.draw.rect(self.screen, self.BLACK, (tc_x + tc_w - 4, ty_tug, 2, 4))
+            pygame.draw.rect(self.screen, self._dim(self.BLACK, mult), (tc_x + tc_w - 4, ty_tug, 2, 4))
+            
+            if is_dark:
+                # Nav light on tug
+                pygame.draw.circle(self.screen, self.WHITE, (tx + tug_w//2, ty_tug), 2)
 
         else: # Default trapezoid
             bow_cut = max(4, bw // 5)
@@ -620,10 +696,17 @@ class LockDamVisualizer:
 
         self.screen.blit(
             self.fnt_md.render("Lock & Dam Operator", True, (170, 195, 255)), (16, 13))
+        
+        h = int(self.game_time)
+        m = int((self.game_time * 60) % 60)
+        time_str = f"Time: {h:02d}:{m:02d}"
+        time_col = (255, 255, 150) if (h < 6 or h > 19) else (200, 220, 255)
+
         pygame.draw.line(self.screen, (70, 110, 195), (16, 34), (pw + 6, 34), 1)
 
         rows = [
             (f"Score: {self.score} boats passed",      (255, 238, 140)),
+            (time_str,                                  time_col),
             ("",                                        None),
             ("[G]    Upstream gate",                    (170, 170, 255)),
             ("[H]    Downstream gate",                  (170, 170, 255)),
@@ -746,8 +829,11 @@ class LockDamVisualizer:
                             self.__init__()   # full restart
             else:
                 running = self.handle_input()
-                self.time += 1 / 60
-                self.lock_dam.update(1 / 60)
+                dt = 1 / 60
+                self.time += dt
+                # Advance game time: (seconds * hours/minute) / 60 seconds/minute = hours
+                self.game_time = (self.game_time + (dt * self.time_scale) / 60.0) % 24
+                self.lock_dam.update(dt)
                 self._spawn_if_needed()
                 self._update_agents()
 
