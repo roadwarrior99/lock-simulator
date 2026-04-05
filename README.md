@@ -27,10 +27,10 @@ Boats spawn automatically from both ends of the canal and queue at the lock gate
 Requires Python 3.10+ and pygame.
 
 ```bash
-python -m venv .venv
+python -m venv .venv #Setup a python virtual enviornment
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install pygame
-python game.py
+pip install -r requirements.txt # only required once.
+python game.py # Runs the game
 ```
 
 ## Project Structure
