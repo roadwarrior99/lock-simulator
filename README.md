@@ -33,7 +33,7 @@ Requires Python 3.10+ and pygame.
 python -m venv .venv #Setup a python virtual enviornment
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt # only required once.
-python game.py # Runs the game
+python ld_sim.py # Runs the game
 ```
 
 ## Project Structure

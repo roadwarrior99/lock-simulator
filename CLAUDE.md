@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 source .venv/bin/activate
-python game.py
+python ld_sim.py
 ```
 
 There are no tests or linting setup. The only dependency is `pygame` (plus `matplotlib` and `numpy` in `requirements.txt`, though these are not used by the game).
