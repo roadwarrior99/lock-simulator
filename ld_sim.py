@@ -2265,15 +2265,17 @@ class GameEngine:
             any_saves = True
             try:
                 saved  = load_campaign(self.CAMPAIGN_SAVE)
-                op     = saved['progressions'].get('operator', {})
-                earned = op.get('total_earnings', 0.0)
-                debt   = op.get('debt', 10000.0)
-                bal    = earned - debt
                 stage_label = next(
                     (s['title'] for s in self.STAGES
                      if s['id'] == saved['active_stage_id']), 'Unknown')
+                # Sum earnings and debt across all stages
+                total_earned = sum(p.get('total_earnings', 0.0)
+                                   for p in saved['progressions'].values())
+                total_debt   = sum(p.get('debt', 0.0)
+                                   for p in saved['progressions'].values())
+                bal  = total_earned - total_debt
                 desc = (f"Stage: {stage_label}   "
-                        f"Earned: ${earned:,.0f}   "
+                        f"Earned: ${total_earned:,.0f}   "
                         f"Balance: {'−' if bal < 0 else '+'}${abs(bal):,.0f}")
             except Exception:
                 desc = "Campaign save (unreadable)"
@@ -2573,6 +2575,7 @@ class GameEngine:
             shift_start_time=start,
             cfg_time_scale=2.0,
             dev_mode=self.dev_mode,
+            first_shift=(prog['shift_num'] == 1),
         )
         vis._shift_phase_label = "Night" if is_night else "Day"
         vis._shift_num_label   = f"{prog['shift_num']}"

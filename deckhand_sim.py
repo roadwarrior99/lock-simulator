@@ -95,13 +95,22 @@ class DeckHandCharacter:
     SPEED = 95.0   # px / real-second
     REACH = 40.0   # px; interaction radius
 
+    JUMP_HEIGHT   = 22   # px peak height of jump arc
+    JUMP_DURATION = 0.32  # seconds for one full arc
+
     def __init__(self, x: float, y: float):
         self.x      = float(x)
         self.y      = float(y)
         self.facing = 1   # +1 = right, -1 = left
         self.moving = False
+        self.state  = 'grounded'   # 'grounded' | 'jumping' | 'drowning'
+        self.jump_t = 0.0
+        self.jump_h = 0            # visual vertical offset in px (upward)
 
     def update(self, dt: float, keys, bounds: tuple):
+        if self.state == 'drowning':
+            self.moving = False
+            return
         dx = dy = 0
         if keys[pygame.K_a] or keys[pygame.K_LEFT]:  dx -= 1
         if keys[pygame.K_d] or keys[pygame.K_RIGHT]: dx += 1
@@ -169,7 +178,7 @@ class DeckHandSimulation:
     C_HUD_BG      = ( 18,  26,  42)
 
     def __init__(self, shift_duration=None, shift_start_time=6.0,
-                 cfg_time_scale=2.0, dev_mode=False):
+                 cfg_time_scale=2.0, dev_mode=False, first_shift=True):
         pygame.init()
         self.width  = 1200
         self.height = 800
@@ -208,10 +217,17 @@ class DeckHandSimulation:
         # Layout & objects
         self._build_tow()
 
-        # Task state — seed with all connect tasks (build the tow first)
+        # Task state
         self.active_tasks = []
-        for conn in self.connections:
-            self.active_tasks.append(Task('connect', conn.midpoint, payload=conn))
+        if first_shift:
+            # First shift only: player must connect and tension all cables
+            for conn in self.connections:
+                self.active_tasks.append(Task('connect', conn.midpoint, payload=conn))
+        else:
+            # Tow is already rigged — all cables pre-connected and tensioned
+            for conn in self.connections:
+                conn.connected = True
+                conn.tensioned = True
         self._next_task_t = random.uniform(self.TASK_INTERVAL_MIN,
                                            self.TASK_INTERVAL_MAX)
 
@@ -225,8 +241,32 @@ class DeckHandSimulation:
         self.notif       = ''
         self.notif_timer = 0.0
 
+        # Overboard / game-over state
+        self._overboard      = False
+        self._overboard_t    = 0.0     # countdown until return to menu
+        self._splash_pos     = (0, 0)
+
         # Walk animation
         self._walk_t = 0.0
+
+        # Docking state — mooring tasks only available while docked
+        self._docking         = False
+        self._dock_timer      = random.uniform(40.0, 80.0)   # seconds until first dock
+        self._dock_duration   = 0.0
+
+        # Winch mini-game state
+        self._winch_active     = False
+        self._winch_task       = None
+        self._winch_tension    = 0.5
+        self._winch_vel        = 0.0
+        self._winch_noise_t    = 0.0
+        self._winch_timer      = 10.0
+        self._winch_phase      = 'working'   # 'working' | 'lock_window' | 'result'
+        self._winch_result     = None        # None | 'success' | 'fail'
+        self._winch_result_t   = 0.0
+        self._winch_drum_angle = 0.0
+        self._winch_space_flag = False
+        self._winch_grace_t    = 0.0
 
     # ── Tow geometry ─────────────────────────────────────────────────────────
 
@@ -298,6 +338,20 @@ class DeckHandSimulation:
         # Maintenance spots — centre of each barge deck
         self.maintenance_positions = [b.rect.center for b in self.barges]
 
+        # Inter-barge gap rects (jumping zones)
+        self._gap_rects = []
+        for b in self.barges:
+            right = self._barge_at(b.row, b.col + 1)
+            if right:
+                self._gap_rects.append(
+                    pygame.Rect(b.rect.right, b.rect.top,
+                                self.BARGE_GAP_X, b.rect.height))
+            below = self._barge_at(b.row + 1, b.col)
+            if below:
+                self._gap_rects.append(
+                    pygame.Rect(b.rect.left, b.rect.bottom,
+                                b.rect.width, self.BARGE_GAP_Y))
+
         # Player movement bounds — slightly outside the tow perimeter
         buf = 55
         self._bounds = (
@@ -324,9 +378,10 @@ class DeckHandSimulation:
             if pos not in occupied:
                 candidates.append(Task('paint', pos))
 
-        for pos in self.mooring_positions:
-            if pos not in occupied:
-                candidates.append(Task('moor', pos))
+        if self._docking:
+            for pos in self.mooring_positions:
+                if pos not in occupied:
+                    candidates.append(Task('moor', pos))
 
         if self.lookout_pos not in occupied:
             candidates.append(Task('lookout', self.lookout_pos))
@@ -352,11 +407,427 @@ class DeckHandSimulation:
         self.notif       = msg
         self.notif_timer = 3.2
 
+    # ── Zone helpers ─────────────────────────────────────────────────────────
+
+    def _is_safe_zone(self, x: float, y: float) -> bool:
+        """True if the player is on solid deck (barge, towboat, mooring, lookout, bow)."""
+        px, py = int(x), int(y)
+        for b in self.barges:
+            if b.rect.inflate(4, 4).collidepoint(px, py):
+                return True
+        if self.towboat_rect.inflate(4, 4).collidepoint(px, py):
+            return True
+        for pos in self.mooring_positions:
+            if math.hypot(x - pos[0], y - pos[1]) < 18:
+                return True
+        if math.hypot(x - self.lookout_pos[0], y - self.lookout_pos[1]) < 38:
+            return True
+        # Connector strip between bottom barge row and towboat
+        tow_w = self.TOW_COLS * self.BARGE_W + (self.TOW_COLS - 1) * self.BARGE_GAP_X
+        conn  = pygame.Rect(self.tow_origin_x,
+                            self.tow_origin_y + self.TOW_ROWS * (self.BARGE_H + self.BARGE_GAP_Y) - self.BARGE_GAP_Y,
+                            tow_w, self.BARGE_GAP_Y + 4)
+        if conn.collidepoint(px, py):
+            return True
+        return False
+
+    def _is_gap_zone(self, x: float, y: float) -> bool:
+        """True if the player is over an inter-barge gap (about to jump)."""
+        px, py = int(x), int(y)
+        for gap in self._gap_rects:
+            if gap.collidepoint(px, py):
+                return True
+        return False
+
+    def _trigger_overboard(self):
+        """Called when the player hits the water."""
+        self._overboard   = True
+        self._overboard_t = 3.0
+        self._splash_pos  = (int(self.player.x), int(self.player.y))
+        self.player.state = 'drowning'
+        self.incident_count += 1
+        self.incidents.append('overboard')
+
+    # ── Winch mini-game ──────────────────────────────────────────────────────
+
+    def _start_winch(self, task: Task):
+        """Launch the first-person winch tensioning mini-game."""
+        self._winch_active     = True
+        self._winch_task       = task
+        self._winch_tension    = 0.5 + random.uniform(-0.2, 0.2)
+        self._winch_vel        = random.uniform(-0.05, 0.05)
+        self._winch_noise_t    = random.uniform(0, 100)
+        self._winch_timer      = 10.0 + random.uniform(-1.0, 1.0)
+        self._winch_phase      = 'working'
+        self._winch_result     = None
+        self._winch_result_t   = 0.0
+        self._winch_drum_angle = 0.0
+        self._winch_space_flag = False
+        self._winch_grace_t    = 0.25   # ignore buttons briefly to avoid E-launch bleed
+
+    def _update_winch(self, dt: float):
+        """Update winch mini-game physics and phase transitions."""
+        if self._winch_phase == 'result':
+            self._winch_result_t -= dt
+            if self._winch_result_t <= 0:
+                task = self._winch_task
+                if self._winch_result == 'success':
+                    self._complete_task(task)
+                    if task in self.active_tasks:
+                        self.active_tasks.remove(task)
+                else:
+                    self._notify("Cable tension off — try again")
+                self._winch_active = False
+                self._winch_task   = None
+                self._winch_result = None
+                self._winch_phase  = 'working'
+            return
+
+        # Grace period: ignore player input briefly after launch
+        if self._winch_grace_t > 0:
+            self._winch_grace_t = max(0.0, self._winch_grace_t - dt)
+
+        keys = pygame.key.get_pressed()
+
+        # Oscillating load noise (cable tension from current, barge drift)
+        self._winch_noise_t += dt
+        noise = (math.sin(self._winch_noise_t * 1.7)  * 0.14 +
+                 math.sin(self._winch_noise_t * 3.1)  * 0.07 +
+                 math.sin(self._winch_noise_t * 0.5)  * 0.11)
+        natural_drift = -0.07   # river load tends to loosen the cable
+
+        player_force = 0.0
+        if self._winch_grace_t <= 0:
+            if keys[pygame.K_q]:
+                player_force += 0.85   # tighten
+            if keys[pygame.K_e]:
+                player_force -= 0.85   # release
+
+        accel = natural_drift + noise + player_force
+        self._winch_vel += accel * dt
+        self._winch_vel *= 0.90   # damping
+        self._winch_tension = max(0.0, min(1.0,
+                                  self._winch_tension + self._winch_vel * dt))
+
+        # Drum rotates with cable movement (visual)
+        self._winch_drum_angle += self._winch_vel * 180 * dt
+
+        # Count down to lock
+        self._winch_timer -= dt
+
+        if self._winch_phase == 'working' and self._winch_timer <= 3.0:
+            self._winch_phase = 'lock_window'
+
+        # Player locks with SPACE during lock window
+        if self._winch_phase == 'lock_window' and self._winch_space_flag:
+            self._lock_winch()
+            self._winch_space_flag = False
+            return
+
+        # Auto-lock when timer expires
+        if self._winch_timer <= 0:
+            self._lock_winch()
+
+    def _lock_winch(self):
+        """Evaluate current tension and record result."""
+        t = self._winch_tension
+        if 0.38 <= t <= 0.62:
+            self._winch_result = 'success'
+        else:
+            self._winch_result = 'fail'
+            if t > 0.62:
+                self.incident_count += 1
+                self.incidents.append('winch_overtension')
+        self._winch_phase    = 'result'
+        self._winch_result_t = 2.2
+
+    def _draw_winch(self):
+        """First-person view of the winch tensioning station."""
+        play_w = self.width - 225
+        cx     = play_w // 2
+
+        # ── Background: deck with sky visible ────────────────────────────────
+        # Sky
+        pygame.draw.rect(self.screen, (58, 84, 124), (0, 0, play_w, 210))
+        # River horizon strip
+        pygame.draw.rect(self.screen, (36, 64, 104), (0, 155, play_w, 55))
+        # Deck floor
+        pygame.draw.rect(self.screen, (50, 44, 34), (0, 210, play_w, 210))
+        # Deck planks
+        for px in range(0, play_w, 22):
+            pygame.draw.line(self.screen, (42, 36, 27), (px, 210), (px, 420), 1)
+        pygame.draw.line(self.screen, (68, 60, 46), (0, 210), (play_w, 210), 2)
+
+        # ── Winch drum ────────────────────────────────────────────────────────
+        drum_cx = cx
+        drum_cy = 310
+        drum_w  = 340
+        drum_h  = 110
+        cap_d   = 44
+
+        # Mount base
+        base = pygame.Rect(drum_cx - drum_w // 2 - 30, drum_cy + drum_h // 2,
+                           drum_w + 60, 22)
+        pygame.draw.rect(self.screen, (38, 42, 52), base, border_radius=4)
+        pygame.draw.rect(self.screen, (55, 62, 74), base, 2, border_radius=4)
+
+        # Support uprights
+        for ux in (drum_cx - drum_w // 2 - 22, drum_cx + drum_w // 2):
+            pygame.draw.rect(self.screen, (44, 50, 62),
+                             (ux, drum_cy - drum_h // 2 - 8, 22, drum_h + 30),
+                             border_radius=3)
+
+        # Drum shadow
+        pygame.draw.ellipse(self.screen, (28, 24, 18),
+                            (drum_cx - drum_w // 2 + 12, drum_cy + drum_h // 2 + 4,
+                             drum_w, 16))
+
+        # Drum body
+        pygame.draw.rect(self.screen, (58, 64, 76),
+                         (drum_cx - drum_w // 2, drum_cy - drum_h // 2,
+                          drum_w, drum_h))
+
+        # Cable wrapping — waves when loose, taut lines when tight
+        cable_col = (128, 116, 86)
+        n_wraps   = 9
+        for i in range(n_wraps):
+            wy = drum_cy - drum_h // 2 + 5 + i * (drum_h - 10) // n_wraps
+            thick = max(2, int(2 + self._winch_tension * 2))
+            if self._winch_tension < 0.4:
+                wave_amp = int((0.4 - self._winch_tension) * 22)
+                pts = []
+                for s in range(21):
+                    frac = s / 20
+                    wx  = drum_cx - drum_w // 2 + int(frac * drum_w)
+                    wwy = wy + int(math.sin(frac * math.pi * 3 + i * 1.1) * wave_amp)
+                    pts.append((wx, wwy))
+                if len(pts) > 1:
+                    pygame.draw.lines(self.screen, cable_col, False, pts, thick)
+            else:
+                pygame.draw.line(self.screen, cable_col,
+                                 (drum_cx - drum_w // 2, wy),
+                                 (drum_cx + drum_w // 2, wy), thick)
+
+        # Right end cap (3-D cylinder effect)
+        cap_x = drum_cx + drum_w // 2 - cap_d
+        pygame.draw.ellipse(self.screen, (70, 78, 92),
+                            (cap_x, drum_cy - drum_h // 2, cap_d * 2, drum_h))
+        pygame.draw.ellipse(self.screen, (88, 98, 114),
+                            (cap_x, drum_cy - drum_h // 2, cap_d * 2, drum_h), 2)
+
+        # Axle hub + animated spokes
+        hub_x = drum_cx + drum_w // 2
+        pygame.draw.circle(self.screen, (95, 105, 122), (hub_x, drum_cy), 16)
+        pygame.draw.circle(self.screen, (118, 130, 148), (hub_x, drum_cy), 16, 2)
+        for s in range(4):
+            ang = self._winch_drum_angle * math.pi / 180 + s * math.pi / 2
+            sx  = hub_x + int(math.cos(ang) * 12)
+            sy  = drum_cy + int(math.sin(ang) * 12)
+            pygame.draw.line(self.screen, (78, 88, 104), (hub_x, drum_cy), (sx, sy), 2)
+
+        # Left end cap
+        pygame.draw.ellipse(self.screen, (52, 58, 70),
+                            (drum_cx - drum_w // 2 - cap_d,
+                             drum_cy - drum_h // 2, cap_d * 2, drum_h))
+        pygame.draw.ellipse(self.screen, (70, 78, 90),
+                            (drum_cx - drum_w // 2 - cap_d,
+                             drum_cy - drum_h // 2, cap_d * 2, drum_h), 2)
+
+        # Cable leaving drum toward barge (with sag when loose)
+        cable_exit_y = drum_cy + int((self._winch_tension - 0.5) * drum_h * 0.6)
+        sag = int((1.0 - self._winch_tension) * 36)
+        pts = [(hub_x + cap_d + int((s / 20) * 230),
+                cable_exit_y + int(math.sin((s / 20) * math.pi) * sag))
+               for s in range(21)]
+        pygame.draw.lines(self.screen, cable_col, False, pts, 3)
+        end_lbl = self.fnt_sm.render("-> BARGE", True, (148, 138, 108))
+        self.screen.blit(end_lbl, (hub_x + cap_d + 238, cable_exit_y - 8))
+
+        # ── Control panel (bottom half) ───────────────────────────────────────
+        panel_y = 420
+        pygame.draw.rect(self.screen, (26, 30, 38),
+                         (0, panel_y, play_w, self.height - panel_y))
+        pygame.draw.rect(self.screen, (44, 50, 64), (0, panel_y, play_w, 5))
+
+        # ── Tension gauge ─────────────────────────────────────────────────────
+        gauge_w = 520
+        gauge_h = 36
+        gauge_x = cx - gauge_w // 2
+        gauge_y = panel_y + 44
+
+        # Bezel
+        pygame.draw.rect(self.screen, (16, 20, 26),
+                         (gauge_x - 8, gauge_y - 8, gauge_w + 16, gauge_h + 16),
+                         border_radius=6)
+        # Zone colours
+        for seg_s, seg_e, col in [
+            (0.00, 0.25, (158, 34, 34)),
+            (0.25, 0.38, (182, 128, 24)),
+            (0.38, 0.62, (34, 158, 54)),
+            (0.62, 0.75, (182, 128, 24)),
+            (0.75, 1.00, (158, 34, 34)),
+        ]:
+            zx = gauge_x + int(seg_s * gauge_w)
+            zw = max(1, int((seg_e - seg_s) * gauge_w))
+            pygame.draw.rect(self.screen, col, (zx, gauge_y, zw, gauge_h))
+        # Sweet-spot edge highlights
+        ss_x = gauge_x + int(0.38 * gauge_w)
+        ss_w = int(0.24 * gauge_w)
+        pygame.draw.rect(self.screen, (58, 208, 78), (ss_x, gauge_y, ss_w, 3))
+        pygame.draw.rect(self.screen, (58, 208, 78),
+                         (ss_x, gauge_y + gauge_h - 3, ss_w, 3))
+        # Gauge border
+        pygame.draw.rect(self.screen, (88, 98, 115),
+                         (gauge_x, gauge_y, gauge_w, gauge_h), 2, border_radius=2)
+
+        # Needle
+        nx = gauge_x + int(self._winch_tension * gauge_w)
+        pygame.draw.line(self.screen, (238, 238, 238),
+                         (nx, gauge_y - 14), (nx, gauge_y + gauge_h + 14), 3)
+        pygame.draw.polygon(self.screen, (238, 238, 238),
+                            [(nx, gauge_y - 14),
+                             (nx - 7, gauge_y - 4),
+                             (nx + 7, gauge_y - 4)])
+
+        # Gauge labels
+        ll = self.fnt_sm.render("<< TOO LOOSE", True, (208, 108, 108))
+        lt = self.fnt_sm.render("TOO TIGHT >>", True, (208, 108, 108))
+        ls = self.fnt_sm.render("SWEET SPOT",   True, (88, 218, 108))
+        self.screen.blit(ll, (gauge_x, gauge_y + gauge_h + 10))
+        self.screen.blit(lt, (gauge_x + gauge_w - lt.get_width(), gauge_y + gauge_h + 10))
+        self.screen.blit(ls, (cx - ls.get_width() // 2, gauge_y + gauge_h + 10))
+        gt = self.fnt_sm.render("CABLE TENSION", True, (135, 152, 172))
+        self.screen.blit(gt, (cx - gt.get_width() // 2, gauge_y - 22))
+
+        # ── Timer / phase display ─────────────────────────────────────────────
+        timer_y = panel_y + 104
+        if self._winch_phase == 'working':
+            ts = self.fnt_md.render(
+                f"Lock in: {max(0.0, self._winch_timer):.1f}s", True, (155, 180, 210))
+            self.screen.blit(ts, (cx - ts.get_width() // 2, timer_y))
+        elif self._winch_phase == 'lock_window':
+            if int(self.real_time * 4) % 2 == 0:
+                fs = self.fnt_lg.render("** LOCK IT NOW! **", True, (78, 238, 100))
+                self.screen.blit(fs, (cx - fs.get_width() // 2, timer_y - 6))
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_y = panel_y + 150
+        btn_w = 150
+        btn_h = 58
+        keys  = pygame.key.get_pressed()
+        q_on  = keys[pygame.K_q]
+        e_on  = keys[pygame.K_e]
+
+        # Q — TIGHTEN (left)
+        q_x  = cx - 290
+        q_bg = (74, 148, 192) if q_on else (36, 70, 98)
+        q_br = (98, 182, 232) if q_on else (52, 92, 128)
+        pygame.draw.rect(self.screen, q_bg, (q_x, btn_y, btn_w, btn_h), border_radius=8)
+        pygame.draw.rect(self.screen, q_br, (q_x, btn_y, btn_w, btn_h), 2, border_radius=8)
+        for lbl, dy in (("[Q]", 6), ("TIGHTEN", 32)):
+            surf = (self.fnt_md if dy == 6 else self.fnt_sm).render(lbl, True, (218, 235, 252))
+            self.screen.blit(surf, (q_x + btn_w // 2 - surf.get_width() // 2, btn_y + dy))
+        # Arrow →
+        ax, ay = q_x + btn_w + 12, btn_y + btn_h // 2
+        arr_c = (98, 182, 232) if q_on else (58, 98, 128)
+        pygame.draw.polygon(self.screen, arr_c,
+                            [(ax, ay), (ax + 18, ay - 12), (ax + 18, ay + 12)])
+
+        # E — RELEASE (right)
+        e_x  = cx + 140
+        e_bg = (192, 88, 52) if e_on else (102, 46, 26)
+        e_br = (232, 112, 72) if e_on else (132, 62, 38)
+        pygame.draw.rect(self.screen, e_bg, (e_x, btn_y, btn_w, btn_h), border_radius=8)
+        pygame.draw.rect(self.screen, e_br, (e_x, btn_y, btn_w, btn_h), 2, border_radius=8)
+        for lbl, dy in (("[E]", 6), ("RELEASE", 32)):
+            surf = (self.fnt_md if dy == 6 else self.fnt_sm).render(lbl, True, (252, 225, 208))
+            self.screen.blit(surf, (e_x + btn_w // 2 - surf.get_width() // 2, btn_y + dy))
+        # Arrow ←
+        ax2, ay2 = e_x - 30, btn_y + btn_h // 2
+        arr_c2 = (232, 112, 72) if e_on else (132, 62, 38)
+        pygame.draw.polygon(self.screen, arr_c2,
+                            [(ax2 + 18, ay2), (ax2, ay2 - 12), (ax2, ay2 + 12)])
+
+        # SPACE — LOCK IN (center, only during lock window)
+        if self._winch_phase == 'lock_window':
+            lk_w = 160
+            lk_x = cx - lk_w // 2
+            lk_f = int(self.real_time * 3) % 2 == 0
+            lk_bg = (44, 172, 72) if lk_f else (26, 108, 46)
+            lk_br = (72, 228, 108) if lk_f else (44, 152, 68)
+            pygame.draw.rect(self.screen, lk_bg,
+                             (lk_x, btn_y - 4, lk_w, btn_h + 8), border_radius=10)
+            pygame.draw.rect(self.screen, lk_br,
+                             (lk_x, btn_y - 4, lk_w, btn_h + 8), 3, border_radius=10)
+            for lbl, dy in (("[SPACE]", 4), ("LOCK IN", 32)):
+                surf = (self.fnt_md if dy == 4 else self.fnt_sm).render(
+                    lbl, True, (208, 244, 218))
+                self.screen.blit(surf, (cx - surf.get_width() // 2, btn_y + dy))
+
+        # ── Result overlay ────────────────────────────────────────────────────
+        if self._winch_result is not None:
+            overlay = pygame.Surface((play_w, self.height), pygame.SRCALPHA)
+            if self._winch_result == 'success':
+                overlay.fill((28, 158, 68, 148))
+                r_text, r_col = "TENSION LOCKED!", (118, 252, 148)
+            else:
+                overlay.fill((158, 28, 28, 148))
+                r_text, r_col = "TENSION OFF -- RETRY", (252, 128, 108)
+            self.screen.blit(overlay, (0, 0))
+            rs = self.fnt_lg.render(r_text, True, r_col)
+            self.screen.blit(rs, (cx - rs.get_width() // 2, self.height // 2 - 28))
+
+        # ── Sidebar HUD + controls hint ───────────────────────────────────────
+        self._draw_hud()
+        hint = self.fnt_sm.render("ESC -- leave winch", True, (84, 94, 114))
+        self.screen.blit(hint, (10, self.height - 26))
+        title = self.fnt_md.render("WINCH STATION", True, (152, 138, 104))
+        self.screen.blit(title, (cx - title.get_width() // 2, 12))
+
     # ── Update ───────────────────────────────────────────────────────────────
 
     def _update(self, dt: float, game_dt: float):
+        # Winch mini-game takes over completely
+        if self._winch_active:
+            if self.notif_timer > 0:
+                self.notif_timer -= dt
+            self.game_time = (self.game_time + game_dt) % 24
+            self._update_winch(dt)
+            return
+
+        if self._overboard:
+            self._overboard_t -= dt
+            if self.notif_timer > 0:
+                self.notif_timer -= dt
+            self.game_time = (self.game_time + game_dt) % 24
+            return
+
         keys = pygame.key.get_pressed()
         self.player.update(dt, keys, self._bounds)
+
+        # Jump / overboard state machine
+        in_gap  = self._is_gap_zone(self.player.x, self.player.y)
+        on_safe = self._is_safe_zone(self.player.x, self.player.y)
+
+        if self.player.state == 'grounded':
+            if in_gap:
+                self.player.state  = 'jumping'
+                self.player.jump_t = 0.0
+            elif not on_safe:
+                self._trigger_overboard()
+                return
+
+        elif self.player.state == 'jumping':
+            self.player.jump_t += dt
+            frac = min(self.player.jump_t / DeckHandCharacter.JUMP_DURATION, 1.0)
+            self.player.jump_h = int(math.sin(frac * math.pi) * DeckHandCharacter.JUMP_HEIGHT)
+            if not in_gap:
+                if on_safe:
+                    self.player.state  = 'grounded'
+                    self.player.jump_h = 0
+                else:
+                    self._trigger_overboard()
+                    return
 
         # Walk animation timer
         if self.player.moving:
@@ -365,6 +836,23 @@ class DeckHandSimulation:
         # Notification fade
         if self.notif_timer > 0:
             self.notif_timer -= dt
+
+        # Docking cycle
+        self._dock_timer -= dt
+        if self._dock_timer <= 0:
+            if self._docking:
+                # Undock — remove any pending mooring tasks
+                self._docking = False
+                self.active_tasks = [t for t in self.active_tasks
+                                     if t.task_type != 'moor']
+                self._notify("Underway — lines cast off")
+                self._dock_timer = random.uniform(50.0, 100.0)
+            else:
+                # Begin docking
+                self._docking       = True
+                self._dock_duration = random.uniform(25.0, 50.0)
+                self._dock_timer    = self._dock_duration
+                self._notify("Docking — secure the mooring lines!")
 
         # Task spawn
         self._next_task_t -= dt
@@ -378,6 +866,13 @@ class DeckHandSimulation:
         completed = []
 
         for task in self.active_tasks:
+            # Tension tasks launch the winch mini-game instead of hold-E
+            if task.task_type == 'tension':
+                if self.player.near(task.position) and e_held:
+                    self._start_winch(task)
+                    break
+                continue
+
             if self.player.near(task.position):
                 if e_held:
                     task.active   = True
@@ -401,17 +896,22 @@ class DeckHandSimulation:
     # ── Rendering ────────────────────────────────────────────────────────────
 
     def _draw(self):
+        if self._winch_active:
+            self._draw_winch()
+            return
+
         play_w = self.width - 225
 
         # ── River background ──
         self.screen.fill(self.C_RIVER)
 
-        # Animated current streaks
-        for i in range(-80, play_w + 80, 75):
-            off = int((self.real_time * 28 + i * 9) % 75)
-            x = i + off
+        # Animated current streaks — water flows downward toward the towboat
+        scroll = int(self.real_time * 48) % (self.height + 80)
+        for i in range(0, play_w, 68):
+            phase = (i * 17) % (self.height + 80)
+            y0 = (phase + scroll) % (self.height + 80) - 40
             pygame.draw.line(self.screen, self.C_RIVER_LINE,
-                             (x, 0), (x - 35, self.height), 1)
+                             (i + 8, y0), (i, y0 + 44), 1)
 
         # ── Towboat ──
         pygame.draw.rect(self.screen, self.C_TOWBOAT,
@@ -493,21 +993,60 @@ class DeckHandSimulation:
 
         # ── Player character ──
         px, py = int(self.player.x), int(self.player.y)
+        jh  = self.player.jump_h
+        bob = int(math.sin(self._walk_t * 10) * 2) if (self.player.moving and jh == 0) else 0
+        draw_y = py - jh   # visual position (elevated during jump)
 
-        # Walking bob
-        bob = int(math.sin(self._walk_t * 10) * 2) if self.player.moving else 0
+        # Shadow on deck below when jumping
+        if jh > 0:
+            shadow_r = max(3, 8 - jh // 4)
+            shadow_a = max(30, 120 - jh * 4)
+            sh_surf = pygame.Surface((shadow_r * 2, shadow_r), pygame.SRCALPHA)
+            pygame.draw.ellipse(sh_surf, (0, 0, 0, shadow_a),
+                                (0, 0, shadow_r * 2, shadow_r))
+            self.screen.blit(sh_surf, (px - shadow_r, py - shadow_r // 2))
 
         # Body
         pygame.draw.ellipse(self.screen, self.C_PLAYER,
-                            (px - 7, py - 5 + bob, 14, 10))
+                            (px - 7, draw_y - 5 + bob, 14, 10))
         # Head
-        pygame.draw.circle(self.screen, self.C_PLAYER_HEAD, (px, py - 10 + bob), 6)
+        pygame.draw.circle(self.screen, self.C_PLAYER_HEAD, (px, draw_y - 10 + bob), 6)
         # Hard hat
         pygame.draw.ellipse(self.screen, (255, 210, 30),
-                            (px - 7, py - 17 + bob, 14, 7))
+                            (px - 7, draw_y - 17 + bob, 14, 7))
         # Direction pointer
         ex = px + self.player.facing * 14
-        pygame.draw.line(self.screen, self.C_PLAYER, (px, py + bob), (ex, py + bob), 2)
+        pygame.draw.line(self.screen, self.C_PLAYER,
+                         (px, draw_y + bob), (ex, draw_y + bob), 2)
+
+        # ── Overboard overlay ──
+        if self._overboard:
+            sx, sy   = self._splash_pos
+            elapsed  = 3.0 - self._overboard_t
+            # Expanding splash rings
+            for ring_i in range(4):
+                ring_age = elapsed - ring_i * 0.18
+                if 0 < ring_age < 1.2:
+                    r     = int(ring_age * 55)
+                    alpha = max(0, int(180 * (1 - ring_age / 1.2)))
+                    if r > 0 and alpha > 0:
+                        rs = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+                        pygame.draw.ellipse(rs, (*self.C_RIVER_LINE, alpha),
+                                            (0, 0, r * 2, r * 2), 2)
+                        self.screen.blit(rs, (sx - r, sy - r))
+            # Dark blue tint deepens over time
+            tint_a = min(200, int(elapsed * 80))
+            tint = pygame.Surface((play_w, self.height), pygame.SRCALPHA)
+            tint.fill((10, 20, 60, tint_a))
+            self.screen.blit(tint, (0, 0))
+            # "MAN OVERBOARD!" flash
+            if int(elapsed * 3) % 2 == 0 or elapsed > 1.5:
+                mob = self.fnt_lg.render("MAN OVERBOARD!", True, (255, 80, 60))
+                self.screen.blit(mob, (play_w // 2 - mob.get_width() // 2,
+                                       self.height // 2 - 28))
+            hint = self.fnt_sm.render("Returning to menu...", True, (180, 190, 220))
+            self.screen.blit(hint, (play_w // 2 - hint.get_width() // 2,
+                                    self.height // 2 + 18))
 
         # ── Notification banner ──
         if self.notif_timer > 0:
@@ -564,6 +1103,18 @@ class DeckHandSimulation:
         sc = self.fnt_md.render(f'Tasks: {self.score}', True, (255, 238, 140))
         self.screen.blit(sc, (cx - sc.get_width() // 2, y)); y += 28
 
+        # Docking status
+        if self._docking:
+            rem_d = max(0.0, self._dock_timer)
+            ds = self.fnt_sm.render(
+                f'DOCKED  {int(rem_d)}s remaining', True, (255, 200, 80))
+            self.screen.blit(ds, (cx - ds.get_width() // 2, y)); y += 18
+        else:
+            next_d = max(0.0, self._dock_timer)
+            ds = self.fnt_sm.render(f'Underway  dock in {int(next_d)}s',
+                                    True, (130, 145, 160))
+            self.screen.blit(ds, (cx - ds.get_width() // 2, y)); y += 18
+
         # Cable status
         n_conn = sum(1 for c in self.connections if c.connected)
         n_taut = sum(1 for c in self.connections if c.tensioned)
@@ -613,7 +1164,17 @@ class DeckHandSimulation:
                 return 'quit'
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    return 'menu'
+                    if self._winch_active:
+                        # Cancel winch, leave task for retry
+                        self._winch_active = False
+                        self._winch_task   = None
+                        self._winch_result = None
+                        self._winch_phase  = 'working'
+                    else:
+                        return 'menu'
+                elif event.key == pygame.K_SPACE:
+                    if self._winch_active and self._winch_phase == 'lock_window':
+                        self._winch_space_flag = True
                 elif self.dev_mode:
                     if event.key == pygame.K_RIGHTBRACKET:
                         self.time_scale = min(60.0, self.time_scale * 2.0)
@@ -645,6 +1206,11 @@ class DeckHandSimulation:
             game_dt = (dt * self.time_scale) / 60.0
             self.real_time           += dt
             self.shift_hours_elapsed += game_dt
+
+            if self._overboard and self._overboard_t <= 0:
+                result  = 'menu'
+                running = False
+                continue
 
             if (self._cfg_shift_duration is not None
                     and self.shift_hours_elapsed >= self._cfg_shift_duration):
