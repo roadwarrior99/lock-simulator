@@ -103,9 +103,10 @@ class DeckHandCharacter:
         self.y      = float(y)
         self.facing = 1   # +1 = right, -1 = left
         self.moving = False
-        self.state  = 'grounded'   # 'grounded' | 'jumping' | 'drowning'
-        self.jump_t = 0.0
-        self.jump_h = 0            # visual vertical offset in px (upward)
+        self.state           = 'grounded'   # 'grounded' | 'jumping' | 'drowning'
+        self.jump_t          = 0.0
+        self.jump_h          = 0            # visual vertical offset in px (upward)
+        self.jump_crossed_gap = False       # True once jump has passed through a gap
 
     def update(self, dt: float, keys, bounds: tuple):
         if self.state == 'drowning':
@@ -338,19 +339,39 @@ class DeckHandSimulation:
         # Maintenance spots — centre of each barge deck
         self.maintenance_positions = [b.rect.center for b in self.barges]
 
-        # Inter-barge gap rects (jumping zones)
+        # Inter-barge gap rects (water — falling in triggers overboard)
         self._gap_rects = []
+        # Approach strips — thin zones on barge faces adjacent to each gap;
+        # standing here shows the "[SPACE] Jump" prompt.
+        _APPROACH = 28   # px strip width on the barge face
+        self._approach_rects = []
         for b in self.barges:
             right = self._barge_at(b.row, b.col + 1)
             if right:
                 self._gap_rects.append(
                     pygame.Rect(b.rect.right, b.rect.top,
                                 self.BARGE_GAP_X, b.rect.height))
+                # strip on right edge of left barge
+                self._approach_rects.append(
+                    pygame.Rect(b.rect.right - _APPROACH, b.rect.top,
+                                _APPROACH, b.rect.height))
+                # strip on left edge of right barge
+                self._approach_rects.append(
+                    pygame.Rect(right.rect.left, right.rect.top,
+                                _APPROACH, right.rect.height))
             below = self._barge_at(b.row + 1, b.col)
             if below:
                 self._gap_rects.append(
                     pygame.Rect(b.rect.left, b.rect.bottom,
                                 b.rect.width, self.BARGE_GAP_Y))
+                # strip on bottom edge of top barge
+                self._approach_rects.append(
+                    pygame.Rect(b.rect.left, b.rect.bottom - _APPROACH,
+                                b.rect.width, _APPROACH))
+                # strip on top edge of bottom barge
+                self._approach_rects.append(
+                    pygame.Rect(below.rect.left, below.rect.top,
+                                below.rect.width, _APPROACH))
 
         # Player movement bounds — slightly outside the tow perimeter
         buf = 55
@@ -432,10 +453,18 @@ class DeckHandSimulation:
         return False
 
     def _is_gap_zone(self, x: float, y: float) -> bool:
-        """True if the player is over an inter-barge gap (about to jump)."""
+        """True if the player is over an inter-barge gap (water — causes overboard)."""
         px, py = int(x), int(y)
         for gap in self._gap_rects:
             if gap.collidepoint(px, py):
+                return True
+        return False
+
+    def _is_approach_zone(self, x: float, y: float) -> bool:
+        """True if the player is in the jump-approach strip at the edge of a barge."""
+        px, py = int(x), int(y)
+        for ap in self._approach_rects:
+            if ap.collidepoint(px, py):
                 return True
         return False
 
@@ -811,8 +840,8 @@ class DeckHandSimulation:
 
         if self.player.state == 'grounded':
             if in_gap:
-                self.player.state  = 'jumping'
-                self.player.jump_t = 0.0
+                self._trigger_overboard()
+                return
             elif not on_safe:
                 self._trigger_overboard()
                 return
@@ -821,13 +850,22 @@ class DeckHandSimulation:
             self.player.jump_t += dt
             frac = min(self.player.jump_t / DeckHandCharacter.JUMP_DURATION, 1.0)
             self.player.jump_h = int(math.sin(frac * math.pi) * DeckHandCharacter.JUMP_HEIGHT)
-            if not in_gap:
+            if in_gap:
+                self.player.jump_crossed_gap = True
+            elif self.player.jump_crossed_gap:
+                # Exited the gap — evaluate landing
                 if on_safe:
-                    self.player.state  = 'grounded'
-                    self.player.jump_h = 0
+                    self.player.state             = 'grounded'
+                    self.player.jump_h            = 0
+                    self.player.jump_crossed_gap  = False
                 else:
                     self._trigger_overboard()
                     return
+            elif self.player.jump_t >= DeckHandCharacter.JUMP_DURATION:
+                # Jump expired without crossing a gap — just land in place
+                self.player.state             = 'grounded'
+                self.player.jump_h            = 0
+                self.player.jump_crossed_gap  = False
 
         # Walk animation timer
         if self.player.moving:
@@ -1140,10 +1178,11 @@ class DeckHandSimulation:
             self.screen.blit(tl, (hud_x + 96, y)); y += 18
 
         # Controls footer
-        y = self.height - 108
+        y = self.height - 128
         for line, col in [
             ('WASD / arrows  Move',    (120, 138, 168)),
             ('[E] hold  Work task',    (120, 138, 168)),
+            ('[SPACE]  Jump gap',      (120, 138, 168)),
             ('[ESC]  Menu',            (95,  112, 142)),
         ]:
             ls = self.fnt_sm.render(line, True, col)
@@ -1175,6 +1214,12 @@ class DeckHandSimulation:
                 elif event.key == pygame.K_SPACE:
                     if self._winch_active and self._winch_phase == 'lock_window':
                         self._winch_space_flag = True
+                    elif (not self._winch_active and not self._overboard
+                          and self.player.state == 'grounded'
+                          and self._is_safe_zone(self.player.x, self.player.y)):
+                        self.player.state             = 'jumping'
+                        self.player.jump_t            = 0.0
+                        self.player.jump_crossed_gap  = False
                 elif self.dev_mode:
                     if event.key == pygame.K_RIGHTBRACKET:
                         self.time_scale = min(60.0, self.time_scale * 2.0)
