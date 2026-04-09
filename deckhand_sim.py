@@ -284,6 +284,7 @@ class DeckHandSimulation:
         # Barge door mini-game state
         self._bdoor_active    = False
         self._bdoor_task      = None
+        self._bdoor_barge_pos = None   # door_positions key for the active barge
         self._bdoor_open      = 0.0     # 0=closed, 1=fully open
         self._bdoor_amps      = 0.0     # normalised 0–1; > AMP_LIMIT trips breaker
         self._bdoor_noise_t   = 0.0
@@ -373,6 +374,8 @@ class DeckHandSimulation:
             (b.rect.centerx, b.rect.y + 22)
             for b in self.barges if b.row == 0
         ]
+        # Persistent open-fraction for each bow barge door (0=closed, 1=open)
+        self._barge_door_open = {pos: 0.0 for pos in self.door_positions}
 
         # Inter-barge gap rects (water — falling in triggers overboard)
         self._gap_rects = []
@@ -472,6 +475,9 @@ class DeckHandSimulation:
             task.payload.connected = True
         elif task.task_type == 'tension' and task.payload:
             task.payload.tensioned = True
+        elif task.task_type == 'barge_doors':
+            self._barge_door_open[task.position] = 1.0
+            self._bdoor_barge_pos = None
         elif task.task_type == 'moor' and self._docking and not self._moored:
             self._dock_moor_done += 1
             if self._dock_moor_done >= self._dock_moor_needed:
@@ -889,8 +895,9 @@ class DeckHandSimulation:
 
     def _start_barge_doors(self, task: Task):
         """Launch the first-person cargo door control panel."""
-        self._bdoor_active   = True
-        self._bdoor_task     = task
+        self._bdoor_active    = True
+        self._bdoor_task      = task
+        self._bdoor_barge_pos = task.position
         self._bdoor_open     = 0.0
         self._bdoor_amps     = 0.0
         self._bdoor_noise_t  = random.uniform(0, 100)
@@ -1506,6 +1513,58 @@ class DeckHandSimulation:
             id_lbl = self.fnt_sm.render(f"B{b.barge_id}", True, (95, 85, 60))
             self.screen.blit(id_lbl, (b.rect.x + 5, b.rect.y + 4))
 
+            # ── Cargo hatch (bow barges only) ─────────────────────────────
+            if b.row == 0:
+                door_pos = (b.rect.centerx, b.rect.y + 22)
+                if self._bdoor_active and self._bdoor_barge_pos == door_pos:
+                    open_frac = self._bdoor_open   # live during mini-game
+                else:
+                    open_frac = self._barge_door_open.get(door_pos, 0.0)
+
+                hatch_w = b.rect.width - 24
+                hatch_h = 32
+                hatch_x = b.rect.x + 12
+                hatch_y = b.rect.y + 10
+
+                # Dark hold interior behind the doors
+                pygame.draw.rect(self.screen, (14, 12, 10),
+                                 (hatch_x, hatch_y, hatch_w, hatch_h), border_radius=2)
+
+                # Two door panels sliding outward from centre
+                panel_w  = hatch_w // 2
+                slide_px = int(open_frac * panel_w)
+
+                old_clip = self.screen.get_clip()
+                self.screen.set_clip(pygame.Rect(hatch_x, hatch_y, hatch_w, hatch_h))
+
+                panel_col = (82, 90, 108)
+                for side, px_ in ((-1, hatch_x + panel_w - slide_px - panel_w),
+                                   (1,  hatch_x + panel_w + slide_px)):
+                    pr = pygame.Rect(px_, hatch_y, panel_w, hatch_h)
+                    pygame.draw.rect(self.screen, panel_col, pr)
+                    # Rivet row
+                    for rv in range(pr.x + 8, pr.right - 4, 14):
+                        pygame.draw.circle(self.screen, (62, 68, 82), (rv, hatch_y + hatch_h // 2), 2)
+
+                self.screen.set_clip(old_clip)
+
+                # Hatch frame
+                pygame.draw.rect(self.screen, (55, 62, 74),
+                                 (hatch_x, hatch_y, hatch_w, hatch_h), 2, border_radius=2)
+
+                # Status badge
+                if open_frac >= 0.98:
+                    badge_col, badge_txt = (28, 128, 52), "OPEN"
+                else:
+                    badge_col, badge_txt = (108, 42, 32), "CLOSED"
+                badge_s = self.fnt_sm.render(badge_txt, True, (220, 235, 220))
+                bx_ = b.rect.centerx - badge_s.get_width() // 2
+                by_ = hatch_y + hatch_h + 3
+                pygame.draw.rect(self.screen, badge_col,
+                                 (bx_ - 3, by_ - 1, badge_s.get_width() + 6, badge_s.get_height() + 2),
+                                 border_radius=3)
+                self.screen.blit(badge_s, (bx_, by_))
+
         # ── Mooring cleats ──
         for pos in self.mooring_positions:
             pygame.draw.rect(self.screen, self.C_CLEAT,
@@ -1727,11 +1786,12 @@ class DeckHandSimulation:
                         self._winch_phase  = 'working'
                     elif self._bdoor_active:
                         # Cancel barge door panel, leave task for retry
-                        self._bdoor_active = False
-                        self._bdoor_task   = None
-                        self._bdoor_result = None
-                        self._bdoor_phase  = 'control'
-                        self._bdoor_amps   = 0.0
+                        self._bdoor_active    = False
+                        self._bdoor_task      = None
+                        self._bdoor_result    = None
+                        self._bdoor_phase     = 'control'
+                        self._bdoor_amps      = 0.0
+                        self._bdoor_barge_pos = None
                     else:
                         return 'menu'
                 elif event.key == pygame.K_SPACE:
