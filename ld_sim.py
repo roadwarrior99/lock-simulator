@@ -651,23 +651,39 @@ class LockDamVisualizer:
                                              (cx_, deck_y - cargo_h, seg_w - 2, cargo_h))
                             pygame.draw.rect(self.screen, outline,
                                              (cx_, deck_y - cargo_h, seg_w - 2, cargo_h), 1)
-                        # Tug at stern
-                        tug_w = max(12, bw // 5)
+                        # Towboat at stern — flat-bowed river pusher
+                        tug_w = max(16, bw // 4)
+                        tx_ = lx - tug_w + 5 if ag.direction == 1 else rx - 5
+                        tug_hull_col = self._dim((38, 38, 42), mult)
+                        pygame.draw.rect(self.screen, tug_hull_col,
+                                         (tx_, deck_y, tug_w, by - deck_y))
+                        pygame.draw.rect(self.screen, outline,
+                                         (tx_, deck_y, tug_w, by - deck_y), 1)
+                        # Wheelhouse
                         tug_h = bh * 3 // 5
-                        tug_col = self._dim((55, 55, 55), mult)
-                        tx_ = lx - tug_w + 2 if ag.direction == 1 else rx - 2
                         tug_y = deck_y - tug_h
-                        pygame.draw.rect(self.screen, tug_col, (tx_, tug_y, tug_w, tug_h + (by - deck_y)))
-                        pygame.draw.rect(self.screen, outline, (tx_, tug_y, tug_w, tug_h + (by - deck_y)), 1)
                         tc_col = (255, 195, 90) if is_dark else self._dim((210, 55, 55), mult)
-                        tc_w = tug_w * 2 // 3
-                        tc_h = tug_h * 2 // 3
+                        tc_w = tug_w * 3 // 4
                         pygame.draw.rect(self.screen, tc_col,
-                                         (tx_ + (tug_w - tc_w) // 2, tug_y + 2, tc_w, tc_h))
-                        # smokestack
-                        stk_x = tx_ + tug_w // 2 - 1
-                        pygame.draw.rect(self.screen, self._dim((30, 30, 30), mult),
-                                         (stk_x, tug_y - 6, 3, 8))
+                                         (tx_ + (tug_w - tc_w) // 2, tug_y, tc_w, tug_h))
+                        pygame.draw.rect(self.screen, outline,
+                                         (tx_ + (tug_w - tc_w) // 2, tug_y, tc_w, tug_h), 1)
+                        # Windows
+                        win_col = (255, 245, 150) if is_dark else self._dim((140, 200, 235), mult)
+                        ww = max(2, tc_w // 4)
+                        for i in range(2):
+                            pygame.draw.rect(self.screen, win_col,
+                                             (tx_ + (tug_w - tc_w) // 2 + 2 + i * (tc_w // 2),
+                                              tug_y + 2, ww, tug_h - 4))
+                        # Two smokestacks at stern
+                        stk_col = self._dim((22, 22, 22), mult)
+                        stk_h = tug_h // 2 + 2
+                        if ag.direction == 1:
+                            s1x, s2x = tx_ + tug_w - 7, tx_ + tug_w - 12
+                        else:
+                            s1x, s2x = tx_ + 4, tx_ + 9
+                        pygame.draw.rect(self.screen, stk_col, (s1x, tug_y - stk_h, 3, stk_h + 2))
+                        pygame.draw.rect(self.screen, stk_col, (s2x, tug_y - stk_h + 2, 3, stk_h))
                         if is_dark:
                             pygame.draw.circle(self.screen, self._dim(self.WHITE, mult),
                                                (tx_ + tug_w // 2, tug_y - 2), 2)
@@ -859,8 +875,8 @@ class LockDamVisualizer:
             # For barges, the wake starts behind the tug boat.
             wx = bx
             if vtype == "barge":
-                tug_w = max(14, bw // 5)
-                wx -= (tug_w - 2) if ag.direction == 1 else -(bw + tug_w - 2)
+                tug_w = max(20, bw // 4)
+                wx -= (tug_w - 5) if ag.direction == 1 else -(bw + tug_w - 5)
             else:
                 wx = bx if ag.direction == 1 else bx + bw
 
@@ -923,28 +939,47 @@ class LockDamVisualizer:
                 cargo_x = bx + 5 + i * (bw - 10) // 3
                 pygame.draw.rect(self.screen, cargo_col, (cargo_x, ty + 3, (bw - 10) // 3 - 2, bh - 6))
             
-            # Tug boat (pushing from behind)
-            tug_w = max(14, bw // 5)
-            tug_h = bh - 2
+            # Towboat (pushing from behind) — flat-bowed river pusher
+            tug_w = max(20, bw // 4)
             if ag.direction == 1:
-                tx = bx - tug_w + 2
+                tx = bx - tug_w + 5   # flat bow flush against barge stern
             else:
-                tx = bx + bw - 2
-            
-            ty_tug = hull_y - tug_h // 2
-            pygame.draw.rect(self.screen, self._dim((55, 55, 55), mult), (tx, ty_tug, tug_w, tug_h))
-            pygame.draw.rect(self.screen, self._dim(self.BLACK, mult), (tx, ty_tug, tug_w, tug_h), 1)
-            # Tug cabin
-            tc_w, tc_h = tug_w // 2, tug_h - 4
-            tc_x = tx + (tug_w - tc_w) // 2
-            tc_col = (255, 200, 100) if is_dark else self._dim((220, 60, 60), mult)
-            pygame.draw.rect(self.screen, tc_col, (tc_x, ty_tug + 2, tc_w, tc_h))
-            # Tug smokestack
-            pygame.draw.rect(self.screen, self._dim(self.BLACK, mult), (tc_x + tc_w - 4, ty_tug, 2, 4))
-            
+                tx = bx + bw - 5
+            ty_tug = ty   # same top as barge hull
+
+            # Dark lower hull — full barge height
+            tug_hull_col = self._dim((38, 38, 42), mult)
+            pygame.draw.rect(self.screen, tug_hull_col, (tx, ty_tug, tug_w, bh))
+            pygame.draw.rect(self.screen, outline, (tx, ty_tug, tug_w, bh), 1)
+
+            # Wheelhouse — tall superstructure above deck
+            wh_w = max(8, tug_w * 3 // 4)
+            wh_h = bh - 2
+            wh_x = tx + (tug_w - wh_w) // 2
+            wh_y = ty_tug - wh_h
+            tc_col = (255, 200, 100) if is_dark else self._dim((210, 55, 50), mult)
+            pygame.draw.rect(self.screen, tc_col, (wh_x, wh_y, wh_w, wh_h))
+            pygame.draw.rect(self.screen, outline, (wh_x, wh_y, wh_w, wh_h), 1)
+            # Wheelhouse windows
+            win_col = (255, 245, 150) if is_dark else self._dim((140, 200, 235), mult)
+            win_w = max(2, wh_w // 4)
+            for i in range(2):
+                pygame.draw.rect(self.screen, win_col,
+                                 (wh_x + 2 + i * (wh_w // 2), wh_y + 2, win_w, wh_h - 4))
+
+            # Two smokestacks at stern (away from barges)
+            stk_col = self._dim((22, 22, 22), mult)
+            stk_h = bh // 2 + 2
+            if ag.direction == 1:
+                s1x, s2x = tx + tug_w - 8, tx + tug_w - 13
+            else:
+                s1x, s2x = tx + 5, tx + 10
+            pygame.draw.rect(self.screen, stk_col, (s1x, wh_y - stk_h, 3, stk_h + 2))
+            pygame.draw.rect(self.screen, stk_col, (s2x, wh_y - stk_h + 2, 3, stk_h))
+
             if is_dark:
-                # Nav light on tug
-                pygame.draw.circle(self.screen, self.WHITE, (tx + tug_w//2, ty_tug), 2)
+                # Masthead nav light
+                pygame.draw.circle(self.screen, self.WHITE, (tx + tug_w // 2, wh_y - 2), 2)
 
         elif vtype == "paddleboat":
             # Chunky rectangular hull with rounded bow

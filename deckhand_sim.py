@@ -159,7 +159,7 @@ class DeckHandSimulation:
     BARGE_W     = 190    # px width  (beam direction on screen)
     BARGE_H     = 95     # px height (length direction on screen)
     BARGE_GAP_X = 12     # px gap between columns (cable run)
-    BARGE_GAP_Y = 12     # px gap between rows
+    BARGE_GAP_Y = 0      # no gap between rows — towboat compression holds them flush
 
     # Task timing
     TASK_INTERVAL_MIN = 14.0   # real seconds between random task spawns
@@ -347,32 +347,32 @@ class DeckHandSimulation:
 
         # Towboat — pushes from stern (bottom of screen)
         tb_w = tow_w
-        tb_h = 68
+        tb_h = 80
         tb_x = self.tow_origin_x
-        tb_y = self.tow_origin_y + tow_h + self.BARGE_GAP_Y
+        tb_y = self.tow_origin_y + tow_h + 3   # tight against barges
         self.towboat_rect = pygame.Rect(tb_x, tb_y, tb_w, tb_h)
 
-        # Lookout post — bow (top centre of tow)
-        self.lookout_pos = (
-            self.tow_origin_x + tow_w // 2,
-            self.tow_origin_y - 32,
-        )
+        # Lookout post — centre of the left bow barge (avoids the column gap)
+        self.lookout_pos = self.barges[0].rect.center
 
-        # Mooring cleats — port (left) and starboard (right) of each row
+        # Mooring cleats — port (left) and starboard (right) of each row + towboat
         self.mooring_positions = []
         for row in range(self.TOW_ROWS):
             cy = self.tow_origin_y + row * (self.BARGE_H + self.BARGE_GAP_Y) + self.BARGE_H // 2
             self.mooring_positions.append((self.tow_origin_x - 22, cy))          # port
             self.mooring_positions.append((self.tow_origin_x + tow_w + 22, cy))  # starboard
+        # Towboat cleats — midship on each side
+        tb_cy = self.tow_origin_y + tow_h + 3 + 80 // 2   # towboat_rect.centery
+        self.mooring_positions.append((self.tow_origin_x - 22, tb_cy))           # port
+        self.mooring_positions.append((self.tow_origin_x + tow_w + 22, tb_cy))   # starboard
 
         # Maintenance spots — centre of each barge deck
         self.maintenance_positions = [b.rect.center for b in self.barges]
 
-        # Cargo door positions — near top edge of each bow barge (row 0),
-        # distinct from the centre-of-barge maintenance positions.
+        # Cargo door positions — near top edge of every barge.
         self.door_positions = [
-            (b.rect.centerx, b.rect.y + 22)
-            for b in self.barges if b.row == 0
+            (b.rect.centerx, b.rect.y + 34)
+            for b in self.barges
         ]
         # Persistent open-fraction for each bow barge door (0=closed, 1=open)
         self._barge_door_open = {pos: 0.0 for pos in self.door_positions}
@@ -1475,20 +1475,73 @@ class DeckHandSimulation:
                                    dock_y + 4))
 
         # ── Towboat ──
-        pygame.draw.rect(self.screen, self.C_TOWBOAT,
-                         self.towboat_rect, border_radius=8)
-        # Wheelhouse
-        wh = pygame.Rect(self.towboat_rect.centerx - 32,
-                         self.towboat_rect.y + 6, 64, 48)
-        pygame.draw.rect(self.screen, (88, 104, 126), wh, border_radius=5)
-        # Windows
-        for wx in (wh.x + 10, wh.x + 36):
-            pygame.draw.rect(self.screen, (160, 190, 215),
-                             pygame.Rect(wx, wh.y + 10, 14, 12), border_radius=2)
-        # "TOWBOAT" label
-        lbl = self.fnt_sm.render("TOWBOAT", True, (160, 175, 195))
-        self.screen.blit(lbl, (self.towboat_rect.centerx - lbl.get_width() // 2,
-                               self.towboat_rect.y + 4))
+        tr = self.towboat_rect
+        taper = 14   # stern (bottom) narrows by this much on each side
+
+        # Hull — polygon with tapered stern
+        hull_pts = [
+            (tr.x,          tr.y),
+            (tr.right,       tr.y),
+            (tr.right - taper, tr.bottom),
+            (tr.x + taper,   tr.bottom),
+        ]
+        pygame.draw.polygon(self.screen, (32, 36, 44), hull_pts)
+        pygame.draw.polygon(self.screen, (20, 22, 28), hull_pts, 2)
+
+        # Outer deck plate (slightly inset from rail)
+        deck_pts = [
+            (tr.x + 6,          tr.y + 14),
+            (tr.right - 6,       tr.y + 14),
+            (tr.right - taper - 2, tr.bottom - 4),
+            (tr.x + taper + 2,   tr.bottom - 4),
+        ]
+        pygame.draw.polygon(self.screen, (50, 56, 68), deck_pts)
+
+        # Push bumpers at bow face — rubber/steel pads that contact barges
+        bump_col = (75, 82, 95)
+        for bx in range(tr.x, tr.right - 20, 26):
+            pygame.draw.rect(self.screen, bump_col, (bx, tr.y, 22, 10), border_radius=2)
+            pygame.draw.rect(self.screen, (50, 55, 65), (bx, tr.y, 22, 10), 1, border_radius=2)
+
+        # ── Wheelhouse block (Level 1 — main deck house) ──
+        L1_w = tr.width - 24
+        L1_h = 38
+        L1_x = tr.x + 12
+        L1_y = tr.y + 14
+        pygame.draw.rect(self.screen, (62, 78, 102), (L1_x, L1_y, L1_w, L1_h), border_radius=4)
+        pygame.draw.rect(self.screen, (42, 58, 82),  (L1_x, L1_y, L1_w, L1_h), 1, border_radius=4)
+
+        # Bridge wings — small platforms poking out each side
+        wing_w, wing_h = 14, 18
+        wing_y = L1_y + (L1_h - wing_h) // 2
+        for wx in (L1_x - wing_w, L1_x + L1_w):
+            pygame.draw.rect(self.screen, (55, 70, 94), (wx, wing_y, wing_w, wing_h), border_radius=2)
+            pygame.draw.rect(self.screen, (38, 52, 72), (wx, wing_y, wing_w, wing_h), 1, border_radius=2)
+
+        # Level 2 — wheelhouse proper (narrower, sits above L1)
+        L2_w = L1_w - 48
+        L2_h = 24
+        L2_x = L1_x + 24
+        L2_y = L1_y + 7
+        pygame.draw.rect(self.screen, (82, 104, 138), (L2_x, L2_y, L2_w, L2_h), border_radius=3)
+        pygame.draw.rect(self.screen, (58, 82, 118),  (L2_x, L2_y, L2_w, L2_h), 1, border_radius=3)
+
+        # Window bank across wheelhouse
+        win_col = (162, 202, 228)
+        n_wins  = 7
+        slot    = (L2_w - 10) // n_wins
+        for i in range(n_wins):
+            wx = L2_x + 5 + i * slot
+            pygame.draw.rect(self.screen, win_col,
+                             pygame.Rect(wx, L2_y + 5, slot - 3, L2_h - 10), border_radius=1)
+
+        # ── Twin exhaust stacks — circles at stern, seen from above ──
+        stk_y = tr.bottom - 16
+        for stk_x in (tr.centerx - 36, tr.centerx + 36):
+            pygame.draw.circle(self.screen, (25, 25, 25), (stk_x, stk_y), 12)
+            pygame.draw.circle(self.screen, (8,   8,  8), (stk_x, stk_y),  7)
+            # Hot rim
+            pygame.draw.circle(self.screen, (55, 46, 36), (stk_x, stk_y), 12, 2)
 
         # ── Cables (draw under barges so they appear to pass between them) ──
         for conn in self.connections:
@@ -1513,57 +1566,56 @@ class DeckHandSimulation:
             id_lbl = self.fnt_sm.render(f"B{b.barge_id}", True, (95, 85, 60))
             self.screen.blit(id_lbl, (b.rect.x + 5, b.rect.y + 4))
 
-            # ── Cargo hatch (bow barges only) ─────────────────────────────
-            if b.row == 0:
-                door_pos = (b.rect.centerx, b.rect.y + 22)
-                if self._bdoor_active and self._bdoor_barge_pos == door_pos:
-                    open_frac = self._bdoor_open   # live during mini-game
-                else:
-                    open_frac = self._barge_door_open.get(door_pos, 0.0)
+            # ── Cargo hatch ───────────────────────────────────────────────
+            door_pos = (b.rect.centerx, b.rect.y + 34)
+            if self._bdoor_active and self._bdoor_barge_pos == door_pos:
+                open_frac = self._bdoor_open   # live during mini-game
+            else:
+                open_frac = self._barge_door_open.get(door_pos, 0.0)
 
-                hatch_w = b.rect.width - 24
-                hatch_h = 32
-                hatch_x = b.rect.x + 12
-                hatch_y = b.rect.y + 10
+            hatch_w = b.rect.width - 60
+            hatch_h = 48
+            hatch_x = b.rect.x + 30
+            hatch_y = b.rect.y + 10
 
-                # Dark hold interior behind the doors
-                pygame.draw.rect(self.screen, (14, 12, 10),
-                                 (hatch_x, hatch_y, hatch_w, hatch_h), border_radius=2)
+            # Dark hold interior behind the doors
+            pygame.draw.rect(self.screen, (14, 12, 10),
+                             (hatch_x, hatch_y, hatch_w, hatch_h), border_radius=2)
 
-                # Two door panels sliding outward from centre
-                panel_w  = hatch_w // 2
-                slide_px = int(open_frac * panel_w)
+            # Two door panels sliding outward from centre
+            panel_w  = hatch_w // 2
+            slide_px = int(open_frac * panel_w)
 
-                old_clip = self.screen.get_clip()
-                self.screen.set_clip(pygame.Rect(hatch_x, hatch_y, hatch_w, hatch_h))
+            old_clip = self.screen.get_clip()
+            self.screen.set_clip(pygame.Rect(hatch_x, hatch_y, hatch_w, hatch_h))
 
-                panel_col = (82, 90, 108)
-                for side, px_ in ((-1, hatch_x + panel_w - slide_px - panel_w),
-                                   (1,  hatch_x + panel_w + slide_px)):
-                    pr = pygame.Rect(px_, hatch_y, panel_w, hatch_h)
-                    pygame.draw.rect(self.screen, panel_col, pr)
-                    # Rivet row
-                    for rv in range(pr.x + 8, pr.right - 4, 14):
-                        pygame.draw.circle(self.screen, (62, 68, 82), (rv, hatch_y + hatch_h // 2), 2)
+            panel_col = (82, 90, 108)
+            for side, px_ in ((-1, hatch_x + panel_w - slide_px - panel_w),
+                               (1,  hatch_x + panel_w + slide_px)):
+                pr = pygame.Rect(px_, hatch_y, panel_w, hatch_h)
+                pygame.draw.rect(self.screen, panel_col, pr)
+                # Rivet row
+                for rv in range(pr.x + 8, pr.right - 4, 14):
+                    pygame.draw.circle(self.screen, (62, 68, 82), (rv, hatch_y + hatch_h // 2), 2)
 
-                self.screen.set_clip(old_clip)
+            self.screen.set_clip(old_clip)
 
-                # Hatch frame
-                pygame.draw.rect(self.screen, (55, 62, 74),
-                                 (hatch_x, hatch_y, hatch_w, hatch_h), 2, border_radius=2)
+            # Hatch frame
+            pygame.draw.rect(self.screen, (55, 62, 74),
+                             (hatch_x, hatch_y, hatch_w, hatch_h), 2, border_radius=2)
 
-                # Status badge
-                if open_frac >= 0.98:
-                    badge_col, badge_txt = (28, 128, 52), "OPEN"
-                else:
-                    badge_col, badge_txt = (108, 42, 32), "CLOSED"
-                badge_s = self.fnt_sm.render(badge_txt, True, (220, 235, 220))
-                bx_ = b.rect.centerx - badge_s.get_width() // 2
-                by_ = hatch_y + hatch_h + 3
-                pygame.draw.rect(self.screen, badge_col,
-                                 (bx_ - 3, by_ - 1, badge_s.get_width() + 6, badge_s.get_height() + 2),
-                                 border_radius=3)
-                self.screen.blit(badge_s, (bx_, by_))
+            # Status badge
+            if open_frac >= 0.98:
+                badge_col, badge_txt = (28, 128, 52), "OPEN"
+            else:
+                badge_col, badge_txt = (108, 42, 32), "CLOSED"
+            badge_s = self.fnt_sm.render(badge_txt, True, (220, 235, 220))
+            bx_ = b.rect.centerx - badge_s.get_width() // 2
+            by_ = hatch_y + hatch_h + 3
+            pygame.draw.rect(self.screen, badge_col,
+                             (bx_ - 3, by_ - 1, badge_s.get_width() + 6, badge_s.get_height() + 2),
+                             border_radius=3)
+            self.screen.blit(badge_s, (bx_, by_))
 
         # ── Mooring cleats ──
         for pos in self.mooring_positions:
