@@ -58,18 +58,22 @@ class Task:
     """
 
     HOLD_TIMES = {
-        'connect': 1.5,
-        'tension': 3.0,
-        'moor':    2.0,
-        'paint':   4.0,
-        'lookout': 5.0,
+        'connect':     1.5,
+        'tension':     3.0,
+        'moor':        2.0,
+        'unmoor':      2.0,
+        'paint':       4.0,
+        'lookout':     5.0,
+        'barge_doors': 0.0,   # launches sub-game, not hold-E
     }
     LABELS = {
-        'connect': 'Connect cable',
-        'tension': 'Tighten winch',
-        'moor':    'Secure mooring',
-        'paint':   'Maintenance',
-        'lookout': 'Stand watch',
+        'connect':     'Connect cable',
+        'tension':     'Tighten winch',
+        'moor':        'Secure mooring',
+        'unmoor':      'Cast off line',
+        'paint':       'Maintenance',
+        'lookout':     'Stand watch',
+        'barge_doors': 'Open cargo doors',
     }
 
     def __init__(self, task_type: str, position: tuple, payload=None):
@@ -96,7 +100,7 @@ class DeckHandCharacter:
     REACH = 40.0   # px; interaction radius
 
     JUMP_HEIGHT   = 22   # px peak height of jump arc
-    JUMP_DURATION = 0.32  # seconds for one full arc
+    JUMP_DURATION = 0.50  # seconds for one full arc
 
     def __init__(self, x: float, y: float):
         self.x      = float(x)
@@ -154,8 +158,8 @@ class DeckHandSimulation:
     TOW_ROWS    = 3
     BARGE_W     = 190    # px width  (beam direction on screen)
     BARGE_H     = 95     # px height (length direction on screen)
-    BARGE_GAP_X = 20     # px gap between columns (cable run)
-    BARGE_GAP_Y = 20     # px gap between rows
+    BARGE_GAP_X = 12     # px gap between columns (cable run)
+    BARGE_GAP_Y = 12     # px gap between rows
 
     # Task timing
     TASK_INTERVAL_MIN = 14.0   # real seconds between random task spawns
@@ -251,9 +255,17 @@ class DeckHandSimulation:
         self._walk_t = 0.0
 
         # Docking state — mooring tasks only available while docked
-        self._docking         = False
-        self._dock_timer      = random.uniform(40.0, 80.0)   # seconds until first dock
-        self._dock_duration   = 0.0
+        self._docking          = False
+        self._dock_timer       = random.uniform(40.0, 80.0)   # seconds until first dock
+        self._dock_duration    = 0.0
+        self._dock_approach    = 0.0   # 0=far, 1=fully alongside; animates on approach
+        self._moored           = False  # True once all port lines are secured
+        self._dock_moor_needed = 0      # port mooring tasks spawned this cycle
+        self._dock_moor_done   = 0      # port mooring tasks completed this cycle
+        self._unmooring        = False  # True when stay is over, casting off
+        self._unmoor_needed    = 0      # unmoor tasks spawned this cycle
+        self._unmoor_done      = 0      # unmoor tasks completed this cycle
+        self._departing        = False  # True while dock slides away after unmoor
 
         # Winch mini-game state
         self._winch_active     = False
@@ -268,6 +280,22 @@ class DeckHandSimulation:
         self._winch_drum_angle = 0.0
         self._winch_space_flag = False
         self._winch_grace_t    = 0.0
+
+        # Barge door mini-game state
+        self._bdoor_active    = False
+        self._bdoor_task      = None
+        self._bdoor_open      = 0.0     # 0=closed, 1=fully open
+        self._bdoor_amps      = 0.0     # normalised 0–1; > AMP_LIMIT trips breaker
+        self._bdoor_noise_t   = 0.0
+        self._bdoor_phase     = 'control'   # 'control' | 'result'
+        self._bdoor_result    = None        # None | 'success' | 'fail'
+        self._bdoor_result_t  = 0.0
+        self._bdoor_trip_t    = 0.0     # accumulates time amps are over limit
+        self._bdoor_grace_t   = 0.0
+        self._bdoor_spark_pts = []      # [(x,y,age), …] sparks on short circuit
+        # Constants
+        self._BDOOR_AMP_LIMIT  = 0.78
+        self._BDOOR_TRIP_DELAY = 0.55
 
     # ── Tow geometry ─────────────────────────────────────────────────────────
 
@@ -339,6 +367,13 @@ class DeckHandSimulation:
         # Maintenance spots — centre of each barge deck
         self.maintenance_positions = [b.rect.center for b in self.barges]
 
+        # Cargo door positions — near top edge of each bow barge (row 0),
+        # distinct from the centre-of-barge maintenance positions.
+        self.door_positions = [
+            (b.rect.centerx, b.rect.y + 22)
+            for b in self.barges if b.row == 0
+        ]
+
         # Inter-barge gap rects (water — falling in triggers overboard)
         self._gap_rects = []
         # Approach strips — thin zones on barge faces adjacent to each gap;
@@ -382,6 +417,21 @@ class DeckHandSimulation:
             self.towboat_rect.bottom + buf,
         )
 
+        # Dock geometry (port side) — matches rendering constants in _draw.
+        # Inflated 8 px rightward so stepping from barge hull onto dock is seamless.
+        _dock_face = self.tow_origin_x - 4
+        _dock_w    = 68
+        self._dock_rect = pygame.Rect(
+            _dock_face - _dock_w,
+            self.tow_origin_y - 10,
+            _dock_w + 8,
+            tow_h + 20,
+        )
+        # Port-side mooring positions (left side of tow — facing the dock)
+        self._port_mooring_pos = [
+            p for p in self.mooring_positions if p[0] < self.tow_origin_x
+        ]
+
     def _barge_at(self, row: int, col: int):
         for b in self.barges:
             if b.row == row and b.col == col:
@@ -422,6 +472,24 @@ class DeckHandSimulation:
             task.payload.connected = True
         elif task.task_type == 'tension' and task.payload:
             task.payload.tensioned = True
+        elif task.task_type == 'moor' and self._docking and not self._moored:
+            self._dock_moor_done += 1
+            if self._dock_moor_done >= self._dock_moor_needed:
+                self._moored       = True
+                self._dock_timer   = self._dock_duration   # start stay timer now
+                self._notify("Ship secured!  Cargo doors ready.")
+                return   # skip generic notify
+        elif task.task_type == 'unmoor' and self._unmooring:
+            self._unmoor_done += 1
+            if self._unmoor_done >= self._unmoor_needed:
+                # All lines cast off — start dock departure
+                self._unmooring  = False
+                self._departing  = True
+                self._moored     = False
+                self.active_tasks = [t for t in self.active_tasks
+                                     if t.task_type not in ('unmoor', 'barge_doors')]
+                self._notify("Lines cast off — getting underway!")
+                return   # skip generic notify
         self._notify(f'+${self.TASK_BONUS:.0f}  {task.label} done')
 
     def _notify(self, msg: str):
@@ -431,13 +499,17 @@ class DeckHandSimulation:
     # ── Zone helpers ─────────────────────────────────────────────────────────
 
     def _is_safe_zone(self, x: float, y: float) -> bool:
-        """True if the player is on solid deck (barge, towboat, mooring, lookout, bow)."""
+        """True if the player is on solid deck (barge, towboat, mooring, lookout, bow, dock)."""
         px, py = int(x), int(y)
         for b in self.barges:
             if b.rect.inflate(4, 4).collidepoint(px, py):
                 return True
         if self.towboat_rect.inflate(4, 4).collidepoint(px, py):
             return True
+        # Dock platform — walkable once fully alongside
+        if self._docking and self._dock_approach >= 1.0:
+            if self._dock_rect.collidepoint(px, py):
+                return True
         for pos in self.mooring_positions:
             if math.hypot(x - pos[0], y - pos[1]) < 18:
                 return True
@@ -813,6 +885,330 @@ class DeckHandSimulation:
         title = self.fnt_md.render("WINCH STATION", True, (152, 138, 104))
         self.screen.blit(title, (cx - title.get_width() // 2, 12))
 
+    # ── Barge door mini-game ─────────────────────────────────────────────────
+
+    def _start_barge_doors(self, task: Task):
+        """Launch the first-person cargo door control panel."""
+        self._bdoor_active   = True
+        self._bdoor_task     = task
+        self._bdoor_open     = 0.0
+        self._bdoor_amps     = 0.0
+        self._bdoor_noise_t  = random.uniform(0, 100)
+        self._bdoor_phase    = 'control'
+        self._bdoor_result   = None
+        self._bdoor_result_t = 0.0
+        self._bdoor_trip_t   = 0.0
+        self._bdoor_grace_t  = 0.3
+        self._bdoor_spark_pts = []
+
+    def _update_barge_doors(self, dt: float):
+        """Physics and state transitions for the cargo door panel."""
+        if self._bdoor_phase == 'result':
+            self._bdoor_result_t -= dt
+            if self._bdoor_result_t <= 0:
+                task = self._bdoor_task
+                if self._bdoor_result == 'success':
+                    self._complete_task(task)
+                    if task in self.active_tasks:
+                        self.active_tasks.remove(task)
+                else:
+                    self._notify("Circuit tripped — doors reset")
+                    self._bdoor_open = 0.0
+                self._bdoor_active = False
+                self._bdoor_task   = None
+                self._bdoor_result = None
+                self._bdoor_phase  = 'control'
+            # Age out sparks
+            self._bdoor_spark_pts = [
+                (x, y, age - dt) for x, y, age in self._bdoor_spark_pts if age > 0
+            ]
+            return
+
+        if self._bdoor_grace_t > 0:
+            self._bdoor_grace_t = max(0.0, self._bdoor_grace_t - dt)
+
+        keys = pygame.key.get_pressed()
+        open_held  = keys[pygame.K_q] and self._bdoor_grace_t <= 0
+        close_held = keys[pygame.K_e] and self._bdoor_grace_t <= 0
+
+        # Amps model: rise when powering motor, fall when idle
+        if open_held:
+            self._bdoor_amps = min(1.0, self._bdoor_amps + dt * 0.55)
+        elif close_held:
+            self._bdoor_amps = min(1.0, self._bdoor_amps + dt * 0.30)
+        else:
+            self._bdoor_amps = max(0.0, self._bdoor_amps - dt * 0.80)
+
+        # Noise — scaled by dt and only present when motor is drawing current,
+        # so idle amps stay at 0 regardless of frame rate.
+        self._bdoor_noise_t += dt
+        if self._bdoor_amps > 0.02:
+            noise = (math.sin(self._bdoor_noise_t * 2.3) * 0.35 +
+                     math.sin(self._bdoor_noise_t * 7.1) * 0.15) * dt
+            self._bdoor_amps = max(0.0, min(1.0, self._bdoor_amps + noise))
+
+        # Door movement — opens when motor running below amp limit
+        if open_held and self._bdoor_amps < self._BDOOR_AMP_LIMIT:
+            self._bdoor_open = min(1.0, self._bdoor_open + dt * 0.10)
+        if close_held:
+            self._bdoor_open = max(0.0, self._bdoor_open - dt * 0.12)
+
+        # Trip accumulator
+        if self._bdoor_amps >= self._BDOOR_AMP_LIMIT:
+            self._bdoor_trip_t += dt
+        else:
+            self._bdoor_trip_t = max(0.0, self._bdoor_trip_t - dt * 0.5)
+
+        if self._bdoor_trip_t >= self._BDOOR_TRIP_DELAY:
+            # SHORT CIRCUIT — spawn sparks, log incident
+            play_w = self.width - 225
+            for _ in range(18):
+                sx = random.randint(play_w // 4, 3 * play_w // 4)
+                sy = random.randint(200, 420)
+                self._bdoor_spark_pts.append((sx, sy, 1.0 + random.random()))
+            self.incident_count += 1
+            self.incidents.append('electrical_short')
+            self._bdoor_result   = 'fail'
+            self._bdoor_phase    = 'result'
+            self._bdoor_result_t = 2.5
+            self._bdoor_amps     = 0.0
+            self._bdoor_trip_t   = 0.0
+            return
+
+        # Success — doors fully open
+        if self._bdoor_open >= 0.98:
+            self._bdoor_result   = 'success'
+            self._bdoor_phase    = 'result'
+            self._bdoor_result_t = 2.2
+
+    def _draw_barge_doors(self):
+        """First-person view: cargo hold doors and control panel."""
+        play_w = self.width - 225
+        cx     = play_w // 2
+
+        # ── Background: sky + dock + barge deck ──────────────────────────────
+        # Sky
+        pygame.draw.rect(self.screen, (52, 72, 108), (0, 0, play_w, 190))
+        # Dock / shore silhouette
+        pygame.draw.rect(self.screen, (38, 52, 38), (0, 160, play_w, 40))
+        # Deck surface
+        pygame.draw.rect(self.screen, (62, 55, 40), (0, 200, play_w, 220))
+        # Deck plank lines
+        for px_ in range(0, play_w, 24):
+            pygame.draw.line(self.screen, (52, 45, 32), (px_, 200), (px_, 420), 1)
+        pygame.draw.line(self.screen, (78, 70, 52), (0, 200), (play_w, 200), 2)
+
+        # ── Cargo hatch opening ───────────────────────────────────────────────
+        # The hatch is a rectangular pit centered on the deck
+        hatch_cx = cx
+        hatch_y  = 230
+        hatch_w  = 420
+        hatch_h  = 140
+
+        # Dark hold interior
+        pygame.draw.rect(self.screen, (14, 12, 10),
+                         (hatch_cx - hatch_w // 2, hatch_y, hatch_w, hatch_h))
+
+        # Draw contents visible inside hold when open
+        if self._bdoor_open > 0.05:
+            alpha_int = min(255, int(self._bdoor_open * 280))
+            # Cargo outlines
+            for i, (rx, ry, rw, rh) in enumerate([
+                (hatch_cx - 160, hatch_y + 20, 80, 60),
+                (hatch_cx - 60,  hatch_y + 30, 80, 50),
+                (hatch_cx + 50,  hatch_y + 15, 90, 65),
+            ]):
+                shade = max(0, min(255, int(alpha_int * 0.4)))
+                s = pygame.Surface((rw, rh), pygame.SRCALPHA)
+                s.fill((80, 68, 44, shade))
+                self.screen.blit(s, (rx, ry))
+
+        # Hatch rim (steel frame)
+        pygame.draw.rect(self.screen, (68, 74, 88),
+                         (hatch_cx - hatch_w // 2 - 10, hatch_y - 8,
+                          hatch_w + 20, hatch_h + 16), 10, border_radius=4)
+
+        # ── Door panels (two halves sliding apart) ────────────────────────────
+        door_w_max = hatch_w // 2   # fully closed: each door covers half the hatch
+        door_open_px = int(self._bdoor_open * door_w_max)   # how far each door has slid
+
+        for side in (-1, 1):   # -1=left door, +1=right door
+            # Each door slides outward from centre
+            if side == -1:
+                door_x = hatch_cx - hatch_w // 2 - door_open_px
+            else:
+                door_x = hatch_cx + door_open_px
+            door_rect = pygame.Rect(door_x, hatch_y - 8, door_w_max + 10, hatch_h + 16)
+
+            # Clip drawing to the hatch area + a bit of rim so doors don't
+            # overlap the deck texture once open
+            old_clip = self.screen.get_clip()
+            clip_margin = 14
+            self.screen.set_clip(pygame.Rect(
+                hatch_cx - hatch_w // 2 - clip_margin, hatch_y - clip_margin,
+                hatch_w + clip_margin * 2, hatch_h + clip_margin * 2
+            ))
+
+            # Door surface (steel plate)
+            pygame.draw.rect(self.screen, (78, 86, 102), door_rect, border_radius=3)
+            # Rivet rows
+            for ry_ in range(hatch_y + 10, hatch_y + hatch_h, 28):
+                for rx_ in range(door_rect.x + 14, door_rect.right - 10, 30):
+                    pygame.draw.circle(self.screen, (55, 62, 74), (rx_, ry_), 3)
+                    pygame.draw.circle(self.screen, (92, 102, 118), (rx_, ry_), 3, 1)
+            # Handle / latch bar
+            bar_y = hatch_y + hatch_h // 2
+            pygame.draw.rect(self.screen, (44, 50, 62),
+                             (door_rect.x + 8, bar_y - 5, door_rect.width - 16, 10),
+                             border_radius=4)
+            pygame.draw.rect(self.screen, (62, 70, 84),
+                             (door_rect.x + 8, bar_y - 5, door_rect.width - 16, 10),
+                             1, border_radius=4)
+
+            self.screen.set_clip(old_clip)
+
+        # Percentage label above hatch
+        pct_s = self.fnt_sm.render(f'{int(self._bdoor_open * 100)}%  OPEN',
+                                   True, (180, 195, 215))
+        self.screen.blit(pct_s, (cx - pct_s.get_width() // 2, hatch_y - 30))
+
+        # ── Sparks (short circuit animation) ─────────────────────────────────
+        for sx, sy, age in self._bdoor_spark_pts:
+            frac = min(1.0, max(0.0, age))
+            r = max(1, int(frac * 6))
+            brightness = int(frac * 255)
+            pygame.draw.circle(self.screen, (255, brightness, 0), (sx, sy), r)
+            pygame.draw.circle(self.screen, (255, 255, 200), (sx, sy), max(1, r - 2))
+
+        # ── Control panel ─────────────────────────────────────────────────────
+        panel_y = 420
+        pygame.draw.rect(self.screen, (22, 26, 34),
+                         (0, panel_y, play_w, self.height - panel_y))
+        pygame.draw.rect(self.screen, (44, 52, 68), (0, panel_y, play_w, 5))
+
+        # ── Amperage meter ────────────────────────────────────────────────────
+        # Analogue needle gauge (semicircle arc)
+        meter_cx = cx
+        meter_cy = panel_y + 80
+        meter_r  = 70
+
+        # Gauge background arc
+        pygame.draw.circle(self.screen, (16, 20, 28), (meter_cx, meter_cy), meter_r + 14)
+        pygame.draw.circle(self.screen, (30, 36, 48), (meter_cx, meter_cy), meter_r + 14, 3)
+
+        # Colour arcs (drawn as thin wedge sections)
+        for seg_start, seg_end, col in [
+            (0.00, 0.50, (34, 158, 64)),    # green — safe zone
+            (0.50, 0.78, (198, 158, 24)),   # yellow — caution
+            (0.78, 1.00, (198, 34, 34)),    # red — danger
+        ]:
+            a0 = math.pi - seg_start * math.pi
+            a1 = math.pi - seg_end   * math.pi
+            for step in range(30):
+                frac = step / 30
+                ang  = a0 + (a1 - a0) * frac
+                ix   = meter_cx + int(math.cos(ang) * meter_r)
+                iy   = meter_cy - int(math.sin(ang) * meter_r)
+                pygame.draw.circle(self.screen, col, (ix, iy), 6)
+
+        # Inner fill to hide rough arc
+        pygame.draw.circle(self.screen, (16, 20, 28), (meter_cx, meter_cy), meter_r - 8)
+
+        # Tick marks
+        for pct in (0, 25, 50, 75, 100):
+            ang = math.pi - (pct / 100) * math.pi
+            ix0 = meter_cx + int(math.cos(ang) * (meter_r - 6))
+            iy0 = meter_cy - int(math.sin(ang) * (meter_r - 6))
+            ix1 = meter_cx + int(math.cos(ang) * (meter_r + 2))
+            iy1 = meter_cy - int(math.sin(ang) * (meter_r + 2))
+            pygame.draw.line(self.screen, (168, 178, 198), (ix0, iy0), (ix1, iy1), 2)
+            tick_lbl = self.fnt_sm.render(str(pct), True, (128, 138, 158))
+            lx = meter_cx + int(math.cos(ang) * (meter_r + 16)) - tick_lbl.get_width() // 2
+            ly = meter_cy - int(math.sin(ang) * (meter_r + 16)) - tick_lbl.get_height() // 2
+            self.screen.blit(tick_lbl, (lx, ly))
+
+        # Needle
+        needle_ang = math.pi - self._bdoor_amps * math.pi
+        nx = meter_cx + int(math.cos(needle_ang) * (meter_r - 10))
+        ny = meter_cy - int(math.sin(needle_ang) * (meter_r - 10))
+        needle_col = (238, 64, 44) if self._bdoor_amps >= self._BDOOR_AMP_LIMIT else (238, 238, 238)
+        pygame.draw.line(self.screen, needle_col, (meter_cx, meter_cy), (nx, ny), 3)
+        pygame.draw.circle(self.screen, (88, 98, 118), (meter_cx, meter_cy), 7)
+
+        # Needle flash when near limit
+        if self._bdoor_amps >= self._BDOOR_AMP_LIMIT and int(self.real_time * 6) % 2 == 0:
+            warn = self.fnt_sm.render("OVERLOAD!", True, (255, 80, 60))
+            self.screen.blit(warn, (meter_cx - warn.get_width() // 2, meter_cy + 10))
+
+        # Meter label
+        meter_lbl = self.fnt_sm.render("AMPERAGE", True, (135, 152, 172))
+        self.screen.blit(meter_lbl, (meter_cx - meter_lbl.get_width() // 2,
+                                     panel_y + 160))
+        amp_val = self.fnt_md.render(f'{int(self._bdoor_amps * 100)} A', True, (175, 192, 218))
+        self.screen.blit(amp_val, (meter_cx - amp_val.get_width() // 2, panel_y + 174))
+
+        # Trip bar — shows how close to tripping
+        if self._bdoor_trip_t > 0:
+            bar_frac = min(1.0, self._bdoor_trip_t / self._BDOOR_TRIP_DELAY)
+            bar_w = 180
+            bar_x = meter_cx - bar_w // 2
+            bar_y = panel_y + 198
+            pygame.draw.rect(self.screen, (38, 28, 28), (bar_x, bar_y, bar_w, 10), border_radius=4)
+            pygame.draw.rect(self.screen, (228, 60, 40),
+                             (bar_x, bar_y, int(bar_w * bar_frac), 10), border_radius=4)
+            pygame.draw.rect(self.screen, (88, 44, 44), (bar_x, bar_y, bar_w, 10), 1, border_radius=4)
+            trip_lbl = self.fnt_sm.render("BREAKER TRIP", True, (228, 100, 80))
+            self.screen.blit(trip_lbl, (bar_x, bar_y + 12))
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_y = panel_y + 140
+        btn_w = 160
+        btn_h = 62
+        keys  = pygame.key.get_pressed()
+        q_on  = keys[pygame.K_q]
+        e_on  = keys[pygame.K_e]
+
+        # OPEN [Q] — left button
+        q_x  = cx - 320
+        q_bg = (44, 148, 68) if q_on else (22, 74, 36)
+        q_br = (68, 208, 98) if q_on else (36, 108, 54)
+        pygame.draw.rect(self.screen, q_bg, (q_x, btn_y, btn_w, btn_h), border_radius=8)
+        pygame.draw.rect(self.screen, q_br, (q_x, btn_y, btn_w, btn_h), 2, border_radius=8)
+        for lbl, dy in (("[Q]", 6), ("OPEN", 34)):
+            surf = (self.fnt_md if dy == 6 else self.fnt_sm).render(lbl, True, (208, 248, 218))
+            self.screen.blit(surf, (q_x + btn_w // 2 - surf.get_width() // 2, btn_y + dy))
+
+        # CLOSE [E] — right button
+        e_x  = cx + 160
+        e_bg = (148, 54, 34) if e_on else (74, 28, 18)
+        e_br = (218, 88, 62) if e_on else (108, 42, 28)
+        pygame.draw.rect(self.screen, e_bg, (e_x, btn_y, btn_w, btn_h), border_radius=8)
+        pygame.draw.rect(self.screen, e_br, (e_x, btn_y, btn_w, btn_h), 2, border_radius=8)
+        for lbl, dy in (("[E]", 6), ("CLOSE", 34)):
+            surf = (self.fnt_md if dy == 6 else self.fnt_sm).render(lbl, True, (252, 215, 205))
+            self.screen.blit(surf, (e_x + btn_w // 2 - surf.get_width() // 2, btn_y + dy))
+
+        # ── Result overlay ────────────────────────────────────────────────────
+        if self._bdoor_result is not None:
+            overlay = pygame.Surface((play_w, self.height), pygame.SRCALPHA)
+            if self._bdoor_result == 'success':
+                overlay.fill((28, 148, 68, 148))
+                r_text, r_col = "CARGO DOORS OPEN!", (118, 252, 148)
+            else:
+                overlay.fill((168, 28, 28, 148))
+                r_text, r_col = "ELECTRICAL SHORT!", (255, 100, 80)
+            self.screen.blit(overlay, (0, 0))
+            rs = self.fnt_lg.render(r_text, True, r_col)
+            self.screen.blit(rs, (cx - rs.get_width() // 2, self.height // 2 - 28))
+
+        # ── Sidebar HUD + hint ────────────────────────────────────────────────
+        self._draw_hud()
+        hint = self.fnt_sm.render("ESC — leave panel  |  [Q] OPEN  [E] CLOSE",
+                                  True, (84, 94, 114))
+        self.screen.blit(hint, (10, self.height - 26))
+        title = self.fnt_md.render("CARGO DOOR CONTROL", True, (135, 155, 118))
+        self.screen.blit(title, (cx - title.get_width() // 2, 12))
+
     # ── Update ───────────────────────────────────────────────────────────────
 
     def _update(self, dt: float, game_dt: float):
@@ -824,6 +1220,14 @@ class DeckHandSimulation:
             self._update_winch(dt)
             return
 
+        # Barge door mini-game takes over completely
+        if self._bdoor_active:
+            if self.notif_timer > 0:
+                self.notif_timer -= dt
+            self.game_time = (self.game_time + game_dt) % 24
+            self._update_barge_doors(dt)
+            return
+
         if self._overboard:
             self._overboard_t -= dt
             if self.notif_timer > 0:
@@ -832,7 +1236,13 @@ class DeckHandSimulation:
             return
 
         keys = pygame.key.get_pressed()
-        self.player.update(dt, keys, self._bounds)
+        # Extend left bound to include dock when fully alongside
+        if self._docking and self._dock_approach >= 1.0 and not self._departing:
+            eff_bounds = (self._dock_rect.left - 4, self._bounds[1],
+                          self._bounds[2], self._bounds[3])
+        else:
+            eff_bounds = self._bounds
+        self.player.update(dt, keys, eff_bounds)
 
         # Jump / overboard state machine
         in_gap  = self._is_gap_zone(self.player.x, self.player.y)
@@ -876,21 +1286,60 @@ class DeckHandSimulation:
             self.notif_timer -= dt
 
         # Docking cycle
-        self._dock_timer -= dt
-        if self._dock_timer <= 0:
-            if self._docking:
-                # Undock — remove any pending mooring tasks
-                self._docking = False
-                self.active_tasks = [t for t in self.active_tasks
-                                     if t.task_type != 'moor']
-                self._notify("Underway — lines cast off")
-                self._dock_timer = random.uniform(50.0, 100.0)
-            else:
-                # Begin docking
-                self._docking       = True
-                self._dock_duration = random.uniform(25.0, 50.0)
-                self._dock_timer    = self._dock_duration
-                self._notify("Docking — secure the mooring lines!")
+        # Timer ticks only while underway (countdown to arrival) or after moored (stay duration)
+        if not self._docking or (self._moored and not self._unmooring and not self._departing):
+            self._dock_timer -= dt
+
+        if self._dock_timer <= 0 and not self._docking:
+            # Begin docking — spawn port mooring + door tasks immediately
+            self._docking          = True
+            self._dock_approach    = 0.0
+            self._moored           = False
+            self._unmooring        = False
+            self._departing        = False
+            self._dock_moor_done   = 0
+            self._unmoor_done      = 0
+            self._dock_duration    = random.uniform(25.0, 50.0)
+            self._dock_timer       = self._dock_duration   # used after mooring
+            self._notify("Docking — secure the mooring lines!")
+            occupied = {t.position for t in self.active_tasks}
+            moor_spawned = 0
+            for pos in self._port_mooring_pos:
+                if pos not in occupied:
+                    self.active_tasks.append(Task('moor', pos))
+                    moor_spawned += 1
+            self._dock_moor_needed = moor_spawned
+            for pos in self.door_positions:
+                if pos not in occupied:
+                    self.active_tasks.append(Task('barge_doors', pos))
+
+        elif self._dock_timer <= 0 and self._moored and not self._unmooring and not self._departing:
+            # Stay timer expired — begin unmooring
+            self._unmooring     = True
+            self._unmoor_done   = 0
+            self._notify("Stay complete — cast off the mooring lines!")
+            occupied = {t.position for t in self.active_tasks}
+            unmoor_spawned = 0
+            for pos in self._port_mooring_pos:
+                if pos not in occupied:
+                    self.active_tasks.append(Task('unmoor', pos))
+                    unmoor_spawned += 1
+            self._unmoor_needed = unmoor_spawned
+
+        # Dock approach / departure animation
+        if self._docking and not self._departing:
+            self._dock_approach = min(1.0, self._dock_approach + dt * 0.35)
+        elif self._departing:
+            self._dock_approach = max(0.0, self._dock_approach - dt * 0.45)
+            if self._dock_approach <= 0.0:
+                # Dock fully away — ship is underway
+                self._docking          = False
+                self._departing        = False
+                self._dock_moor_needed = 0
+                self._dock_moor_done   = 0
+                self._unmoor_needed    = 0
+                self._unmoor_done      = 0
+                self._dock_timer       = random.uniform(50.0, 100.0)
 
         # Task spawn
         self._next_task_t -= dt
@@ -911,6 +1360,13 @@ class DeckHandSimulation:
                     break
                 continue
 
+            # Barge door tasks launch the cargo door panel instead of hold-E
+            if task.task_type == 'barge_doors':
+                if self.player.near(task.position) and e_held:
+                    self._start_barge_doors(task)
+                    break
+                continue
+
             if self.player.near(task.position):
                 if e_held:
                     task.active   = True
@@ -926,7 +1382,8 @@ class DeckHandSimulation:
                 task.progress = max(0.0, task.progress - dt * 0.4)
 
         for t in completed:
-            self.active_tasks.remove(t)
+            if t in self.active_tasks:   # _complete_task may have already removed it
+                self.active_tasks.remove(t)
 
         # Game time
         self.game_time = (self.game_time + game_dt) % 24
@@ -938,18 +1395,77 @@ class DeckHandSimulation:
             self._draw_winch()
             return
 
+        if self._bdoor_active:
+            self._draw_barge_doors()
+            return
+
         play_w = self.width - 225
 
         # ── River background ──
         self.screen.fill(self.C_RIVER)
 
-        # Animated current streaks — water flows downward toward the towboat
-        scroll = int(self.real_time * 48) % (self.height + 80)
+        # Animated current streaks — frozen while moored at dock
+        scroll_rate = 0 if (self._moored and not self._unmooring) else 48
+        scroll = int(self.real_time * scroll_rate) % (self.height + 80)
         for i in range(0, play_w, 68):
             phase = (i * 17) % (self.height + 80)
             y0 = (phase + scroll) % (self.height + 80) - 40
             pygame.draw.line(self.screen, self.C_RIVER_LINE,
                              (i + 8, y0), (i, y0 + 44), 1)
+
+        # ── Dock (port side, slides in when docking) ─────────────────────────
+        if self._docking or self._dock_approach > 0:
+            dock_w    = 68
+            dock_face = self.tow_origin_x - 4   # right edge touches port hull
+            gap       = int((1.0 - self._dock_approach) * 90)   # closes to 0 when docked
+            dock_x    = dock_face - dock_w - gap
+            tow_h     = (self.TOW_ROWS * self.BARGE_H +
+                         (self.TOW_ROWS - 1) * self.BARGE_GAP_Y)
+            dock_y    = self.tow_origin_y - 10
+            dock_h    = tow_h + 20
+
+            # Dock body
+            pygame.draw.rect(self.screen, (58, 50, 36),
+                             (dock_x, dock_y, dock_w, dock_h))
+            # Plank lines (horizontal, running port-to-starboard)
+            for py_ in range(dock_y + 10, dock_y + dock_h, 14):
+                pygame.draw.line(self.screen, (46, 40, 28),
+                                 (dock_x, py_), (dock_x + dock_w, py_), 1)
+            # Dock edge facing the barge (right edge)
+            pygame.draw.rect(self.screen, (78, 70, 50),
+                             (dock_x + dock_w - 8, dock_y, 8, dock_h))
+            pygame.draw.line(self.screen, (92, 84, 62),
+                             (dock_x + dock_w, dock_y),
+                             (dock_x + dock_w, dock_y + dock_h), 2)
+
+            # Bollards on dock edge (one per barge row)
+            for row in range(self.TOW_ROWS):
+                by_ = (self.tow_origin_y + row * (self.BARGE_H + self.BARGE_GAP_Y)
+                       + self.BARGE_H // 2)
+                bx_ = dock_x + dock_w - 4
+                pygame.draw.circle(self.screen, (88, 80, 62), (bx_, by_), 8)
+                pygame.draw.circle(self.screen, (108, 98, 78), (bx_, by_), 8, 2)
+
+            # Mooring lines — draw when fully docked
+            if self._dock_approach >= 1.0:
+                for pos in self.mooring_positions:
+                    if pos[0] < self.tow_origin_x:  # port-side cleats only
+                        row_idx = self.mooring_positions.index(pos) // 2
+                        bollard_y = (self.tow_origin_y
+                                     + row_idx * (self.BARGE_H + self.BARGE_GAP_Y)
+                                     + self.BARGE_H // 2)
+                        pygame.draw.line(self.screen, (160, 145, 105),
+                                         pos, (dock_x + dock_w - 4, bollard_y), 2)
+
+            # Water gap strip between dock and barge (closes as approach reaches 1)
+            if gap > 0:
+                pygame.draw.rect(self.screen, self.C_RIVER,
+                                 (dock_x + dock_w, dock_y, gap, dock_h))
+
+            # Label
+            lbl = self.fnt_sm.render("DOCK", True, (108, 96, 72))
+            self.screen.blit(lbl, (dock_x + dock_w // 2 - lbl.get_width() // 2,
+                                   dock_y + 4))
 
         # ── Towboat ──
         pygame.draw.rect(self.screen, self.C_TOWBOAT,
@@ -1209,12 +1725,20 @@ class DeckHandSimulation:
                         self._winch_task   = None
                         self._winch_result = None
                         self._winch_phase  = 'working'
+                    elif self._bdoor_active:
+                        # Cancel barge door panel, leave task for retry
+                        self._bdoor_active = False
+                        self._bdoor_task   = None
+                        self._bdoor_result = None
+                        self._bdoor_phase  = 'control'
+                        self._bdoor_amps   = 0.0
                     else:
                         return 'menu'
                 elif event.key == pygame.K_SPACE:
                     if self._winch_active and self._winch_phase == 'lock_window':
                         self._winch_space_flag = True
-                    elif (not self._winch_active and not self._overboard
+                    elif (not self._winch_active and not self._bdoor_active
+                          and not self._overboard
                           and self.player.state == 'grounded'
                           and self._is_safe_zone(self.player.x, self.player.y)):
                         self.player.state             = 'jumping'
