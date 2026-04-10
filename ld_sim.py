@@ -9,6 +9,7 @@ from lock_and_dam import LockAndDam
 from boat import Yacht, Barge, Kayak, PaddleBoat
 from waterway import Canal
 from deckhand_sim import DeckHandSimulation
+from engineer import EngineerSimulation
 from campaign_save import save_campaign, load_campaign, default_progressions
 
 
@@ -1935,9 +1936,9 @@ class GameEngine:
         {
             'id':        'engineer',
             'title':     'Engineer',
-            'desc':      ['Maintain the dam machinery', 'and prevent breakdowns.'],
+            'desc':      ['Keep the engine room running.', 'Diesel, electric, hydraulic.'],
             'color':     (175, 115, 30),
-            'available': False,
+            'available': True,
         },
         {
             'id':        'captain',
@@ -2655,6 +2656,57 @@ class GameEngine:
         self.screen_name = 'debrief'
         return result
 
+    def _launch_engineer_shift(self):
+        """Configure and run one engineer shift based on current progression."""
+        prog     = self.progressions['engineer']
+        is_night = prog['phase'] == 'nights'
+        start    = 20.0 if is_night else 6.0
+        vis = EngineerSimulation(
+            shift_duration=4.0,
+            shift_start_time=start,
+            cfg_time_scale=5.0,
+            dev_mode=self.dev_mode,
+        )
+
+        result = vis.run()
+
+        if result == 'quit':
+            return 'quit'
+
+        wages          = EngineerSimulation.HOURLY_WAGE * vis.shift_hours_elapsed
+        bonuses        = EngineerSimulation.TASK_BONUS  * vis.score
+        shift_earnings = wages + bonuses
+        prog['total_earnings'] += shift_earnings
+
+        self.debrief_data = {
+            'completed':        result == 'shift_complete',
+            'incidents':        vis.incident_count,
+            'score':            vis.score,
+            'promoted_to_days': False,
+            'advanced':         False,
+            'wages':            wages,
+            'bonuses':          bonuses,
+            'shift_earnings':   shift_earnings,
+            'total_earnings':   prog['total_earnings'],
+            'debt':             prog['debt'],
+        }
+
+        if result == 'shift_complete':
+            prog['shift_num'] += 1
+            if vis.incident_count == 0:
+                prog['clean_shifts'] += 1
+                if prog['clean_shifts'] >= 5:
+                    if is_night:
+                        prog['phase']        = 'days'
+                        prog['clean_shifts'] = 0
+                        prog['shift_num']    = 1
+                        self.debrief_data['promoted_to_days'] = True
+                    else:
+                        self.debrief_data['advanced'] = True
+
+        self.screen_name = 'debrief'
+        return result
+
     def _launch_placeholder_shift(self, stage_id):
         """Stub for stages not yet implemented — shows a debrief immediately."""
         prog = self.progressions[stage_id]
@@ -2681,6 +2733,8 @@ class GameEngine:
             return self._launch_operator_shift()
         elif stage_id == 'deckhand':
             return self._launch_deckhand_shift()
+        elif stage_id == 'engineer':
+            return self._launch_engineer_shift()
         else:
             return self._launch_placeholder_shift(stage_id)
 

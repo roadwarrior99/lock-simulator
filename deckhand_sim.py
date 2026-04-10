@@ -2,7 +2,7 @@
 deckhand_sim.py — Deck Hand simulation, Stage 2 of Lock & Dam.
 
 Top-down view of a barge tow on the river.  The player controls a deck hand
-completing five duty types that mirror real towboat operations:
+plcompleting five duty types that mirror real towboat operations:
 
   connect  — attach steel cables between adjacent barges (building the tow)
   tension  — operate a winch to tighten a connected cable
