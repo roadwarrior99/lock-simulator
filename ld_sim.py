@@ -9,7 +9,7 @@ from lock_and_dam import LockAndDam
 from boat import Yacht, Barge, Kayak, PaddleBoat
 from waterway import Canal
 from deckhand_sim import DeckHandSimulation
-from engineer import EngineerSimulation
+from engineer_sim import EngineerSimulation
 from campaign_save import save_campaign, load_campaign, default_progressions
 
 

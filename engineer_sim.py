@@ -1,5 +1,5 @@
 """
-engineer.py — Engine Room simulation.
+engineer_sim.py — Engine Room simulation.
 
 Top-down view of the towboat engine room. Four instrument panels:
   diesel      — Throttle & RPM management, temperature control
@@ -435,11 +435,15 @@ class EngineerSimulation:
     def _drift_systems(self, dt):
         t = pygame.time.get_ticks() * 0.001
 
-        # Diesel: temp slowly rises at high throttle
+        # Diesel: RPM follows throttle; temp driven by RPM vs normal operating RPM
+        # Equilibrium at target RPM (0.65) — above that → heat, below → cool.
+        # Engine off (throttle → 0) cools quickly toward ambient.
         d = self._diesel
-        noise = math.sin(t * 1.4) * 0.006
-        d['rpm'] = max(0.0, min(1.0, d['rpm'] + noise))
-        d['temp'] += (d['throttle'] - 0.42) * 0.015 * dt
+        noise = math.sin(t * 1.4) * 0.004
+        target_rpm = d['throttle'] * 0.9
+        d['rpm'] = max(0.0, min(1.0,
+            d['rpm'] + (target_rpm - d['rpm']) * 0.5 * dt + noise))
+        d['temp'] += (d['rpm'] - 0.65) * 0.060 * dt
         d['temp'] = max(0.0, min(1.0, d['temp']))
         self._alarms['diesel'] = d['temp'] > 0.82
 
