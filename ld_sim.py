@@ -2662,9 +2662,9 @@ class GameEngine:
         is_night = prog['phase'] == 'nights'
         start    = 20.0 if is_night else 6.0
         vis = EngineerSimulation(
-            shift_duration=4.0,
+            shift_duration=12.0,
             shift_start_time=start,
-            cfg_time_scale=5.0,
+            cfg_time_scale=2.0,
             dev_mode=self.dev_mode,
         )
 
