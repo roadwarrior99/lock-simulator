@@ -131,7 +131,49 @@ class GameEngine:
                 'cta': 'Press SPACE to begin',
             },
         ],
-        'engineer': [],
+        'engineer': [
+            {
+                'location': 'MV Prairie Star  —  Upper Mississippi River',
+                'clock':    '5:50 AM',
+                'lines': [
+                    "The engine room is loud and warm before you're even down the ladder.",
+                    "Diesel smell, gear oil, the hum of something that never stops.",
+                    "The outgoing engineer is already pulling on his jacket.",
+                ],
+            },
+            {
+                'location': None,
+                'clock':    None,
+                'lines': [
+                    '"She\'s been running clean. Don\'t let her overheat."',
+                    '',
+                    '"Eight panels. Walk the room every few minutes.',
+                    ' Something starts flashing, you go fix it."',
+                    '"Hydraulics drift. Bilge needs watching after rain."',
+                ],
+            },
+            {
+                'location': None,
+                'clock':    None,
+                'lines': [
+                    '"Alternator keeps the batteries up as long as the engine\'s healthy.',
+                    ' Engine goes down, you\'re on solar and shore power."',
+                    '',
+                    '"Ventilation gets away from you fast if you ignore it.',
+                    ' Hot engine room is a tired crew."',
+                ],
+            },
+            {
+                'location': None,
+                'clock':    None,
+                'lines': [
+                    "He heads up the ladder without looking back.",
+                    '',
+                    "The engine doesn't care what time it is.",
+                ],
+                'cta': 'Press SPACE to begin',
+            },
+        ],
         'captain':  [],
     }
 
@@ -147,7 +189,9 @@ class GameEngine:
             "Hold [E] near a task marker to work it — step away and it resets slowly.",
         ],
         'engineer': [
-            "Coming soon.",
+            "Walk the room — panels flash red when a system needs attention.",
+            "Hold [E] at a panel to enter it. [ESC] exits back to the room.",
+            "The alternator charges batteries automatically while the engine runs clean.",
         ],
         'captain': [
             "Coming soon.",
