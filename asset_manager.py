@@ -27,6 +27,9 @@ Usage examples
 
     # Print DB summary
     python asset_manager.py summary
+
+    # Browse and regenerate art_assets in a windowed UI
+    python asset_manager.py browse
 """
 
 import argparse
@@ -335,6 +338,8 @@ def generate_crew_dialog(
         f"Write {count} distinct one-or-two-sentence lines this character might say. "
         f"Return only the lines, one per row, no numbering."
     )
+    logger.debug("chat prompt [dialog]:\n  system: %s\n  user: %s",
+                 DIALOG_SYSTEM_PROMPT, user_prompt)
     response = client.chat.completions.create(
         model='gpt-4o',
         messages=[
@@ -385,6 +390,8 @@ def generate_crew_profile(name: str, role: str, vessel: str = None) -> dict:
         f"(personality quirk or secret the player might uncover). "
         f"Format as two paragraphs: first the bio, then 'GM: ' followed by the note."
     )
+    logger.debug("chat prompt [profile]:\n  system: %s\n  user: %s",
+                 PROFILE_SYSTEM_PROMPT, user_prompt)
     response = client.chat.completions.create(
         model='gpt-4o',
         messages=[
@@ -418,6 +425,7 @@ def generate_image(
     The file is named from a slug of the prompt.
     """
     client = _openai_client()
+    logger.debug("image prompt [generate_image]  size=%s:\n%s", size, prompt)
     response = client.images.generate(
         model='dall-e-3',
         prompt=prompt,
@@ -427,6 +435,7 @@ def generate_image(
     )
     image_data = response.data[0].b64_json
     revised_prompt = getattr(response.data[0], 'revised_prompt', prompt)
+    logger.debug("revised prompt: %s", revised_prompt)
 
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     slug = ''.join(c if c.isalnum() else '_' for c in prompt.lower())[:60]
@@ -579,6 +588,7 @@ def gen_crew_portraits(db, *, crew_id: int = None) -> list[dict]:
         filepath = os.path.join(PORTRAIT_OUTPUT_DIR, filename)
 
         logger.info("Generating portrait for %s (crew %s)…", member['name'], cid)
+        logger.debug("image prompt [portrait  crew %s]:\n%s", cid, prompt)
 
         response = client.images.generate(
             model='dall-e-3',
@@ -611,6 +621,308 @@ def gen_crew_portraits(db, *, crew_id: int = None) -> list[dict]:
     return results
 
 
+# ── Asset browser UI ─────────────────────────────────────────────────────────
+
+WIN_W, WIN_H   = 900, 620
+PANEL_W        = 320          # left info panel width
+PREVIEW_X      = PANEL_W + 10
+PREVIEW_Y      = 10
+PREVIEW_SIZE   = WIN_H - 20   # square preview area
+BG_COLOR       = (18,  18,  22)
+PANEL_BG       = (28,  28,  34)
+ACCENT         = (80, 160, 220)
+TEXT_COLOR     = (210, 210, 215)
+DIM_COLOR      = (110, 110, 120)
+REGEN_COLOR    = (200,  80,  80)
+REGEN_ACTIVE   = (255, 130,  60)
+
+
+def browse_assets_ui(db):
+    """
+    Pygame window for browsing and regenerating art_assets.
+
+    Controls
+    --------
+    ←  /  →   previous / next asset
+    ↑  /  ↓   jump 10 back / forward
+    R         regenerate current image via DALL-E (saves & updates DB)
+    F         filter: cycle through categories  (all → background → character → …)
+    ESC / Q   quit
+    """
+    try:
+        import pygame
+    except ImportError:
+        sys.exit("pygame is required for the asset browser.  Run: pip install pygame")
+
+    try:
+        from PIL import Image as _PIL
+        _HAS_PIL = True
+    except ImportError:
+        _HAS_PIL = False
+
+    pygame.init()
+    screen = pygame.display.set_mode((WIN_W, WIN_H))
+    pygame.display.set_caption("Asset Browser — Albatross")
+    clock  = pygame.time.Clock()
+
+    font_lg  = pygame.font.SysFont('monospace', 15, bold=True)
+    font_sm  = pygame.font.SysFont('monospace', 12)
+    font_xs  = pygame.font.SysFont('monospace', 11)
+
+    # ── state ─────────────────────────────────────────────────────────────────
+    all_assets   = db.art_assets()
+    categories   = ['all'] + sorted({a['category'] for a in all_assets if a['category']})
+    cat_idx      = 0
+    assets       = all_assets[:]
+    idx          = 0
+    cached_surf  = None   # the currently displayed pygame.Surface
+    regen_state  = None   # None | 'working' | 'done' | 'error'
+    status_msg   = ''
+
+    def filtered():
+        cat = categories[cat_idx]
+        return all_assets if cat == 'all' else [a for a in all_assets if a['category'] == cat]
+
+    def load_surface(asset):
+        """Return a pygame.Surface for *asset*, or None if file not found."""
+        # Try several candidate paths
+        candidates = [
+            asset['filename'],
+            os.path.join(IMAGE_OUTPUT_DIR, asset['filename']),
+            os.path.join(PORTRAIT_OUTPUT_DIR, asset['filename']),
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                try:
+                    return pygame.image.load(path).convert_alpha()
+                except Exception:
+                    return None
+        return None
+
+    def wrap_text(text, font, max_w):
+        """Split *text* into lines that fit within *max_w* pixels."""
+        words, lines, line = text.split(), [], ''
+        for word in words:
+            test = f'{line} {word}'.strip()
+            if font.size(test)[0] <= max_w:
+                line = test
+            else:
+                if line:
+                    lines.append(line)
+                line = word
+        if line:
+            lines.append(line)
+        return lines
+
+    def draw_panel(asset, regen_state, status_msg):
+        panel = pygame.Rect(0, 0, PANEL_W, WIN_H)
+        pygame.draw.rect(screen, PANEL_BG, panel)
+        pygame.draw.line(screen, ACCENT, (PANEL_W, 0), (PANEL_W, WIN_H), 1)
+
+        y  = 12
+        mx = PANEL_W - 12
+
+        def row(label, value, vc=TEXT_COLOR):
+            nonlocal y
+            lbl = font_sm.render(label, True, DIM_COLOR)
+            screen.blit(lbl, (10, y))
+            y += 16
+            if value:
+                for ln in wrap_text(str(value), font_xs, mx):
+                    surf = font_xs.render(ln, True, vc)
+                    screen.blit(surf, (14, y))
+                    y += 14
+            y += 4
+
+        # index badge
+        badge = font_lg.render(f"{idx + 1} / {len(assets)}", True, ACCENT)
+        screen.blit(badge, (10, y));  y += 22
+
+        row('filename',    asset['filename'])
+        row('category',    asset['category'])
+        row('description', asset['description'])
+        row('tags',        asset['tags'])
+        row('size',
+            f"{asset['width']}×{asset['height']}" if asset['width'] else '—')
+
+        # filter indicator
+        y = WIN_H - 110
+        cat_txt = font_sm.render(
+            f"filter: {categories[cat_idx]}  [F]", True, ACCENT)
+        screen.blit(cat_txt, (10, y));  y += 20
+
+        # regen button hint
+        rcolor = REGEN_ACTIVE if regen_state == 'working' else REGEN_COLOR
+        label  = 'regenerating…' if regen_state == 'working' else '[R] regenerate'
+        screen.blit(font_sm.render(label, True, rcolor), (10, y));  y += 20
+
+        # status
+        if status_msg:
+            for ln in wrap_text(status_msg, font_xs, mx):
+                screen.blit(font_xs.render(ln, True, DIM_COLOR), (10, y))
+                y += 14
+
+        # nav hint
+        screen.blit(font_xs.render('← →  navigate   ESC quit', True, DIM_COLOR),
+                    (10, WIN_H - 18))
+
+    def draw_preview(surf):
+        preview_rect = pygame.Rect(PREVIEW_X, PREVIEW_Y,
+                                   WIN_W - PREVIEW_X - 10, WIN_H - 20)
+        pygame.draw.rect(screen, PANEL_BG, preview_rect)
+        if surf is None:
+            msg = font_sm.render('no image on disk', True, DIM_COLOR)
+            screen.blit(msg, msg.get_rect(center=preview_rect.center))
+        else:
+            # Scale to fit while keeping aspect ratio
+            sw, sh  = surf.get_size()
+            pw, ph  = preview_rect.size
+            scale   = min(pw / sw, ph / sh)
+            nw, nh  = int(sw * scale), int(sh * scale)
+            scaled  = pygame.transform.smoothscale(surf, (nw, nh))
+            cx = preview_rect.x + (pw - nw) // 2
+            cy = preview_rect.y + (ph - nh) // 2
+            screen.blit(scaled, (cx, cy))
+
+    # ── initial load ──────────────────────────────────────────────────────────
+    assets      = filtered()
+    cached_surf = load_surface(assets[idx]) if assets else None
+
+    running = True
+    while running:
+        clock.tick(30)
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    running = False
+
+                elif event.key == pygame.K_RIGHT and assets:
+                    idx = (idx + 1) % len(assets)
+                    cached_surf = load_surface(assets[idx])
+                    regen_state = status_msg = None
+
+                elif event.key == pygame.K_LEFT and assets:
+                    idx = (idx - 1) % len(assets)
+                    cached_surf = load_surface(assets[idx])
+                    regen_state = status_msg = None
+
+                elif event.key == pygame.K_DOWN and assets:
+                    idx = min(idx + 10, len(assets) - 1)
+                    cached_surf = load_surface(assets[idx])
+                    regen_state = status_msg = None
+
+                elif event.key == pygame.K_UP and assets:
+                    idx = max(idx - 10, 0)
+                    cached_surf = load_surface(assets[idx])
+                    regen_state = status_msg = None
+
+                elif event.key == pygame.K_f:
+                    cat_idx = (cat_idx + 1) % len(categories)
+                    assets  = filtered()
+                    idx     = 0
+                    cached_surf = load_surface(assets[idx]) if assets else None
+                    regen_state = status_msg = None
+
+                elif event.key == pygame.K_r and assets and regen_state != 'working':
+                    asset = assets[idx]
+                    is_portrait = (asset.get('category') == 'character' or
+                                   'portrait' in (asset.get('tags') or ''))
+
+                    # For crew portraits use the same prompt builder as gen-portraits
+                    prompt = None
+                    if is_portrait:
+                        crew_id_tag = next(
+                            (t for t in (asset.get('tags') or '').split(',')
+                             if t.strip().startswith('crew_id:')),
+                            None,
+                        )
+                        if crew_id_tag:
+                            try:
+                                cid = int(crew_id_tag.strip().split(':')[1])
+                                member = db.get_crew(cid)
+                                if member:
+                                    prompt = _portrait_prompt(member)
+                            except (ValueError, IndexError):
+                                pass
+                    if not prompt:
+                        prompt = asset.get('description') or asset['filename']
+
+                    regen_state = 'working'
+                    status_msg  = 'Calling DALL-E…'
+                    screen.fill(BG_COLOR)
+                    draw_panel(asset, regen_state, status_msg)
+                    draw_preview(cached_surf)
+                    pygame.display.flip()
+
+                    try:
+                        # Determine output dir from existing path
+                        out_dir = PORTRAIT_OUTPUT_DIR if is_portrait else IMAGE_OUTPUT_DIR
+                        for candidate in (asset['filename'],
+                                          os.path.join(IMAGE_OUTPUT_DIR, asset['filename']),
+                                          os.path.join(PORTRAIT_OUTPUT_DIR, asset['filename'])):
+                            if os.path.isfile(candidate):
+                                out_dir = os.path.dirname(os.path.abspath(candidate))
+                                break
+
+                        client = _openai_client()
+                        logger.debug("image prompt [browser regen]:\n%s", prompt)
+                        response = client.images.generate(
+                            model='dall-e-3',
+                            prompt=prompt,
+                            size='1024x1024',
+                            response_format='b64_json',
+                            n=1,
+                        )
+                        raw_bytes = base64.b64decode(response.data[0].b64_json)
+
+                        filepath = os.path.join(out_dir, asset['filename'])
+                        if is_portrait and _HAS_PIL:
+                            import io
+                            from PIL import Image as _PILB
+                            img = _PILB.open(io.BytesIO(raw_bytes))
+                            img.resize((PORTRAIT_SIZE_PX, PORTRAIT_SIZE_PX),
+                                       _PILB.LANCZOS).save(filepath)
+                        else:
+                            Path(out_dir).mkdir(parents=True, exist_ok=True)
+                            with open(filepath, 'wb') as fh:
+                                fh.write(raw_bytes)
+
+                        # Update DB dimensions
+                        if _HAS_PIL:
+                            from PIL import Image as _PILC
+                            with _PILC.open(filepath) as im:
+                                w, h = im.size
+                            db.register_asset(asset['filename'],
+                                              category=asset.get('category'),
+                                              description=asset.get('description'),
+                                              tags=asset.get('tags'),
+                                              campaign_id=asset.get('campaign_id'),
+                                              width=w, height=h)
+
+                        cached_surf = load_surface(asset)
+                        regen_state = 'done'
+                        status_msg  = 'Regenerated.'
+                    except Exception as exc:
+                        regen_state = 'error'
+                        status_msg  = f'Error: {exc}'
+
+        screen.fill(BG_COLOR)
+        if assets:
+            draw_panel(assets[idx], regen_state, status_msg)
+            draw_preview(cached_surf)
+        else:
+            msg = font_lg.render('No assets found.', True, DIM_COLOR)
+            screen.blit(msg, msg.get_rect(center=screen.get_rect().center))
+
+        pygame.display.flip()
+
+    pygame.quit()
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def build_parser():
@@ -620,6 +932,8 @@ def build_parser():
     )
     p.add_argument('--db', default=db_module.DB_PATH,
                    help='Path to the assets SQLite database (default: %(default)s)')
+    p.add_argument('--debug', action='store_true',
+                   help='Enable DEBUG logging (prints all prompts sent to OpenAI)')
 
     sub = p.add_subparsers(dest='cmd', metavar='COMMAND')
 
@@ -665,6 +979,9 @@ def build_parser():
     img.add_argument('--dry-run',     action='store_true',
                      help='Print the prompt, do not call the API')
 
+    # -- browse
+    sub.add_parser('browse', help='Open the art_assets browser UI')
+
     # -- gen-portraits
     gp = sub.add_parser('gen-portraits',
                         help='Generate a portrait image for every crew member without one')
@@ -694,6 +1011,9 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     if args.cmd is None:
         parser.print_help()
@@ -782,6 +1102,9 @@ def main():
                 args.category, args.campaign_id,
             )
             print(f"Done: {filepath}")
+
+        elif args.cmd == 'browse':
+            browse_assets_ui(db)
 
         elif args.cmd == 'gen-portraits':
             if args.dry_run:
