@@ -1276,6 +1276,12 @@ class LockDamVisualizer:
             else:
                 self.weather_timer = random.randint(3600, 9000) # Clear lasts 1-2.5m
 
+        # Lightning timer always runs down so the bolt never gets stuck
+        if self.lightning_timer > 0:
+            self.lightning_timer -= 1
+            if self.lightning_timer == 0:
+                self.lightning_bolt = None
+
         # Update rain drops
         if self.rain_active:
             for d in self.rain_drops:
@@ -1284,13 +1290,9 @@ class LockDamVisualizer:
                 if d['y'] > self.height:
                     d['y'] = -10
                     d['x'] = random.randint(0, self.width + 100)
-            
-            # Lightning logic
-            if self.lightning_timer > 0:
-                self.lightning_timer -= 1
-                if self.lightning_timer == 0:
-                    self.lightning_bolt = None
-            elif random.random() < 0.003: # ~1 strike every 5-6 seconds on avg during rain
+
+            # New lightning strikes only while raining
+            if self.lightning_timer == 0 and random.random() < 0.003:
                 self.lightning_timer = random.randint(5, 12)
                 bx = random.randint(100, self.width - 100)
                 by = 0
