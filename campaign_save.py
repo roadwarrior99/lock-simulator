@@ -9,35 +9,32 @@ import os
 
 STAGE_IDS = ('operator', 'deckhand', 'engineer', 'captain')
 
+STARTING_DEBT = 10000.0
+
 
 def default_progressions():
-    """Return a fresh per-stage progression dict."""
-    def _fresh(debt=0.0):
+    """Return a fresh per-stage progression dict (no debt — debt is global)."""
+    def _fresh():
         return {
             'phase':          'nights',
             'clean_shifts':   0,
             'shift_num':      1,
             'story_seen':     False,
             'total_earnings': 0.0,
-            'debt':           debt,
         }
-    return {
-        'operator': _fresh(debt=10000.0),
-        'deckhand': _fresh(),
-        'engineer': _fresh(),
-        'captain':  _fresh(),
-    }
+    return {sid: _fresh() for sid in STAGE_IDS}
 
 
-def save_campaign(path, active_stage_id, progressions):
+def save_campaign(path, active_stage_id, progressions, debt):
     """
     Write campaign state to *path* as JSON.
     Parent directories are created automatically.
     """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     payload = {
-        'version':         1,
+        'version':         2,
         'active_stage_id': active_stage_id,
+        'debt':            debt,
         'progressions':    progressions,
     }
     with open(path, 'w') as fh:
@@ -56,6 +53,7 @@ def load_campaign(path):
     Returns:
         {
             'active_stage_id': str,
+            'debt':            float,
             'progressions':    dict   (all STAGE_IDS guaranteed present)
         }
     """
@@ -67,11 +65,18 @@ def load_campaign(path):
 
     merged = {}
     for sid in STAGE_IDS:
-        base = dict(defaults[sid])          # start from defaults
-        base.update(saved_progs.get(sid, {}))  # overlay saved values
+        base = dict(defaults[sid])
+        saved = dict(saved_progs.get(sid, {}))
+        saved.pop('debt', None)   # strip legacy per-stage debt if present
+        base.update(saved)
         merged[sid] = base
+
+    # v1 saves stored debt inside operator progression — migrate if needed
+    legacy_debt = saved_progs.get('operator', {}).get('debt', None)
+    debt = data.get('debt', legacy_debt if legacy_debt is not None else STARTING_DEBT)
 
     return {
         'active_stage_id': data.get('active_stage_id', 'operator'),
+        'debt':            float(debt),
         'progressions':    merged,
     }

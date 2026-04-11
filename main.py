@@ -217,6 +217,7 @@ class GameEngine:
         self.debrief_data    = None  # dict set after each shift
         self.active_stage_id = 'operator'
         self.progressions    = default_progressions()
+        self.debt            = 10000.0   # global debt shared across all stages
         self._save_notif     = 0.0   # countdown for "Saved" banner
         os.makedirs(self.SAVE_DIR, exist_ok=True)
         # Auto-load campaign save if one exists
@@ -225,6 +226,7 @@ class GameEngine:
                 saved = load_campaign(self.CAMPAIGN_SAVE)
                 self.active_stage_id = saved['active_stage_id']
                 self.progressions    = saved['progressions']
+                self.debt            = saved['debt']
             except Exception:
                 pass   # corrupt save — silently start fresh
 
@@ -239,7 +241,7 @@ class GameEngine:
 
     def save_campaign_state(self):
         """Persist progression state to saves/campaign.json."""
-        save_campaign(self.CAMPAIGN_SAVE, self.active_stage_id, self.progressions)
+        save_campaign(self.CAMPAIGN_SAVE, self.active_stage_id, self.progressions, self.debt)
         self._save_notif = 2.5   # seconds to display "Saved" banner
 
     def _gradient_rect(self, c1, c2, rect):
@@ -450,11 +452,9 @@ class GameEngine:
                 stage_label = next(
                     (s['title'] for s in self.STAGES
                      if s['id'] == saved['active_stage_id']), 'Unknown')
-                # Sum earnings and debt across all stages
                 total_earned = sum(p.get('total_earnings', 0.0)
                                    for p in saved['progressions'].values())
-                total_debt   = sum(p.get('debt', 0.0)
-                                   for p in saved['progressions'].values())
+                total_debt   = saved['debt']
                 bal  = total_earned - total_debt
                 desc = (f"Stage: {stage_label}   "
                         f"Earned: ${total_earned:,.0f}   "
@@ -642,7 +642,7 @@ class GameEngine:
         bonuses = d.get('bonuses',        0.0)
         earned  = d.get('shift_earnings', 0.0)
         total   = d.get('total_earnings', 0.0)
-        debt    = d.get('debt',        10000.0)
+        debt    = d.get('debt', self.debt)
         balance = total - debt
         bal_col = (120, 230, 130) if balance >= 0 else (230, 130, 80)
 
@@ -723,7 +723,7 @@ class GameEngine:
             'bonuses':          bonuses,
             'shift_earnings':   shift_earnings,
             'total_earnings':   prog['total_earnings'],
-            'debt':             prog['debt'],
+            'debt':             self.debt,
         }
 
         if result == 'shift_complete':
@@ -782,7 +782,7 @@ class GameEngine:
             'bonuses':          bonuses,
             'shift_earnings':   shift_earnings,
             'total_earnings':   prog['total_earnings'],
-            'debt':             prog['debt'],
+            'debt':             self.debt,
         }
 
         if result == 'shift_complete':
@@ -833,7 +833,7 @@ class GameEngine:
             'bonuses':          bonuses,
             'shift_earnings':   shift_earnings,
             'total_earnings':   prog['total_earnings'],
-            'debt':             prog['debt'],
+            'debt':             self.debt,
         }
 
         if result == 'shift_complete':
@@ -860,7 +860,7 @@ class GameEngine:
             'promoted_to_days': False, 'advanced': False,
             'wages': 0.0, 'bonuses': 0.0, 'shift_earnings': 0.0,
             'total_earnings': prog['total_earnings'],
-            'debt': prog['debt'],
+            'debt': self.debt,
         }
         self.screen_name = 'debrief'
         return 'menu'
@@ -970,6 +970,7 @@ class GameEngine:
                     saved = load_campaign(self.CAMPAIGN_SAVE)
                     self.active_stage_id = saved['active_stage_id']
                     self.progressions    = saved['progressions']
+                    self.debt            = saved['debt']
                 except Exception:
                     pass
                 self.screen_name = 'stage_select'
