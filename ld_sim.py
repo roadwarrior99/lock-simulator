@@ -207,6 +207,9 @@ class LockDamVisualizer:
         self._radio_approach: set[int]  = set()      # id(ag) already triggered (lock entry)
         self._radio_depart:   set[int]  = set()      # id(ag) already triggered (lines cleared)
         self._radio_bubbles: list[dict] = []         # active speech bubbles
+        self._roster_buttons: list      = []         # [(pygame.Rect, Agent), ...] refreshed each frame
+        self._db_operator_radio: dict[str, list[dict]] = {}  # vessel_name → [{id, message}]
+        self._radio_popup: dict | None  = None       # active radio popup state
 
         try:
             _db = GameDatabase()
@@ -224,6 +227,13 @@ class LockDamVisualizer:
                     dir_str = msg.get('direction') or None  # 'downstream'/'upstream'/None
                     record = {'id': msg['id'], 'message': msg['message']}
                     self._db_radio.setdefault(vn, {}).setdefault(dir_str, []).append(record)
+
+            # Pre-load operator→ship radio messages (options the player can choose).
+            for msg in _db.lock_radio_messages(sender_type='operator', limit=5000):
+                vn = msg.get('vessel_name') or msg.get('sender_name')
+                if vn:
+                    record = {'id': msg['id'], 'message': msg['message']}
+                    self._db_operator_radio.setdefault(vn, []).append(record)
 
             # Pre-load captain portraits
             self._captain_portraits = self._load_captain_portraits(_db)
@@ -441,10 +451,53 @@ class LockDamVisualizer:
         pygame.draw.rect(self.screen, self._dim(self.GRASS, mult),      (x, top_y - 26, w, 14))
         pygame.draw.rect(self.screen, self._dim(self.GRASS_DARK, mult), (x, top_y - 38, w, 12))
 
-    def _draw_channel_floor(self, x, w):
-        mult = self._get_ambient_mult()
-        pygame.draw.rect(self.screen, self._dim(self.DIRT, mult),  (x, self._water_bot_y,      w, 16))
-        pygame.draw.rect(self.screen, self._dim(self.GRASS, mult), (x, self._water_bot_y + 16, w, 16))
+    def _draw_ground_strip(self, lk_sx, lk_ex):
+        """Fill the full ground area below _water_bot_y with layered earth and grass."""
+        mult  = self._get_ambient_mult()
+        gy    = self._water_bot_y
+        gh    = self.height - gy
+
+        for gx, gw in ((0, lk_sx), (lk_ex, self.width - lk_ex)):
+            if gw <= 0:
+                continue
+            # Earth gradient: medium soil at top → dark earth at bottom
+            self._gradient_rect(
+                self._dim((112, 86, 56), mult),
+                self._dim((70,  52, 32), mult),
+                (gx, gy, gw, gh),
+            )
+            # Grass cap
+            pygame.draw.rect(self.screen, self._dim(self.GRASS,      mult), (gx, gy,      gw, 14))
+            pygame.draw.rect(self.screen, self._dim(self.GRASS_DARK, mult), (gx, gy + 12, gw,  6))
+            pygame.draw.rect(self.screen, self._dim(self.DIRT,       mult), (gx, gy + 16, gw, 10))
+
+            # Grass tufts (deterministic using x position as seed)
+            for tx in range(gx + 6, gx + gw, 16):
+                th = 4 + (tx * 17 + 3) % 5
+                pygame.draw.line(self.screen, self._dim((48, 118, 44), mult),
+                                 (tx,     gy + 2), (tx - 2, gy + 2 - th), 1)
+                pygame.draw.line(self.screen, self._dim((68, 148, 58), mult),
+                                 (tx + 3, gy + 2), (tx + 5, gy + 2 - th + 1), 1)
+
+            # Ground-level trees at the same sim-space positions as the sky trees
+            for tree in self.trees:
+                sx = self._sx(tree['x'])
+                if gx <= sx < gx + gw:
+                    self._draw_ground_tree(sx, gy)
+
+    def _draw_ground_tree(self, sx, ground_y):
+        """Draw a larger ground-level tree on the embankment."""
+        mult  = self._get_ambient_mult()
+        trunk = self._dim(( 82, 53, 26), mult)
+        leaf1 = self._dim(( 26, 112, 26), mult)
+        leaf2 = self._dim(( 44, 138, 38), mult)
+        # Trunk planted in the soil
+        pygame.draw.rect(self.screen, trunk, (sx - 4, ground_y + 8, 8, 30))
+        # Canopy — three overlapping circles for a fuller look
+        pygame.draw.circle(self.screen, leaf1, (sx,       ground_y + 2),  20)
+        pygame.draw.circle(self.screen, leaf2, (sx - 13,  ground_y + 10), 14)
+        pygame.draw.circle(self.screen, leaf2, (sx + 13,  ground_y + 10), 14)
+        pygame.draw.circle(self.screen, leaf1, (sx,       ground_y + 16), 15)
 
     # ── Shore view ────────────────────────────────────────────────────────────
 
@@ -460,13 +513,15 @@ class LockDamVisualizer:
 
         self._draw_sky(min(up_y, dn_y) - 40)
 
+        # Ground strip (full width below water_bot_y — covers both channel floors)
+        self._draw_ground_strip(lk_sx, lk_ex)
+
         # Upstream channel
         mult = self._get_ambient_mult()
         shimmer_col = self._dim(self.WATER_SHIMMER, mult)
         self._draw_water_band(0, up_y, lk_sx)
         self._lane_divider(0, lk_sx, up_y)
         self._draw_bank_strip(0, up_y, lk_sx)
-        self._draw_channel_floor(0, lk_sx)
         t = self.time * 1.8
         for wx in range(0, lk_sx - 10, 35):
             oy = int(3 * math.sin(t + wx * 0.06))
@@ -477,7 +532,6 @@ class LockDamVisualizer:
         self._draw_water_band(lk_ex, dn_y, self.width - lk_ex)
         self._lane_divider(lk_ex, self.width - lk_ex, dn_y)
         self._draw_bank_strip(lk_ex, dn_y, self.width - lk_ex)
-        self._draw_channel_floor(lk_ex, self.width - lk_ex)
         for wx in range(lk_ex + 5, self.width - 10, 35):
             oy = int(2 * math.sin(t + wx * 0.06))
             pygame.draw.line(self.screen, shimmer_col,
@@ -1150,8 +1204,29 @@ class LockDamVisualizer:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return 'quit'
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self._radio_popup:
+                    # Option selection
+                    for rect, rec in zip(self._radio_popup['option_rects'],
+                                         self._radio_popup['options']):
+                        if rect.collidepoint(event.pos):
+                            self._select_radio_option(rec)
+                            break
+                    else:
+                        # Close button
+                        cr = self._radio_popup.get('close_rect')
+                        if cr and cr.collidepoint(event.pos):
+                            self._radio_popup = None
+                else:
+                    for btn_rect, ag in self._roster_buttons:
+                        if btn_rect.collidepoint(event.pos):
+                            self._open_radio_popup(ag)
+                            break
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
+                    if self._radio_popup:
+                        self._radio_popup = None
+                        continue
                     return 'menu'
                 elif event.key == pygame.K_g:
                     self._toggle_upstream_gate()
@@ -1455,7 +1530,11 @@ class LockDamVisualizer:
                     if tag_target in [t.strip() for t in (a.get('tags') or '').split(',')]
                 ]
                 # Always record crew_id so debug logging works even without a portrait.
-                self._captain_meta[vessel] = {'crew_id': cid, 'filename': None}
+                self._captain_meta[vessel] = {
+                    'crew_id':  cid,
+                    'filename': None,
+                    'name':     cap.get('name', ''),
+                }
 
                 if not matching:
                     logger.debug("  crew_id=%d (%s) vessel=%r: no art_asset tagged %r",
@@ -1595,29 +1674,45 @@ class LockDamVisualizer:
         if not self._radio_bubbles:
             return
 
-        # Tick every bubble independently; remove expired ones.
+        # Tick delays first, then TTLs; keep anything still alive or waiting.
+        surviving = []
         for b in self._radio_bubbles:
-            b['ttl'] -= 1
-        self._radio_bubbles = [b for b in self._radio_bubbles if b['ttl'] > 0]
-        if not self._radio_bubbles:
+            if b.get('delay', 0) > 0:
+                b['delay'] -= 1
+                surviving.append(b)
+            else:
+                b['ttl'] -= 1
+                if b['ttl'] > 0:
+                    surviving.append(b)
+        self._radio_bubbles = surviving
+
+        # Only render bubbles whose delay has expired.
+        visible = [b for b in self._radio_bubbles if b.get('delay', 0) == 0]
+        if not visible:
             return
 
-        if len(self._radio_bubbles) == 1:
-            self._draw_bubble_single(self._radio_bubbles[0])
+        if len(visible) == 1:
+            self._draw_bubble_single(visible[0])
         else:
-            self._draw_bubble_row(self._radio_bubbles)
+            self._draw_bubble_row(visible)
 
     # ── Radio bubble rendering helpers ────────────────────────────────────────
 
     def _draw_bubble_single(self, bubble):
-        """Original bottom-right layout: text bubble left, portrait right, tail."""
+        """Original bottom-right layout: text bubble left, portrait/icon right, tail."""
         alpha_frac = min(1.0, bubble['ttl'] / 40)
         alpha      = int(255 * alpha_frac)
+        is_op      = bubble.get('is_operator', False)
 
         portrait_size  = 80
         margin         = 12
         chars_per_line = 28
         line_h         = self.fnt_sm.get_height() + 2
+
+        # Operator messages: blue tint; ship messages: light grey
+        body_col = (210, 228, 255, alpha) if is_op else (240, 240, 240, alpha)
+        bord_col = (55,  100, 200, alpha) if is_op else (80,  80,  100, alpha)
+        text_col = (10,  20,  60)         if is_op else (20,  20,   40)
 
         lines = self._wrap_text(bubble['text'], chars_per_line)
         bub_w  = chars_per_line * 9 + 16
@@ -1628,9 +1723,6 @@ class LockDamVisualizer:
         py    = self.height - portrait_size - margin
         bub_x = px - bub_w - 10
         bub_y = py + portrait_size - bub_h - tail_h
-
-        body_col = (240, 240, 240, alpha)
-        bord_col = (80,  80, 100, alpha)
 
         bub_surf = pygame.Surface((bub_w, bub_h + tail_h), pygame.SRCALPHA)
         pygame.draw.rect(bub_surf, body_col, (0, 0, bub_w, bub_h), border_radius=8)
@@ -1645,7 +1737,7 @@ class LockDamVisualizer:
         pygame.draw.lines(bub_surf, bord_col, False, tail_pts, 2)
 
         for i, line in enumerate(lines):
-            ts = self.fnt_sm.render(line, True, (20, 20, 40))
+            ts = self.fnt_sm.render(line, True, text_col)
             ts.set_alpha(alpha)
             bub_surf.blit(ts, (8, 8 + i * line_h))
         self.screen.blit(bub_surf, (bub_x, bub_y))
@@ -1658,75 +1750,255 @@ class LockDamVisualizer:
         chars_per_line = 18
         line_h         = self.fnt_sm.get_height() + 2
         margin         = 10
-        gap            = 8   # gap between portrait and text within a card
-        card_margin    = 10  # horizontal gap between cards
+        gap            = 8
+        card_margin    = 10
 
-        # Compute a uniform card height based on the tallest message in the queue.
-        max_lines = max(
-            len(self._wrap_text(b['text'], chars_per_line)) for b in bubbles
-        )
-        max_lines = min(max_lines, 5)
+        max_lines = min(
+            max(len(self._wrap_text(b['text'], chars_per_line)) for b in bubbles), 5)
         bub_h  = line_h * max_lines + 16
         bub_w  = chars_per_line * 9 + 16
         card_w = portrait_size + gap + bub_w
         card_h = max(portrait_size, bub_h)
 
-        # Distribute cards evenly; if they would overflow just pack from the left.
-        n          = len(bubbles)
-        total_w    = n * card_w + (n - 1) * card_margin
-        start_x    = max(margin, (self.width - total_w) // 2)
-        bottom_y   = self.height - margin
-        card_top   = bottom_y - card_h
-
-        body_col = (240, 240, 240)
-        bord_col = (80,  80, 100)
+        n       = len(bubbles)
+        total_w = n * card_w + (n - 1) * card_margin
+        start_x = max(margin, (self.width - total_w) // 2)
+        card_top = self.height - margin - card_h
 
         for i, bubble in enumerate(bubbles):
             alpha_frac = min(1.0, bubble['ttl'] / 40)
             alpha      = int(255 * alpha_frac)
+            is_op      = bubble.get('is_operator', False)
+
+            body_col = (210, 228, 255) if is_op else (240, 240, 240)
+            bord_col = (55,  100, 200) if is_op else (80,   80, 100)
+            text_col = (10,   20,  60) if is_op else (20,   20,  40)
 
             cx = start_x + i * (card_w + card_margin)
-
-            # Portrait on the left of each card
             self._draw_bubble_portrait(
                 bubble, cx, card_top + (card_h - portrait_size) // 2,
                 portrait_size, alpha)
 
-            # Text bubble to the right of the portrait
-            lines   = self._wrap_text(bubble['text'], chars_per_line)[:max_lines]
-            bub_x   = cx + portrait_size + gap
-            bub_y   = card_top + (card_h - bub_h) // 2
-            bc      = (*body_col, alpha)
-            brc     = (*bord_col, alpha)
-            surf    = pygame.Surface((bub_w, bub_h), pygame.SRCALPHA)
-            pygame.draw.rect(surf, bc,  (0, 0, bub_w, bub_h), border_radius=8)
-            pygame.draw.rect(surf, brc, (0, 0, bub_w, bub_h), 2, border_radius=8)
+            lines = self._wrap_text(bubble['text'], chars_per_line)[:max_lines]
+            bub_x = cx + portrait_size + gap
+            bub_y = card_top + (card_h - bub_h) // 2
+            surf  = pygame.Surface((bub_w, bub_h), pygame.SRCALPHA)
+            pygame.draw.rect(surf, (*body_col, alpha), (0, 0, bub_w, bub_h), border_radius=8)
+            pygame.draw.rect(surf, (*bord_col, alpha), (0, 0, bub_w, bub_h), 2, border_radius=8)
             for j, line in enumerate(lines):
-                ts = self.fnt_sm.render(line, True, (20, 20, 40))
+                ts = self.fnt_sm.render(line, True, text_col)
                 ts.set_alpha(alpha)
                 surf.blit(ts, (8, 8 + j * line_h))
             self.screen.blit(surf, (bub_x, bub_y))
 
     def _draw_bubble_portrait(self, bubble, px, py, size, alpha):
-        """Draw a portrait (or placeholder silhouette) at (px, py) scaled to size."""
+        """Draw portrait, operator icon, or ship placeholder at (px, py) scaled to size."""
+        is_op   = bubble.get('is_operator', False)
         portrait = bubble.get('portrait')
-        bord_col = (80, 80, 100, alpha)
-        if portrait:
+
+        if is_op:
+            # Blue operator icon
+            ph = pygame.Surface((size, size), pygame.SRCALPHA)
+            ph.fill((30, 55, 110, alpha))
+            pygame.draw.rect(ph, (55, 110, 210, alpha), (0, 0, size, size), 2, border_radius=4)
+            op_lbl = self.fnt_sm.render("OP", True, (160, 200, 255))
+            op_lbl.set_alpha(alpha)
+            ph.blit(op_lbl, ((size - op_lbl.get_width()) // 2,
+                              size // 2 - op_lbl.get_height() // 2))
+            self.screen.blit(ph, (px, py))
+        elif portrait:
             ps = pygame.transform.smoothscale(portrait, (size, size))
             ps.set_alpha(alpha)
             self.screen.blit(ps, (px, py))
             bord = pygame.Surface((size + 4, size + 4), pygame.SRCALPHA)
-            pygame.draw.rect(bord, bord_col, (0, 0, size + 4, size + 4), 2, border_radius=4)
+            pygame.draw.rect(bord, (80, 80, 100, alpha),
+                             (0, 0, size + 4, size + 4), 2, border_radius=4)
             self.screen.blit(bord, (px - 2, py - 2))
         else:
             ph = pygame.Surface((size, size), pygame.SRCALPHA)
             ph.fill((60, 60, 80, alpha))
-            pygame.draw.rect(ph, bord_col, (0, 0, size, size), 2, border_radius=4)
+            pygame.draw.rect(ph, (80, 80, 100, alpha), (0, 0, size, size), 2, border_radius=4)
             cap_lbl = self.fnt_sm.render("CAPT", True, (180, 180, 200))
             cap_lbl.set_alpha(alpha)
             ph.blit(cap_lbl, ((size - cap_lbl.get_width()) // 2,
                                size // 2 - cap_lbl.get_height() // 2))
             self.screen.blit(ph, (px, py))
+
+    # ── Lock roster panel ─────────────────────────────────────────────────────
+
+    def _draw_lock_roster(self):
+        """Draw a vertical centered list of ships currently in the lock."""
+        self._roster_buttons = []
+
+        in_lock = [
+            ag for ag in self.agents
+            if ag.state == 'active' and self._in_lock(ag.boat)
+        ]
+        if not in_lock:
+            return
+
+        row_h    = 30
+        panel_w  = 300
+        pad      = 12
+        btn_w    = 60
+        btn_h    = 22
+        header_h = 28
+
+        panel_h  = header_h + len(in_lock) * row_h + 8
+        panel_x  = (self.width - panel_w) // 2
+        panel_y  = self.height - panel_h - 8
+
+        bg = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        bg.fill((8, 14, 34, 210))
+        self.screen.blit(bg, (panel_x, panel_y))
+        pygame.draw.rect(self.screen, (55, 100, 180), (panel_x, panel_y, panel_w, panel_h), 1)
+
+        hdr = self.fnt_sm.render("Ships in Lock", True, (150, 185, 255))
+        self.screen.blit(hdr, (panel_x + pad, panel_y + 5))
+        pygame.draw.line(self.screen, (55, 100, 180),
+                         (panel_x + 6, panel_y + header_h - 2),
+                         (panel_x + panel_w - 6, panel_y + header_h - 2), 1)
+
+        for i, ag in enumerate(in_lock):
+            ry      = panel_y + header_h + i * row_h
+            mid_y   = ry + row_h // 2
+
+            name_lbl = self.fnt_sm.render(ag.boat.name[:28], True, (220, 230, 255))
+            self.screen.blit(name_lbl, (panel_x + pad,
+                                        mid_y - name_lbl.get_height() // 2))
+
+            btn_x    = panel_x + panel_w - btn_w - pad
+            btn_rect = pygame.Rect(btn_x, mid_y - btn_h // 2, btn_w, btn_h)
+            pygame.draw.rect(self.screen, (38, 92, 168), btn_rect, border_radius=4)
+            pygame.draw.rect(self.screen, (80, 140, 220), btn_rect, 1, border_radius=4)
+            r_lbl    = self.fnt_sm.render("RADIO", True, (195, 218, 255))
+            self.screen.blit(r_lbl, (btn_x + (btn_w - r_lbl.get_width()) // 2,
+                                     mid_y - r_lbl.get_height() // 2))
+            self._roster_buttons.append((btn_rect, ag))
+
+    # ── Radio popup ───────────────────────────────────────────────────────────
+
+    def _open_radio_popup(self, ag):
+        """Open the operator radio popup for the given agent."""
+        ship        = self._agent_ship_map.get(id(ag))
+        vessel_name = ship['name'] if ship else ag.boat.name
+        all_op_msgs = self._db_operator_radio.get(vessel_name, [])
+        options     = random.sample(all_op_msgs, min(4, len(all_op_msgs))) if all_op_msgs else []
+        self._radio_popup = {
+            'ag':           ag,
+            'vessel_name':  vessel_name,
+            'options':      options,
+            'option_rects': [],
+            'close_rect':   None,
+        }
+
+    def _select_radio_option(self, record):
+        """Player chose an operator message; show it and queue the ship's response."""
+        popup       = self._radio_popup
+        ag          = popup['ag']
+        vessel_name = popup['vessel_name']
+        self._radio_popup = None
+
+        # Operator transmission bubble (blue tint, no portrait)
+        op_ttl = self._reading_ttl(record['message'])
+        self._radio_bubbles.append({
+            'text':        record['message'],
+            'portrait':    None,
+            'ttl':         op_ttl,
+            'max_ttl':     op_ttl,
+            'is_operator': True,
+        })
+
+        # Ship response — delayed by 2 s so it doesn't overlap instantly
+        ship     = self._agent_ship_map.get(id(ag))
+        ship_dir = ship.get('direction') if ship else None
+        buckets  = self._db_radio.get(vessel_name, {})
+        records  = buckets.get(ship_dir) or buckets.get(None) or []
+        if records:
+            resp    = random.choice(records)
+            portrait = self._captain_portraits.get(vessel_name)
+            r_ttl   = self._reading_ttl(resp['message'])
+            self._radio_bubbles.append({
+                'text':        resp['message'],
+                'portrait':    portrait,
+                'ttl':         r_ttl,
+                'max_ttl':     r_ttl,
+                'is_operator': False,
+                'delay':       120,   # 2 s at 60 fps
+            })
+
+    def _draw_radio_popup(self):
+        """Render the operator radio selection popup."""
+        popup = self._radio_popup
+        if not popup:
+            return
+
+        options  = popup['options']
+        opt_h    = 54
+        pad      = 14
+        pop_w    = 560
+        header_h = 52
+        gap      = 6
+
+        pop_h = header_h + len(options) * (opt_h + gap) + 44   # 44 for close btn + margin
+        pop_x = (self.width  - pop_w) // 2
+        pop_y = (self.height - pop_h) // 2
+
+        # Screen dim
+        dim = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 130))
+        self.screen.blit(dim, (0, 0))
+
+        # Panel
+        panel = pygame.Surface((pop_w, pop_h), pygame.SRCALPHA)
+        panel.fill((10, 16, 40, 245))
+        self.screen.blit(panel, (pop_x, pop_y))
+        pygame.draw.rect(self.screen, (65, 115, 195), (pop_x, pop_y, pop_w, pop_h), 2, border_radius=6)
+
+        # Header
+        title = self.fnt_md.render(f"RADIO — {popup['vessel_name']}", True, (170, 205, 255))
+        self.screen.blit(title, (pop_x + pad, pop_y + 10))
+        sub = self.fnt_sm.render("Select operator transmission:", True, (110, 140, 185))
+        self.screen.blit(sub, (pop_x + pad, pop_y + 32))
+        pygame.draw.line(self.screen, (65, 115, 195),
+                         (pop_x + 8, pop_y + header_h - 4),
+                         (pop_x + pop_w - 8, pop_y + header_h - 4), 1)
+
+        option_rects = []
+        for i, rec in enumerate(options):
+            oy       = pop_y + header_h + i * (opt_h + gap)
+            opt_rect = pygame.Rect(pop_x + pad, oy, pop_w - 2 * pad, opt_h)
+            pygame.draw.rect(self.screen, (22, 46, 90), opt_rect, border_radius=4)
+            pygame.draw.rect(self.screen, (65, 115, 195), opt_rect, 1, border_radius=4)
+
+            # Number badge
+            num = self.fnt_md.render(str(i + 1), True, (130, 175, 255))
+            self.screen.blit(num, (opt_rect.x + 8, oy + (opt_h - num.get_height()) // 2))
+
+            # Message text — up to 2 lines
+            for j, line in enumerate(self._wrap_text(rec['message'], 54)[:2]):
+                line_surf = self.fnt_sm.render(line, True, (205, 222, 255))
+                self.screen.blit(line_surf, (opt_rect.x + 32, oy + 8 + j * 20))
+
+            option_rects.append(opt_rect)
+
+        popup['option_rects'] = option_rects
+
+        # If no operator messages exist for this vessel show a note
+        if not options:
+            note = self.fnt_sm.render("No operator messages on file for this vessel.",
+                                      True, (160, 140, 120))
+            self.screen.blit(note, (pop_x + pad, pop_y + header_h + 10))
+
+        # Close button
+        close_y    = pop_y + pop_h - 34
+        close_rect = pygame.Rect(pop_x + (pop_w - 80) // 2, close_y, 80, 24)
+        pygame.draw.rect(self.screen, (65, 32, 32), close_rect, border_radius=4)
+        pygame.draw.rect(self.screen, (180, 80, 80), close_rect, 1, border_radius=4)
+        cl = self.fnt_sm.render("CLOSE", True, (235, 175, 175))
+        self.screen.blit(cl, (close_rect.x + (80 - cl.get_width()) // 2,
+                               close_rect.y + (24 - cl.get_height()) // 2))
+        popup['close_rect'] = close_rect
 
     @staticmethod
     def _wrap_text(text: str, chars_per_line: int) -> list[str]:
@@ -2353,7 +2625,10 @@ class LockDamVisualizer:
             self._draw_lightning()
 
             self.draw_ui()
+            if self.view_mode == "shore":
+                self._draw_lock_roster()
             self._draw_radio_bubbles()
+            self._draw_radio_popup()
 
             if not self.game_over:
                 self._check_both_gates()
