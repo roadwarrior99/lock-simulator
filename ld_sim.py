@@ -178,6 +178,7 @@ class LockDamVisualizer:
             'state': 'idle', # 'idle', 'walking', 'tying', 'untying', 'crossing'
             'side': 0, # 0 = top, 1 = bottom
             'target_side': 0,
+            'cross_progress': 0.0,  # 0.0→1.0 while crossing between walls
             'rope_progress': 0.0, # 0.0 to 1.0 (thrown)
             'target_boat': None, # agent being tied/untied
             'task': None # 'tie', 'untie', or None
@@ -626,7 +627,18 @@ class LockDamVisualizer:
 
         op = self.operator
         ox = self._sx(op['x'])
-        oy = wall_top - 5 if op['side'] == 0 else self._water_bot_y + 10
+        top_y    = wall_top - 5
+        bottom_y = self._water_bot_y + 10
+        if op['state'] == 'crossing':
+            t  = op['cross_progress']
+            # Ease in-out so the walk looks natural
+            t  = t * t * (3 - 2 * t)
+            if op['target_side'] == 1:   # crossing top → bottom
+                oy = int(top_y    + (bottom_y - top_y) * t)
+            else:                         # crossing bottom → top
+                oy = int(bottom_y + (top_y - bottom_y) * t)
+        else:
+            oy = top_y if op['side'] == 0 else bottom_y
         self._op_screen_pos = (ox, oy)   # cached for speech-bubble anchoring
 
         body_col = self._dim((60, 80, 200), mult) # blue uniform
@@ -1269,7 +1281,16 @@ class LockDamVisualizer:
 
     def _update_operator(self, dt):
         op = self.operator
-        
+
+        # Advance wall-crossing animation; block other logic until complete.
+        if op['state'] == 'crossing':
+            op['cross_progress'] = min(1.0, op['cross_progress'] + 0.04)
+            if op['cross_progress'] >= 1.0:
+                op['side']           = op['target_side']
+                op['cross_progress'] = 0.0
+                op['state']          = 'idle'
+            return
+
         # 1. Identify tasks
         tying_tasks = []
         untying_tasks = []
@@ -1346,9 +1367,10 @@ class LockDamVisualizer:
                         op['state'] = 'walking'
                         op['x'] += 1.2 if dx > 0 else -1.2
                     else:
-                        # Cross the gate!
-                        op['state'] = 'crossing'
-                        op['side'] = boat_side
+                        # Begin animated crossing to the other wall.
+                        op['state']          = 'crossing'
+                        op['target_side']    = boat_side
+                        op['cross_progress'] = 0.0
                 else:
                     # Both gates open? Wait at the best spot.
                     op['state'] = 'waiting'
@@ -1392,7 +1414,10 @@ class LockDamVisualizer:
                         op['state'] = 'walking'
                         op['x'] += 1.2 if dx > 0 else -1.2
                     else:
-                        op['side'] = 0
+                        # Begin animated crossing back to top wall.
+                        op['state']          = 'crossing'
+                        op['target_side']    = 0
+                        op['cross_progress'] = 0.0
                 else:
                     op['state'] = 'idle'
             else:
@@ -2538,6 +2563,7 @@ class LockDamVisualizer:
                 'state':           op['state'],
                 'side':            op['side'],
                 'target_side':     op['target_side'],
+                'cross_progress':  op['cross_progress'],
                 'rope_progress':   op['rope_progress'],
                 'target_boat_idx': target_idx,
                 'task':            op['task'],
@@ -2605,6 +2631,7 @@ class LockDamVisualizer:
             'state':         op_d['state'],
             'side':          op_d['side'],
             'target_side':   op_d['target_side'],
+            'cross_progress': op_d.get('cross_progress', 0.0),
             'rope_progress': op_d['rope_progress'],
             'target_boat':   self.agents[tgt] if tgt is not None and tgt < len(self.agents) else None,
             'task':          op_d['task'],
