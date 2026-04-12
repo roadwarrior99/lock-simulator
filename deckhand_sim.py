@@ -839,9 +839,10 @@ class DeckHandSimulation:
     def _update_ai_crew(self, dt: float):
         for hand in self._ai_crew:
             completed = hand.update(dt, self.active_tasks)
-            if completed is not None and completed in self.active_tasks:
+            if completed is not None:
                 self._complete_task(completed, scored=False)
-                self.active_tasks.remove(completed)
+                if completed in self.active_tasks:
+                    self.active_tasks.remove(completed)
 
     def _draw_ai_crew(self):
         """Draw each AI deckhand figure, name tag, and portrait+bubble when speaking."""
