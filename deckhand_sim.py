@@ -797,8 +797,9 @@ class DeckHandSimulation:
         if candidates:
             self.active_tasks.append(random.choice(candidates))
 
-    def _complete_task(self, task: Task):
-        self.score   += 1
+    def _complete_task(self, task: Task, scored: bool = True):
+        if scored:
+            self.score += 1
         task.complete = True
         if task.task_type == 'connect' and task.payload:
             task.payload.connected = True
@@ -826,7 +827,8 @@ class DeckHandSimulation:
                                      if t.task_type not in ('unmoor', 'barge_doors')]
                 self._notify("Lines cast off — getting underway!")
                 return   # skip generic notify
-        self._notify(f'+${self.TASK_BONUS:.0f}  {task.label} done')
+        if scored:
+            self._notify(f'+${self.TASK_BONUS:.0f}  {task.label} done')
 
     def _notify(self, msg: str):
         self.notif       = msg
@@ -838,7 +840,7 @@ class DeckHandSimulation:
         for hand in self._ai_crew:
             completed = hand.update(dt, self.active_tasks)
             if completed is not None and completed in self.active_tasks:
-                self._complete_task(completed)
+                self._complete_task(completed, scored=False)
                 self.active_tasks.remove(completed)
 
     def _draw_ai_crew(self):
