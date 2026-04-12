@@ -25,6 +25,9 @@ Usage examples
     # Generate an image and save the file + register it in the DB
     python asset_manager.py image --prompt "towboat at night on the Mississippi River" --category background
 
+    # Generate lock radio traffic for all ships (creates captains first)
+    python asset_manager.py gen-radio --all
+
     # Print DB summary
     python asset_manager.py summary
 
@@ -261,6 +264,140 @@ def random_ship_record() -> dict:
         'cargo':       cargo,
         'notes':       None,
     }
+
+
+# ── Lock radio generation ─────────────────────────────────────────────────────
+
+LOCK_RADIO_SYSTEM_PROMPT = """\
+You write realistic VHF radio exchanges between vessels and a Mississippi River lock operator.
+Follow real-world lockage protocol: the vessel hails the lock on channel 14 or 16,
+requests lockage, operator confirms availability and gives approach/hold instructions,
+vessel acknowledges and enters, operator gives clearance, vessel thanks and departs.
+Keep each transmission short and clipped — real radio talk, no pleasantries.
+Use proper callsign format. The lock operator's callsign is "Lock Twelve" (or the lock name given).
+Return ONLY a JSON array. Each element must be an object with exactly three keys:
+  "sender_type": "ship" or "operator"
+  "sender_name": the callsign used (vessel name or lock name)
+  "message": the radio transmission text
+No markdown fences, no explanation — raw JSON array only."""
+
+
+def generate_lock_radio_exchange(
+    vessel_name: str,
+    direction:   str,
+    vessel_type: str  = 'vessel',
+    lock_name:   str  = 'Lock Twelve',
+    cargo:       str  = None,
+) -> list[dict]:
+    """
+    Generate a realistic VHF lockage exchange for *vessel_name*.
+
+    Returns a list of dicts: [{sender_type, sender_name, message}, …]
+    """
+    import json as _json
+
+    client = _openai_client()
+
+    cargo_clause  = f' carrying {cargo}' if cargo else ''
+    bound_clause  = f'{"up" if direction == "upstream" else "down"}bound'
+    user_prompt   = (
+        f"Generate a realistic VHF radio lockage exchange.\n"
+        f"Vessel: {vessel_name}, a {vessel_type}{cargo_clause}, {bound_clause}.\n"
+        f"Lock: {lock_name}.\n"
+        f"Write 6–10 transmissions covering: initial hail, operator response, "
+        f"approach/hold instructions, entry clearance, and departure."
+    )
+
+    logger.debug("chat prompt [lock_radio]:\n  system: %s\n  user: %s",
+                 LOCK_RADIO_SYSTEM_PROMPT, user_prompt)
+
+    response = client.chat.completions.create(
+        model='gpt-4o',
+        messages=[
+            {'role': 'system', 'content': LOCK_RADIO_SYSTEM_PROMPT},
+            {'role': 'user',   'content': user_prompt},
+        ],
+        temperature=0.7,
+    )
+
+    raw = response.choices[0].message.content.strip()
+    logger.debug("lock_radio raw response: %s", raw)
+
+    try:
+        messages = _json.loads(raw)
+    except _json.JSONDecodeError:
+        # Strip accidental markdown fences and retry
+        clean = raw.strip('`').lstrip('json').strip()
+        messages = _json.loads(clean)
+
+    # Normalise keys
+    result = []
+    for m in messages:
+        result.append({
+            'sender_type': str(m.get('sender_type', 'ship')).lower(),
+            'sender_name': str(m.get('sender_name', vessel_name)),
+            'message':     str(m.get('message', '')),
+        })
+    return result
+
+
+def gen_lock_radio(
+    db,
+    *,
+    vessel_name: str  = None,
+    lock_name:   str  = 'Lock Twelve',
+    count:       int  = 1,
+) -> list[dict]:
+    """
+    Generate lock radio exchanges and save them to the lock_radio table.
+
+    If *vessel_name* is given, generate one exchange for that ship.
+    Otherwise pick *count* random ships from the ships table.
+
+    Returns a list of {vessel_name, thread_id, messages} dicts.
+    """
+    if vessel_name:
+        ship_rows = [{'name': vessel_name, 'vessel_type': 'vessel',
+                      'direction': 'downstream', 'cargo': None}]
+    else:
+        all_ships = db.ships(limit=10_000)
+        if not all_ships:
+            logger.warning("No ships in DB — add some with gen-ships first.")
+            return []
+        ship_rows = random.sample(all_ships, min(count, len(all_ships)))
+
+    results = []
+    for ship in ship_rows:
+        name   = ship.get('name') or 'Unknown Vessel'
+        vtype  = ship.get('vessel_type') or 'vessel'
+        dirn   = ship.get('direction') or 'downstream'
+        cargo  = ship.get('cargo')
+
+        exchanges = generate_lock_radio_exchange(
+            name, dirn, vessel_type=vtype,
+            lock_name=lock_name, cargo=cargo,
+        )
+
+        thread_id = db.new_radio_thread()
+        for msg in exchanges:
+            db.add_lock_radio_message(
+                msg['sender_type'],
+                msg['sender_name'],
+                msg['message'],
+                thread_id=thread_id,
+                vessel_name=name,
+                direction=dirn,
+            )
+
+        results.append({
+            'vessel_name': name,
+            'thread_id':   thread_id,
+            'messages':    exchanges,
+        })
+        logger.info("Saved %d messages for %s (thread %d)",
+                    len(exchanges), name, thread_id)
+
+    return results
 
 
 # ── Captain generation ───────────────────────────────────────────────────────
@@ -937,6 +1074,21 @@ def build_parser():
 
     sub = p.add_subparsers(dest='cmd', metavar='COMMAND')
 
+    # -- gen-radio
+    gr = sub.add_parser('gen-radio',
+                        help='Generate VHF lock radio exchanges and store in lock_radio')
+    gr.add_argument('--vessel',    default=None,
+                    help='Generate for this specific vessel name (skips DB lookup)')
+    gr.add_argument('--lock-name', default='Lock Twelve',
+                    help='Lock callsign used by the operator (default: %(default)s)')
+    gr.add_argument('--count',     type=int, default=1,
+                    help='Number of random ships to generate exchanges for (default: 1)')
+    gr.add_argument('--all',       action='store_true',
+                    help='Create captains for all ships then generate radio traffic for '
+                         'every ship that does not already have an exchange')
+    gr.add_argument('--dry-run',   action='store_true',
+                    help='Print the exchange without saving to DB')
+
     # -- crew-name
     cn = sub.add_parser('crew-name', help='Generate random crew names from census data')
     cn.add_argument('--count',  type=int, default=1, help='How many names to generate')
@@ -1022,7 +1174,88 @@ def main():
     db = db_module.GameDatabase(args.db)
 
     try:
-        if args.cmd == 'crew-name':
+        if args.cmd == 'gen-radio':
+            if args.dry_run:
+                vessel   = args.vessel or 'MV Example'
+                print("Dry run — would send:\n")
+                print(f"  system: {LOCK_RADIO_SYSTEM_PROMPT}\n")
+                print(
+                    f"  user: Generate a realistic VHF radio lockage exchange.\n"
+                    f"  Vessel: {vessel}, a vessel, downbound.\n"
+                    f"  Lock: {args.lock_name}.\n"
+                    f"  Write 6–10 transmissions covering: initial hail, operator "
+                    f"response, approach/hold instructions, entry clearance, and departure."
+                )
+            elif getattr(args, 'all', False):
+                # ── Step 1: ensure every ship has a captain ───────────────────
+                new_caps = gen_captains(db)
+                if new_caps:
+                    print(f"Created {len(new_caps)} captain(s).")
+                else:
+                    print("All ships already have a captain.")
+
+                # ── Step 2: generate radio for ships with no existing exchange ─
+                all_ships = db.ships(limit=10_000)
+                covered   = {
+                    m['vessel_name']
+                    for m in db.lock_radio_messages(limit=10_000)
+                    if m.get('vessel_name')
+                }
+                pending = [s for s in all_ships
+                           if s.get('name') and s['name'] not in covered]
+                skipped = len(all_ships) - len(pending)
+
+                if skipped:
+                    print(f"Skipping {skipped} ship(s) that already have radio traffic.")
+                if not pending:
+                    print("Nothing to generate.")
+                else:
+                    print(f"Generating radio exchanges for {len(pending)} ship(s)…\n")
+                    total_msgs = 0
+                    for ship in pending:
+                        name  = ship['name']
+                        vtype = ship.get('vessel_type') or 'vessel'
+                        dirn  = ship.get('direction')   or 'downstream'
+                        cargo = ship.get('cargo')
+                        try:
+                            exchanges = generate_lock_radio_exchange(
+                                name, dirn,
+                                vessel_type=vtype,
+                                lock_name=args.lock_name,
+                                cargo=cargo,
+                            )
+                            thread_id = db.new_radio_thread()
+                            for msg in exchanges:
+                                db.add_lock_radio_message(
+                                    msg['sender_type'],
+                                    msg['sender_name'],
+                                    msg['message'],
+                                    thread_id=thread_id,
+                                    vessel_name=name,
+                                    direction=dirn,
+                                )
+                            total_msgs += len(exchanges)
+                            print(f"  [{thread_id}] {name}  ({len(exchanges)} msgs)")
+                        except Exception as exc:
+                            print(f"  ERROR {name}: {exc}")
+
+                    print(f"\nDone. {total_msgs} message(s) across {len(pending)} thread(s).")
+            else:
+                results = gen_lock_radio(
+                    db,
+                    vessel_name=args.vessel,
+                    lock_name=args.lock_name,
+                    count=args.count,
+                )
+                for r in results:
+                    print(f"\n── {r['vessel_name']}  (thread {r['thread_id']}) ──")
+                    for msg in r['messages']:
+                        tag = '→' if msg['sender_type'] == 'ship' else '←'
+                        print(f"  {tag}  [{msg['sender_name']}]  {msg['message']}")
+                print(f"\n{sum(len(r['messages']) for r in results)} message(s) saved "
+                      f"across {len(results)} thread(s).")
+
+        elif args.cmd == 'crew-name':
             names = [random_crew_name(args.gender) for _ in range(args.count)]
             for name in names:
                 print(name)

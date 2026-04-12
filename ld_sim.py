@@ -1,9 +1,11 @@
 import pygame
 import math
+import os
 import random
 from lock_and_dam import LockAndDam
 from boat import Yacht, Barge, Kayak, PaddleBoat
 from waterway import Canal
+from assets import GameDatabase
 
 
 # ── Boat agent ────────────────────────────────────────────────────────────────
@@ -172,6 +174,39 @@ class LockDamVisualizer:
         self.fnt_lg = pygame.font.Font(None, 42)
         self.fnt_md = pygame.font.Font(None, 28)
         self.fnt_sm = pygame.font.Font(None, 22)
+
+        # ── Asset DB ──────────────────────────────────────────────────────────
+        # Map vessel_type strings → game class
+        _VT_TO_CLS = {
+            'barge': Barge, 'towboat': Barge,
+            'yacht': Yacht, 'kayak': Kayak, 'paddleboat': PaddleBoat,
+        }
+        self._db_ships_by_cls: dict[type, list[dict]] = {
+            Barge: [], Yacht: [], Kayak: [], PaddleBoat: []}
+        self._db_radio: dict[str, list[str]] = {}   # vessel_name → [message, ...]
+        self._captain_portraits: dict[str, pygame.Surface] = {}
+        self._agent_ship_map: dict[int, dict] = {}   # id(ag) → ship record
+        self._radio_triggered: set[int] = set()      # id(ag) already triggered
+        self._radio_bubbles: list[dict] = []         # active speech bubbles
+
+        try:
+            _db = GameDatabase()
+            for s in _db.ships():
+                cls = _VT_TO_CLS.get((s.get('vessel_type') or '').lower())
+                if cls and s.get('name'):
+                    self._db_ships_by_cls[cls].append(s)
+
+            # Pre-load ship radio messages (ship→operator transmissions only)
+            for msg in _db.lock_radio_messages(sender_type='ship', limit=5000):
+                vn = msg.get('vessel_name') or msg.get('sender_name')
+                if vn:
+                    self._db_radio.setdefault(vn, []).append(msg['message'])
+
+            # Pre-load captain portraits
+            self._captain_portraits = self._load_captain_portraits(_db)
+            _db.close()
+        except Exception:
+            pass   # DB unavailable — game runs without it
 
         # Seed two initial boats
         self._spawn_boat( 1,  100)
@@ -1213,6 +1248,9 @@ class LockDamVisualizer:
                             target_ag.tied_down = True
                             target_ag.tied_side = op['side']
                             op['target_boat'] = None # Task finished
+                            if id(target_ag) not in self._radio_triggered:
+                                self._radio_triggered.add(id(target_ag))
+                                self._trigger_radio_bubble(target_ag)
                     elif op['task'] == 'untie':
                         op['state'] = 'untying'
                         if op['rope_progress'] > 0.0:
@@ -1348,12 +1386,154 @@ class LockDamVisualizer:
                         b['x'] += (dx / dist) * speed
                         b['y'] += (dy / dist) * speed
 
+    # ── Asset-DB helpers ──────────────────────────────────────────────────────
+
+    def _load_captain_portraits(self, db) -> dict:
+        """
+        Return {vessel_name: pygame.Surface} for every captain that has a portrait.
+        Portrait path is looked up via art_assets tags: 'crew_id:<n>'.
+        """
+        portrait_dir = os.path.join('assets', 'generated', 'portraits')
+        portraits = {}
+        try:
+            captains = db.crew_list(role='captain')
+            for cap in captains:
+                vessel = cap.get('vessel_name')
+                if not vessel:
+                    continue
+                cid = str(cap['id'])
+                # Find portrait asset tagged with this crew id
+                matching = [
+                    a for a in db.art_assets(category='character')
+                    if f"crew_id:{cid}" in (a.get('tags') or '')
+                ]
+                if not matching:
+                    continue
+                filepath = os.path.join(portrait_dir, matching[0]['filename'])
+                if not os.path.exists(filepath):
+                    continue
+                try:
+                    surf = pygame.image.load(filepath).convert_alpha()
+                    portraits[vessel] = surf
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return portraits
+
+    def _trigger_radio_bubble(self, ag):
+        """Fire a speech bubble for the captain of ag's vessel (if available)."""
+        ship = self._agent_ship_map.get(id(ag))
+        if not ship:
+            return
+        vessel_name = ship.get('name', '')
+        messages = self._db_radio.get(vessel_name)
+        if not messages:
+            return
+        msg = random.choice(messages)
+        portrait = self._captain_portraits.get(vessel_name)
+        self._radio_bubbles.append({
+            'text':     msg,
+            'portrait': portrait,
+            'ttl':      320,
+            'max_ttl':  320,
+        })
+
+    def _draw_radio_bubbles(self):
+        """Render captain speech bubbles in the bottom-right corner."""
+        if not self._radio_bubbles:
+            return
+
+        bubble = self._radio_bubbles[0]
+        bubble['ttl'] -= 1
+        if bubble['ttl'] <= 0:
+            self._radio_bubbles.pop(0)
+            return
+
+        alpha_frac = min(1.0, bubble['ttl'] / 40)   # fade out last 40 frames
+        alpha = int(255 * alpha_frac)
+
+        portrait_size = 80
+        margin = 12
+        px = self.width - portrait_size - margin
+        py = self.height - portrait_size - margin
+
+        # ── Speech bubble ─────────────────────────────────────────────────────
+        chars_per_line = 28
+        words = bubble['text'].split()
+        lines, cur = [], ''
+        for w in words:
+            if len(cur) + len(w) + 1 <= chars_per_line:
+                cur = (cur + ' ' + w).strip()
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        lines = lines[:6]   # cap to 6 lines
+
+        line_h   = self.fnt_sm.get_height() + 2
+        bub_w    = chars_per_line * 9 + 16
+        bub_h    = line_h * len(lines) + 16
+        tail_h   = 14
+        bub_x    = px - bub_w - 10
+        bub_y    = py + portrait_size - bub_h - tail_h
+
+        bub_surf = pygame.Surface((bub_w, bub_h + tail_h), pygame.SRCALPHA)
+
+        # Rounded rect body
+        body_col  = (240, 240, 240, alpha)
+        bord_col  = (80, 80, 100, alpha)
+        pygame.draw.rect(bub_surf, body_col, (0, 0, bub_w, bub_h), border_radius=8)
+        pygame.draw.rect(bub_surf, bord_col, (0, 0, bub_w, bub_h), 2, border_radius=8)
+
+        # Tail (triangle pointing right toward portrait)
+        tail_points = [
+            (bub_w,          bub_h - 10),
+            (bub_w + tail_h, bub_h + 4),
+            (bub_w,          bub_h + 4),
+        ]
+        pygame.draw.polygon(bub_surf, body_col, tail_points)
+        pygame.draw.lines(bub_surf, bord_col, False,
+                          [tail_points[0], tail_points[1], tail_points[2]], 2)
+
+        # Text lines
+        txt_col = (20, 20, 40, alpha)
+        for i, line in enumerate(lines):
+            ts = self.fnt_sm.render(line, True, (20, 20, 40))
+            ts.set_alpha(alpha)
+            bub_surf.blit(ts, (8, 8 + i * line_h))
+
+        self.screen.blit(bub_surf, (bub_x, bub_y))
+
+        # ── Portrait ──────────────────────────────────────────────────────────
+        portrait = bubble.get('portrait')
+        if portrait:
+            ps = pygame.transform.smoothscale(portrait, (portrait_size, portrait_size))
+            ps.set_alpha(alpha)
+            self.screen.blit(ps, (px, py))
+            # Border around portrait
+            bord = pygame.Surface((portrait_size + 4, portrait_size + 4), pygame.SRCALPHA)
+            pygame.draw.rect(bord, (80, 80, 100, alpha), (0, 0, portrait_size + 4, portrait_size + 4), 2, border_radius=4)
+            self.screen.blit(bord, (px - 2, py - 2))
+        else:
+            # Placeholder silhouette
+            ph = pygame.Surface((portrait_size, portrait_size), pygame.SRCALPHA)
+            ph.fill((60, 60, 80, alpha))
+            pygame.draw.rect(ph, (80, 80, 100, alpha), (0, 0, portrait_size, portrait_size), 2, border_radius=4)
+            cap_lbl = self.fnt_sm.render("CAPTAIN", True, (180, 180, 200))
+            cap_lbl.set_alpha(alpha)
+            ph.blit(cap_lbl, ((portrait_size - cap_lbl.get_width()) // 2,
+                               portrait_size // 2 - cap_lbl.get_height() // 2))
+            self.screen.blit(ph, (px, py))
+
     def _spawn_boat(self, direction, position=None):
         self._boat_counter += 1
         h = self.game_time
         # Spawning restrictions: no Kayaks at night, minimal Yachts.
         is_night = h < 6.0 or h > 20.0
-        
+
         if is_night:
             # 70% Barge, 20% PaddleBoat, 10% Yacht, 0% Kayak
             cls = random.choices([Barge, PaddleBoat, Yacht], weights=[0.7, 0.2, 0.1])[0]
@@ -1361,10 +1541,29 @@ class LockDamVisualizer:
             # Equal probability during the day
             cls = random.choice([Yacht, Barge, Kayak, PaddleBoat])
 
-        name = f"{cls.__name__[0]}{self._boat_counter}"
+        # Try to assign a real ship from the asset DB
+        db_ship = None
+        pool = self._db_ships_by_cls.get(cls, [])
+        if pool:
+            # Prefer ships not currently active on screen
+            active_names = {
+                self._agent_ship_map[id(ag)]['name']
+                for ag in self.agents
+                if id(ag) in self._agent_ship_map
+            }
+            available = [s for s in pool if s['name'] not in active_names]
+            if available:
+                db_ship = random.choice(available)
+            else:
+                db_ship = random.choice(pool)
+
+        name = db_ship['name'] if db_ship else f"{cls.__name__[0]}{self._boat_counter}"
         boat = cls(name)
         boat.position = (-120 if direction == 1 else 1100) if position is None else position
-        self.agents.append(Agent(boat, direction))
+        ag = Agent(boat, direction)
+        if db_ship:
+            self._agent_ship_map[id(ag)] = db_ship
+        self.agents.append(ag)
 
     def _spawn_if_needed(self):
         self.spawn_timer += 1
@@ -1413,7 +1612,11 @@ class LockDamVisualizer:
                 if ag.ttl <= 0:
                     ag.state = "done"
 
-        # Remove done agents
+        # Remove done agents and clean up their tracking data
+        done_ids = {id(ag) for ag in self.agents if ag.state == "done"}
+        for aid in done_ids:
+            self._agent_ship_map.pop(aid, None)
+            self._radio_triggered.discard(aid)
         self.agents = [ag for ag in self.agents if ag.state != "done"]
 
     def _step_agent(self, ag, all_active):
@@ -1893,6 +2096,7 @@ class LockDamVisualizer:
             self._draw_lightning()
 
             self.draw_ui()
+            self._draw_radio_bubbles()
 
             if not self.game_over:
                 self._check_both_gates()
