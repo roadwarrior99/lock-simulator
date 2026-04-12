@@ -23,14 +23,15 @@ CREATE TABLE IF NOT EXISTS crew (
     name        TEXT    NOT NULL,
     role        TEXT,                        -- deckhand / engineer / captain / cook / etc.
     vessel_name TEXT,                        -- ship they're currently assigned to
+    shift       TEXT,                        -- day / night / swing / etc. (nullable)
     bio         TEXT,                        -- short background blurb
     notes       TEXT                         -- freeform GM notes
 );
 
 CREATE TABLE IF NOT EXISTS crew_messages (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    crew_id     INTEGER REFERENCES crew(id), -- NULL = unknown / unregistered sender
-    sender      TEXT    NOT NULL,
+    crew_id     INTEGER REFERENCES crew(id), -- sender derived from this link
+    message     TEXT,                        -- dialog text
     role        TEXT,                        -- deckhand / engineer / captain / etc.
     context     TEXT,                        -- what triggered this (e.g. 'barge_connected')
     stage_id    TEXT                         -- operator / deckhand / engineer / captain
@@ -91,7 +92,14 @@ class GameDatabase:
         self._conn = sqlite3.connect(path)
         self._conn.row_factory = sqlite3.Row   # rows behave like dicts
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self):
+        """Apply additive schema changes to existing databases."""
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(crew)")}
+        if 'shift' not in existing:
+            self._conn.execute("ALTER TABLE crew ADD COLUMN shift TEXT")
 
     # ── Context manager ───────────────────────────────────────────────────────
 
@@ -124,13 +132,14 @@ class GameDatabase:
         *,
         role:        str = None,
         vessel_name: str = None,
+        shift:       str = None,
         bio:         str = None,
         notes:       str = None,
     ) -> int:
         return self._run(
-            """INSERT INTO crew (name, role, vessel_name, bio, notes)
-               VALUES (?, ?, ?, ?, ?)""",
-            (name, role, vessel_name, bio, notes),
+            """INSERT INTO crew (name, role, vessel_name, shift, bio, notes)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (name, role, vessel_name, shift, bio, notes),
         )
 
     def get_crew(self, crew_id: int) -> dict | None:
@@ -148,7 +157,7 @@ class GameDatabase:
 
     def update_crew(self, crew_id: int, **fields):
         """Update any subset of crew fields by keyword argument."""
-        allowed = {'name', 'role', 'vessel_name', 'bio', 'notes'}
+        allowed = {'name', 'role', 'vessel_name', 'shift', 'bio', 'notes'}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
@@ -162,17 +171,17 @@ class GameDatabase:
 
     def add_crew_message(
         self,
-        sender:   str,
         *,
         crew_id:  int = None,
+        message:  str = None,
         role:     str = None,
         context:  str = None,
         stage_id: str = None,
     ) -> int:
         return self._run(
-            """INSERT INTO crew_messages (crew_id, sender, role, context, stage_id)
+            """INSERT INTO crew_messages (crew_id, message, role, context, stage_id)
                VALUES (?, ?, ?, ?, ?)""",
-            (crew_id, sender, role, context, stage_id),
+            (crew_id, message, role, context, stage_id),
         )
 
     def crew_messages(
@@ -192,7 +201,7 @@ class GameDatabase:
             clauses.append("cm.role = ?");     params.append(role)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         return self._rows(
-            f"""SELECT cm.*, c.name AS crew_name, c.vessel_name
+            f"""SELECT cm.*, c.name AS sender, c.vessel_name
                 FROM crew_messages cm
                 LEFT JOIN crew c ON c.id = cm.crew_id
                 {where}

@@ -14,9 +14,11 @@ Compatible interface with LockDamVisualizer:
   DeckHandSimulation(...).run()  →  'menu' | 'quit' | 'shift_complete'
 """
 
+import os
 import pygame
 import math
 import random
+from assets import GameDatabase
 
 
 # ── Supporting data classes ──────────────────────────────────────────────────
@@ -77,12 +79,13 @@ class Task:
     }
 
     def __init__(self, task_type: str, position: tuple, payload=None):
-        self.task_type = task_type
-        self.position  = position   # (x, y) target on screen
-        self.payload   = payload    # CableConnection for connect/tension tasks
-        self.progress  = 0.0       # 0–1; resets slowly when player steps away
-        self.complete  = False
-        self.active    = False      # True while player is actively working it
+        self.task_type  = task_type
+        self.position   = position   # (x, y) target on screen
+        self.payload    = payload    # CableConnection for connect/tension tasks
+        self.progress   = 0.0       # 0–1; resets slowly when player steps away
+        self.complete   = False
+        self.active     = False      # True while player is actively working it
+        self.claimed_by = None       # AICrewHand or None
 
     @property
     def hold_time(self) -> float:
@@ -134,6 +137,130 @@ class DeckHandCharacter:
 
     def near(self, pos: tuple) -> bool:
         return math.hypot(self.x - pos[0], self.y - pos[1]) < self.REACH
+
+
+# ── AI crew ──────────────────────────────────────────────────────────────────
+
+class AICrewHand:
+    """
+    An NPC deckhand that autonomously walks to tasks and completes them.
+    Slower than the player; skips mini-games (tension / barge_doors handled
+    directly).  Uses crew_messages keyed by task_type for speech bubbles.
+    """
+
+    SPEED       = 62.0   # px / real-second  (~65 % of player speed)
+    REACH       = 38.0   # px; close-enough radius to start working
+    # Task types AI will handle; barge_doors needs the panel mini-game so skip
+    VALID_TASKS = {'connect', 'tension', 'moor', 'unmoor', 'paint', 'lookout'}
+
+    BUBBLE_INTERVAL_MIN = 14.0   # seconds between spontaneous lines
+    BUBBLE_INTERVAL_MAX = 30.0
+
+    def __init__(self, crew_id: int, name: str,
+                 messages: dict, hat_color: tuple,
+                 start_x: float, start_y: float,
+                 portrait=None):
+        self.crew_id   = crew_id
+        self.name      = name
+        self.messages  = messages    # {context: [str, ...]}
+        self.hat_color = hat_color
+        self.portrait  = portrait    # pygame.Surface or None
+        self.x         = float(start_x)
+        self.y         = float(start_y)
+        self.facing    = 1
+
+        self.target_task: 'Task | None' = None
+        self._work_progress = 0.0
+
+        self.bubble_text: str | None = None
+        self.bubble_ttl  = 0.0      # seconds remaining
+        self._next_bubble = random.uniform(5.0, 12.0)
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def near(self, pos: tuple) -> bool:
+        return math.hypot(self.x - pos[0], self.y - pos[1]) < self.REACH
+
+    def _pick_msg(self, context: str) -> 'str | None':
+        pool = self.messages.get(context) or self.messages.get('working') or []
+        return random.choice(pool) if pool else None
+
+    def _say(self, context: str):
+        msg = self._pick_msg(context)
+        if msg:
+            self.bubble_text = msg
+            words = len(msg.split())
+            self.bubble_ttl  = max(3.5, words / 3.0)
+
+    # ── per-frame update ─────────────────────────────────────────────────────
+
+    def update(self, dt: float, active_tasks: list) -> 'Task | None':
+        """
+        Advance AI state.  Returns the Task that was just completed this
+        frame (so the caller can invoke _complete_task), or None.
+        """
+        # Drop stale claim
+        if self.target_task and (
+                self.target_task.complete or
+                self.target_task not in active_tasks):
+            self.target_task.claimed_by = None
+            self.target_task = None
+            self._work_progress = 0.0
+
+        # Player stole the task (player is actively working it)
+        if self.target_task and self.target_task.active:
+            self.target_task.claimed_by = None
+            self.target_task = None
+            self._work_progress = 0.0
+
+        # Pick a new task
+        if self.target_task is None:
+            candidates = [
+                t for t in active_tasks
+                if t.task_type in self.VALID_TASKS
+                and not t.complete
+                and t.claimed_by is None
+            ]
+            if candidates:
+                self.target_task = random.choice(candidates)
+                self.target_task.claimed_by = self
+                self._work_progress = 0.0
+                self._say(self.target_task.task_type)
+
+        # Bubble cooldown
+        self._next_bubble -= dt
+        if self._next_bubble <= 0 and self.target_task:
+            self._next_bubble = random.uniform(self.BUBBLE_INTERVAL_MIN,
+                                               self.BUBBLE_INTERVAL_MAX)
+            self._say(self.target_task.task_type)
+
+        if self.bubble_ttl > 0:
+            self.bubble_ttl -= dt
+
+        if self.target_task is None:
+            return None
+
+        tx, ty = self.target_task.position
+        dist = math.hypot(tx - self.x, ty - self.y)
+
+        if dist > self.REACH:
+            # Walk toward task
+            self.x      += ((tx - self.x) / dist) * self.SPEED * dt
+            self.y      += ((ty - self.y) / dist) * self.SPEED * dt
+            self.facing  = 1 if (tx - self.x) >= 0 else -1
+            return None
+
+        # Work on task — progress at normal hold-time rate
+        hold_t = self.target_task.hold_time or 1.5
+        self._work_progress += dt / hold_t
+        if self._work_progress >= 1.0:
+            completed = self.target_task
+            completed.claimed_by = None
+            self.target_task     = None
+            self._work_progress  = 0.0
+            return completed
+
+        return None
 
 
 # ── Main simulation ──────────────────────────────────────────────────────────
@@ -219,6 +346,93 @@ class DeckHandSimulation:
         self.fnt_md = pygame.font.Font(None, 29)
         self.fnt_sm = pygame.font.Font(None, 21)
 
+        # ── Shift identity ────────────────────────────────────────────────────
+        _is_night = shift_start_time >= 18.0
+        # Night: deck lead = Grace Rogers (8), deckhand = Scarlett Ramirez (9)
+        # Day : deck lead = Alex White    (7), deckhands = Jacob Kues (5), Daniel Kreis (6)
+        _DECK_LEAD_ID  = 8 if _is_night else 7
+        _AI_HAND_IDS   = [9] if _is_night else [5, 6]
+        _PORTRAIT_DIR  = os.path.join('assets', 'generated', 'portraits')
+
+        # AI deckhand hat colours: green at night, orange during day
+        _HAT_COLORS = {
+            9: (50,  200, 100),   # Scarlett — green
+            5: (230, 140,  40),   # Jacob K  — orange
+            6: (220, 100,  50),   # Daniel   — rust-orange
+        }
+
+        # ── Deck lead speech bubble system ───────────────────────────────────
+        self._lead_portrait: pygame.Surface | None = None
+        self._lead_messages: dict[str, str] = {}   # context → message text
+        self._crew_bubbles:  list[dict]     = []
+        self._crew_bubble_fired: set[str]   = set()
+        self._crew_intro_fired              = False
+
+        # ── AI crew hands ─────────────────────────────────────────────────────
+        self._ai_crew: list[AICrewHand] = []
+
+        try:
+            _db = GameDatabase()
+
+            # Deck lead messages
+            member = _db.get_crew(_DECK_LEAD_ID)
+            if member:
+                for msg in _db.crew_messages(crew_id=_DECK_LEAD_ID, limit=50):
+                    ctx = msg.get('context') or ''
+                    if ctx and msg.get('message'):
+                        self._lead_messages[ctx] = msg['message']
+
+                tag_target = f'crew_id:{_DECK_LEAD_ID}'
+                portrait_assets = [
+                    a for a in _db.art_assets(category='character')
+                    if tag_target in [t.strip() for t in (a.get('tags') or '').split(',')]
+                ]
+                if portrait_assets:
+                    fp = os.path.join(_PORTRAIT_DIR, portrait_assets[0]['filename'])
+                    if os.path.exists(fp):
+                        self._lead_portrait = pygame.image.load(fp).convert_alpha()
+
+            # AI deckhands — positioned below; we'll relocate after _build_tow
+            for crew_id in _AI_HAND_IDS:
+                hand_member = _db.get_crew(crew_id)
+                if hand_member:
+                    msgs: dict[str, list] = {}
+                    for msg in _db.crew_messages(crew_id=crew_id, limit=50):
+                        ctx  = msg.get('context') or 'working'
+                        text = msg.get('message') or ''
+                        if text:
+                            msgs.setdefault(ctx, []).append(text)
+
+                    # Portrait
+                    portrait = None
+                    tag_target = f'crew_id:{crew_id}'
+                    hand_portraits = [
+                        a for a in _db.art_assets(category='character')
+                        if tag_target in [t.strip() for t in (a.get('tags') or '').split(',')]
+                    ]
+                    if hand_portraits:
+                        fp = os.path.join(_PORTRAIT_DIR, hand_portraits[0]['filename'])
+                        if os.path.exists(fp):
+                            try:
+                                portrait = pygame.image.load(fp).convert_alpha()
+                            except Exception:
+                                pass
+
+                    hand = AICrewHand(
+                        crew_id   = crew_id,
+                        name      = hand_member['name'],
+                        messages  = msgs,
+                        hat_color = _HAT_COLORS.get(crew_id, (200, 200, 50)),
+                        start_x   = 0.0,   # set after _build_tow
+                        start_y   = 0.0,
+                        portrait  = portrait,
+                    )
+                    self._ai_crew.append(hand)
+
+            _db.close()
+        except Exception:
+            pass
+
         # Layout & objects
         self._build_tow()
 
@@ -241,6 +455,11 @@ class DeckHandSimulation:
                                    (self.TOW_COLS - 1) * self.BARGE_GAP_X) // 2
         py = self.towboat_rect.centery
         self.player = DeckHandCharacter(px, py)
+
+        # Place AI crew on the towboat deck, offset from player spawn
+        for i, hand in enumerate(self._ai_crew):
+            hand.x = float(px + (i + 1) * 22)
+            hand.y = float(py + 12)
 
         # Notification banner
         self.notif       = ''
@@ -297,6 +516,116 @@ class DeckHandSimulation:
         # Constants
         self._BDOOR_AMP_LIMIT  = 0.78
         self._BDOOR_TRIP_DELAY = 0.55
+
+    # ── Crew dialog bubbles ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _reading_ttl(text: str) -> int:
+        """Frames to display a message at ~3.5 words/sec with a 1.5 s lead-in."""
+        words = len(text.split())
+        return max(300, int((words / 3.5 + 1.5) * 60))
+
+    def _trigger_crew_bubble(self, context: str):
+        """Show a speech bubble from the deck lead for the given context, once."""
+        if context in self._crew_bubble_fired:
+            return
+        text = self._lead_messages.get(context)
+        if not text:
+            return
+        self._crew_bubble_fired.add(context)
+        ttl = self._reading_ttl(text)
+        self._crew_bubbles.append({
+            'text':    text,
+            'ttl':     ttl,
+            'max_ttl': ttl,
+        })
+
+    def _draw_crew_bubbles(self):
+        """
+        Render the deck lead's speech bubble anchored to the towboat area.
+        Portrait at bottom-left, speech bubble extends right.
+        """
+        if not self._crew_bubbles:
+            return
+
+        bubble = self._crew_bubbles[0]
+        bubble['ttl'] -= 1
+        if bubble['ttl'] <= 0:
+            self._crew_bubbles.pop(0)
+            return
+
+        alpha = int(255 * min(1.0, bubble['ttl'] / 40))
+        play_w     = self.width - 225
+        port_size  = 80
+        margin     = 12
+        px         = margin
+        py         = self.height - port_size - margin
+
+        # ── Portrait ──────────────────────────────────────────────────────────
+        if self._lead_portrait:
+            ps = pygame.transform.smoothscale(
+                self._lead_portrait, (port_size, port_size))
+            ps.set_alpha(alpha)
+            self.screen.blit(ps, (px, py))
+        else:
+            ph = pygame.Surface((port_size, port_size), pygame.SRCALPHA)
+            ph.fill((40, 55, 70, alpha))
+            lbl = self.fnt_sm.render("LEAD", True, (180, 200, 210))
+            lbl.set_alpha(alpha)
+            ph.blit(lbl, ((port_size - lbl.get_width()) // 2,
+                           port_size // 2 - lbl.get_height() // 2))
+            self.screen.blit(ph, (px, py))
+        pygame.draw.rect(self.screen, (80, 100, 120),
+                         (px - 2, py - 2, port_size + 4, port_size + 4), 2,
+                         border_radius=4)
+
+        # ── Bubble ────────────────────────────────────────────────────────────
+        chars_per_line = 30
+        words = bubble['text'].split()
+        lines, cur = [], ''
+        for w in words:
+            if len(cur) + len(w) + 1 <= chars_per_line:
+                cur = (cur + ' ' + w).strip()
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        lines = lines[:6]
+
+        line_h  = self.fnt_sm.get_height() + 3
+        bub_w   = chars_per_line * 9 + 16
+        bub_h   = line_h * len(lines) + 16
+        tail_h  = 14
+        bub_x   = px + port_size + 10
+        bub_y   = py + port_size - bub_h - tail_h
+
+        # Clamp so bubble stays on screen
+        bub_x = min(bub_x, play_w - bub_w - margin)
+
+        bub_surf = pygame.Surface((bub_w, bub_h + tail_h), pygame.SRCALPHA)
+        pygame.draw.rect(bub_surf, (235, 235, 235, alpha),
+                         (0, 0, bub_w, bub_h), border_radius=8)
+        pygame.draw.rect(bub_surf, (70, 90, 110, alpha),
+                         (0, 0, bub_w, bub_h), 2, border_radius=8)
+
+        # Tail pointing left toward portrait
+        tail_pts = [
+            (0,        bub_h - 10),
+            (-tail_h,  bub_h + 4),
+            (0,        bub_h + 4),
+        ]
+        pygame.draw.polygon(bub_surf, (235, 235, 235, alpha), tail_pts)
+        pygame.draw.lines(bub_surf, (70, 90, 110, alpha), False,
+                          [tail_pts[0], tail_pts[1], tail_pts[2]], 2)
+
+        for i, line in enumerate(lines):
+            ts = self.fnt_sm.render(line, True, (20, 30, 40))
+            ts.set_alpha(alpha)
+            bub_surf.blit(ts, (8, 8 + i * line_h))
+
+        self.screen.blit(bub_surf, (bub_x, bub_y))
 
     # ── Tow geometry ─────────────────────────────────────────────────────────
 
@@ -484,6 +813,7 @@ class DeckHandSimulation:
                 self._moored       = True
                 self._dock_timer   = self._dock_duration   # start stay timer now
                 self._notify("Ship secured!  Cargo doors ready.")
+                self._trigger_crew_bubble('unloading')
                 return   # skip generic notify
         elif task.task_type == 'unmoor' and self._unmooring:
             self._unmoor_done += 1
@@ -501,6 +831,125 @@ class DeckHandSimulation:
     def _notify(self, msg: str):
         self.notif       = msg
         self.notif_timer = 3.2
+
+    # ── AI crew ───────────────────────────────────────────────────────────────
+
+    def _update_ai_crew(self, dt: float):
+        for hand in self._ai_crew:
+            completed = hand.update(dt, self.active_tasks)
+            if completed is not None and completed in self.active_tasks:
+                self._complete_task(completed)
+                self.active_tasks.remove(completed)
+
+    def _draw_ai_crew(self):
+        """Draw each AI deckhand figure, name tag, and portrait+bubble when speaking."""
+        play_w    = self.width - 225
+        port_size = 80
+        margin    = 12
+
+        # Collect speaking hands so we can stack their portraits bottom-up
+        speaking = [h for h in self._ai_crew if h.bubble_text and h.bubble_ttl > 0]
+
+        for hand in self._ai_crew:
+            px, py = int(hand.x), int(hand.y)
+
+            # Body
+            pygame.draw.ellipse(self.screen, (80, 130, 200),
+                                (px - 7, py - 5, 14, 10))
+            # Head
+            pygame.draw.circle(self.screen, (255, 200, 165), (px, py - 10), 6)
+            # Hard hat
+            pygame.draw.ellipse(self.screen, hand.hat_color,
+                                (px - 7, py - 17, 14, 7))
+            # Direction pointer
+            ex = px + hand.facing * 14
+            pygame.draw.line(self.screen, (80, 130, 200),
+                             (px, py), (ex, py), 2)
+            # Name tag
+            name_s = self.fnt_sm.render(hand.name.split()[0], True, (210, 230, 255))
+            self.screen.blit(name_s, (px - name_s.get_width() // 2, py - 28))
+
+        # ── Portrait + bubble panel for speaking hands ────────────────────────
+        for slot, hand in enumerate(speaking):
+            alpha = int(255 * min(1.0, hand.bubble_ttl / 0.6))
+
+            # Portrait anchored bottom-right of play area, stacked upward per slot
+            port_x = play_w - port_size - margin
+            port_y = self.height - port_size - margin - slot * (port_size + margin + 4)
+
+            if hand.portrait:
+                ps = pygame.transform.smoothscale(hand.portrait, (port_size, port_size))
+                ps.set_alpha(alpha)
+                self.screen.blit(ps, (port_x, port_y))
+            else:
+                ph = pygame.Surface((port_size, port_size), pygame.SRCALPHA)
+                ph.fill((40, 60, 80, min(alpha, 200)))
+                init = self.fnt_md.render(hand.name[0], True, (180, 210, 240))
+                init.set_alpha(alpha)
+                ph.blit(init, ((port_size - init.get_width()) // 2,
+                               (port_size - init.get_height()) // 2))
+                self.screen.blit(ph, (port_x, port_y))
+
+            # Border in crew hat colour
+            border_surf = pygame.Surface((port_size + 4, port_size + 4), pygame.SRCALPHA)
+            pygame.draw.rect(border_surf, (*hand.hat_color, alpha),
+                             (0, 0, port_size + 4, port_size + 4), 2, border_radius=4)
+            self.screen.blit(border_surf, (port_x - 2, port_y - 2))
+
+            # ── Speech bubble to the left of portrait ─────────────────────────
+            chars_per_line = 28
+            words = hand.bubble_text.split()
+            lines, cur = [], ''
+            for w in words:
+                if len(cur) + len(w) + 1 <= chars_per_line:
+                    cur = (cur + ' ' + w).strip()
+                else:
+                    if cur:
+                        lines.append(cur)
+                    cur = w
+            if cur:
+                lines.append(cur)
+            lines = lines[:5]
+
+            line_h = self.fnt_sm.get_height() + 3
+            bub_w  = chars_per_line * 8 + 16
+            bub_h  = line_h * len(lines) + 16
+            tail_h = 14
+            bub_x  = port_x - bub_w - 8
+            bub_y  = port_y + port_size - bub_h - tail_h
+
+            # Clamp left edge
+            bub_x = max(margin, bub_x)
+
+            bub_surf = pygame.Surface((bub_w, bub_h + tail_h), pygame.SRCALPHA)
+            pygame.draw.rect(bub_surf, (235, 235, 235, alpha),
+                             (0, 0, bub_w, bub_h), border_radius=8)
+            pygame.draw.rect(bub_surf, (70, 90, 110, alpha),
+                             (0, 0, bub_w, bub_h), 2, border_radius=8)
+
+            # Tail pointing right toward portrait
+            tail_pts = [
+                (bub_w,          bub_h - 10),
+                (bub_w + tail_h, bub_h + 4),
+                (bub_w,          bub_h + 4),
+            ]
+            pygame.draw.polygon(bub_surf, (235, 235, 235, alpha), tail_pts)
+            pygame.draw.lines(bub_surf, (70, 90, 110, alpha), False,
+                              [tail_pts[0], tail_pts[1], tail_pts[2]], 2)
+
+            for i, line in enumerate(lines):
+                ts = self.fnt_sm.render(line, True, (20, 30, 40))
+                ts.set_alpha(alpha)
+                bub_surf.blit(ts, (8, 8 + i * line_h))
+
+            self.screen.blit(bub_surf, (bub_x, bub_y))
+
+            # Name label above portrait
+            name_label = self.fnt_sm.render(hand.name, True, (210, 230, 255))
+            name_label.set_alpha(alpha)
+            self.screen.blit(name_label,
+                             (port_x + port_size // 2 - name_label.get_width() // 2,
+                              port_y - name_label.get_height() - 3))
 
     # ── Zone helpers ─────────────────────────────────────────────────────────
 
@@ -1242,6 +1691,11 @@ class DeckHandSimulation:
             self.game_time = (self.game_time + game_dt) % 24
             return
 
+        # Shift-start message — fires once on the very first update tick
+        if not self._crew_intro_fired:
+            self._crew_intro_fired = True
+            self._trigger_crew_bubble('shift_start')
+
         keys = pygame.key.get_pressed()
         # Extend left bound to include dock when fully alongside
         if self._docking and self._dock_approach >= 1.0 and not self._departing:
@@ -1309,6 +1763,7 @@ class DeckHandSimulation:
             self._dock_duration    = random.uniform(25.0, 50.0)
             self._dock_timer       = self._dock_duration   # used after mooring
             self._notify("Docking — secure the mooring lines!")
+            self._trigger_crew_bubble('docking')
             occupied = {t.position for t in self.active_tasks}
             moor_spawned = 0
             for pos in self._port_mooring_pos:
@@ -1322,6 +1777,7 @@ class DeckHandSimulation:
 
         elif self._dock_timer <= 0 and self._moored and not self._unmooring and not self._departing:
             # Stay timer expired — begin unmooring
+            self._trigger_crew_bubble('leaving_dock')
             self._unmooring     = True
             self._unmoor_done   = 0
             self._notify("Stay complete — cast off the mooring lines!")
@@ -1391,6 +1847,9 @@ class DeckHandSimulation:
         for t in completed:
             if t in self.active_tasks:   # _complete_task may have already removed it
                 self.active_tasks.remove(t)
+
+        # AI crew
+        self._update_ai_crew(dt)
 
         # Game time
         self.game_time = (self.game_time + game_dt) % 24
@@ -1684,6 +2143,9 @@ class DeckHandSimulation:
         pygame.draw.line(self.screen, self.C_PLAYER,
                          (px, draw_y + bob), (ex, draw_y + bob), 2)
 
+        # ── AI crew ──
+        self._draw_ai_crew()
+
         # ── Overboard overlay ──
         if self._overboard:
             sx, sy   = self._splash_pos
@@ -1720,6 +2182,7 @@ class DeckHandSimulation:
             ns = self.fnt_md.render(self.notif, True, col)
             self.screen.blit(ns, (play_w // 2 - ns.get_width() // 2, 28))
 
+        self._draw_crew_bubbles()
         self._draw_hud()
 
     def _draw_hud(self):

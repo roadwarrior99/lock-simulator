@@ -807,7 +807,24 @@ def browse_assets_ui(db):
     font_xs  = pygame.font.SysFont('monospace', 11)
 
     # ── state ─────────────────────────────────────────────────────────────────
-    all_assets   = db.art_assets()
+    def _crew_id_from_asset(asset):
+        for tag in (asset.get('tags') or '').split(','):
+            tag = tag.strip()
+            if tag.startswith('crew_id:'):
+                try:
+                    return int(tag.split(':')[1])
+                except (ValueError, IndexError):
+                    pass
+        return None
+
+    raw_assets = db.art_assets()
+    # Sort: portraits first (by crew_id numerically), then others (category/filename)
+    raw_assets.sort(key=lambda a: (
+        (0, _crew_id_from_asset(a) or 0, '')
+        if _crew_id_from_asset(a) is not None
+        else (1, 0, f"{a.get('category','')}/{a.get('filename','')}")
+    ))
+    all_assets   = raw_assets
     categories   = ['all'] + sorted({a['category'] for a in all_assets if a['category']})
     cat_idx      = 0
     assets       = all_assets[:]
@@ -816,9 +833,24 @@ def browse_assets_ui(db):
     regen_state  = None   # None | 'working' | 'done' | 'error'
     status_msg   = ''
 
+    # Crew-ID jump input state
+    jump_mode    = False   # True while user is typing a crew id
+    jump_buf     = ''      # digits typed so far
+
     def filtered():
         cat = categories[cat_idx]
         return all_assets if cat == 'all' else [a for a in all_assets if a['category'] == cat]
+
+    def jump_to_crew(crew_id_str):
+        """Move idx to the first asset whose crew_id tag matches."""
+        try:
+            target = int(crew_id_str)
+        except ValueError:
+            return f'invalid id: {crew_id_str!r}'
+        for i, a in enumerate(assets):
+            if _crew_id_from_asset(a) == target:
+                return i
+        return f'crew id {target} not found'
 
     def load_surface(asset):
         """Return a pygame.Surface for *asset*, or None if file not found."""
@@ -879,14 +911,27 @@ def browse_assets_ui(db):
         row('category',    asset['category'])
         row('description', asset['description'])
         row('tags',        asset['tags'])
+        cid = _crew_id_from_asset(asset)
+        row('crew id',     str(cid) if cid is not None else '—')
         row('size',
             f"{asset['width']}×{asset['height']}" if asset['width'] else '—')
 
         # filter indicator
-        y = WIN_H - 110
+        y = WIN_H - 130
         cat_txt = font_sm.render(
             f"filter: {categories[cat_idx]}  [F]", True, ACCENT)
         screen.blit(cat_txt, (10, y));  y += 20
+
+        # crew-id jump box
+        if jump_mode:
+            box_col = (255, 220, 80)
+            prompt  = f'crew id: {jump_buf}_'
+            pygame.draw.rect(screen, (40, 40, 20), (8, y, PANEL_W - 16, 18))
+            pygame.draw.rect(screen, box_col,      (8, y, PANEL_W - 16, 18), 1)
+            screen.blit(font_sm.render(prompt, True, box_col), (12, y + 2))
+        else:
+            screen.blit(font_sm.render('[G] go to crew id', True, DIM_COLOR), (10, y))
+        y += 22
 
         # regen button hint
         rcolor = REGEN_ACTIVE if regen_state == 'working' else REGEN_COLOR
@@ -934,8 +979,37 @@ def browse_assets_ui(db):
                 running = False
 
             elif event.type == pygame.KEYDOWN:
+                # ── Crew-ID jump input mode ────────────────────────────────────
+                if jump_mode:
+                    if event.key == pygame.K_ESCAPE:
+                        jump_mode = False
+                        jump_buf  = ''
+                        status_msg = ''
+                    elif event.key == pygame.K_RETURN and jump_buf:
+                        result = jump_to_crew(jump_buf)
+                        jump_mode = False
+                        jump_buf  = ''
+                        if isinstance(result, int):
+                            idx = result
+                            cached_surf = load_surface(assets[idx])
+                            regen_state = None
+                            status_msg  = ''
+                        else:
+                            status_msg = result
+                    elif event.key == pygame.K_BACKSPACE:
+                        jump_buf = jump_buf[:-1]
+                    elif event.unicode.isdigit():
+                        jump_buf += event.unicode
+                    continue   # swallow all other keys while in jump mode
+
+                # ── Normal navigation ─────────────────────────────────────────
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     running = False
+
+                elif event.key == pygame.K_g:
+                    jump_mode  = True
+                    jump_buf   = ''
+                    status_msg = ''
 
                 elif event.key == pygame.K_RIGHT and assets:
                     idx = (idx + 1) % len(assets)

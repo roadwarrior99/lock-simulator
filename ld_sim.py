@@ -1403,9 +1403,10 @@ class LockDamVisualizer:
                     continue
                 cid = str(cap['id'])
                 # Find portrait asset tagged with this crew id
+                tag_target = f"crew_id:{cid}"
                 matching = [
                     a for a in db.art_assets(category='character')
-                    if f"crew_id:{cid}" in (a.get('tags') or '')
+                    if tag_target in [t.strip() for t in (a.get('tags') or '').split(',')]
                 ]
                 if not matching:
                     continue
@@ -1421,6 +1422,12 @@ class LockDamVisualizer:
             pass
         return portraits
 
+    @staticmethod
+    def _reading_ttl(text: str) -> int:
+        """Frames to display a message at ~3.5 words/sec with a 1.5 s lead-in."""
+        words = len(text.split())
+        return max(300, int((words / 3.5 + 1.5) * 60))
+
     def _trigger_radio_bubble(self, ag):
         """Fire a speech bubble for the captain of ag's vessel (if available)."""
         ship = self._agent_ship_map.get(id(ag))
@@ -1432,11 +1439,12 @@ class LockDamVisualizer:
             return
         msg = random.choice(messages)
         portrait = self._captain_portraits.get(vessel_name)
+        ttl = self._reading_ttl(msg)
         self._radio_bubbles.append({
             'text':     msg,
             'portrait': portrait,
-            'ttl':      320,
-            'max_ttl':  320,
+            'ttl':      ttl,
+            'max_ttl':  ttl,
         })
 
     def _draw_radio_bubbles(self):
