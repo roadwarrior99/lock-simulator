@@ -2353,29 +2353,30 @@ class LockDamVisualizer:
         # Boats approaching from outside stop at the outer wall face.
         # Boats inside the lock stopping at a closed gate use the inner wall face
         # so they don't visually clip into the concrete.
-        wt = self._wall_t_sim
-        gate_gap = int(100 / self._sx_scale)   # 100 screen-px converted to sim units
+        wt            = self._wall_t_sim
+        outer_gap     = int(100 / self._sx_scale)   # 100 px gap approaching from outside
+        inner_gap     = int(20  / self._sx_scale)   # 20 px gap when stopped inside lock
         if d == 1:
             gate_order = [
-                (self.lock_start,      self.lock_dam.upstream_gates_open),   # entry — outer face
-                (self.lock_end - wt,   self.lock_dam.downstream_gates_open), # exit  — inner face
+                (self.lock_start,      self.lock_dam.upstream_gates_open,   outer_gap),
+                (self.lock_end - wt,   self.lock_dam.downstream_gates_open, inner_gap),
             ]
         else:
             gate_order = [
-                (self.lock_end,        self.lock_dam.downstream_gates_open), # entry — outer face
-                (self.lock_start + wt, self.lock_dam.upstream_gates_open),   # exit  — inner face
+                (self.lock_end,        self.lock_dam.downstream_gates_open, outer_gap),
+                (self.lock_start + wt, self.lock_dam.upstream_gates_open,   inner_gap),
             ]
 
-        for gate_x, open_ in gate_order:
+        for gate_x, open_, gap in gate_order:
             if open_:
                 continue
             if d == 1:
-                if boat.position + boat.length <= gate_x - gate_gap < new_pos + boat.length:
-                    boat.position = gate_x - boat.length - gate_gap
+                if boat.position + boat.length <= gate_x - gap < new_pos + boat.length:
+                    boat.position = gate_x - boat.length - gap
                     return
             else:
-                if boat.position >= gate_x + gate_gap > new_pos:
-                    boat.position = gate_x + gate_gap
+                if boat.position >= gate_x + gap > new_pos:
+                    boat.position = gate_x + gap
                     return
 
         # ── Same-lane boat blocking (same direction only) ────────────────────────
