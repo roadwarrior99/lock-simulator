@@ -2354,7 +2354,7 @@ class LockDamVisualizer:
         # Boats inside the lock stopping at a closed gate use the inner wall face
         # so they don't visually clip into the concrete.
         wt = self._wall_t_sim
-        gate_gap = 12
+        gate_gap = int(100 / self._sx_scale)   # 100 screen-px converted to sim units
         if d == 1:
             gate_order = [
                 (self.lock_start,      self.lock_dam.upstream_gates_open),   # entry — outer face
