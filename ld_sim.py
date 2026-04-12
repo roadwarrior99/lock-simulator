@@ -1616,6 +1616,7 @@ class LockDamVisualizer:
             'ttl':      ttl,
             'max_ttl':  ttl,
         })
+        self._queue_operator_response(vessel_name, delay=ttl // 2)
 
     def _trigger_radio_departure(self, ag):
         """Fire a departure speech bubble when the operator clears mooring lines."""
@@ -1661,6 +1662,23 @@ class LockDamVisualizer:
             'portrait': portrait,
             'ttl':      ttl,
             'max_ttl':  ttl,
+        })
+        self._queue_operator_response(vessel_name, delay=ttl // 2)
+
+    def _queue_operator_response(self, vessel_name: str, delay: int = 120):
+        """Queue a random operator reply for vessel_name, shown after delay frames."""
+        op_msgs = self._db_operator_radio.get(vessel_name, [])
+        if not op_msgs:
+            return
+        rec = random.choice(op_msgs)
+        op_ttl = self._reading_ttl(rec['message'])
+        self._radio_bubbles.append({
+            'text':        rec['message'],
+            'portrait':    None,
+            'ttl':         op_ttl,
+            'max_ttl':     op_ttl,
+            'is_operator': True,
+            'delay':       delay,
         })
 
     def _draw_radio_bubbles(self):
