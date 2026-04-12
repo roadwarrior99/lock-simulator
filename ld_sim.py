@@ -1585,27 +1585,153 @@ class LockDamVisualizer:
         })
 
     def _draw_radio_bubbles(self):
-        """Render captain speech bubbles in the bottom-right corner."""
+        """Render captain speech bubbles.
+
+        Single bubble: bottom-right corner with portrait to the right and a
+        speech-bubble tail pointing at the portrait.
+        Multiple bubbles: all cards laid out side-by-side across the bottom so
+        they can be read simultaneously rather than queuing sequentially.
+        """
         if not self._radio_bubbles:
             return
 
-        bubble = self._radio_bubbles[0]
-        bubble['ttl'] -= 1
-        if bubble['ttl'] <= 0:
-            self._radio_bubbles.pop(0)
+        # Tick every bubble independently; remove expired ones.
+        for b in self._radio_bubbles:
+            b['ttl'] -= 1
+        self._radio_bubbles = [b for b in self._radio_bubbles if b['ttl'] > 0]
+        if not self._radio_bubbles:
             return
 
-        alpha_frac = min(1.0, bubble['ttl'] / 40)   # fade out last 40 frames
-        alpha = int(255 * alpha_frac)
+        if len(self._radio_bubbles) == 1:
+            self._draw_bubble_single(self._radio_bubbles[0])
+        else:
+            self._draw_bubble_row(self._radio_bubbles)
 
-        portrait_size = 80
-        margin = 12
-        px = self.width - portrait_size - margin
-        py = self.height - portrait_size - margin
+    # ── Radio bubble rendering helpers ────────────────────────────────────────
 
-        # ── Speech bubble ─────────────────────────────────────────────────────
+    def _draw_bubble_single(self, bubble):
+        """Original bottom-right layout: text bubble left, portrait right, tail."""
+        alpha_frac = min(1.0, bubble['ttl'] / 40)
+        alpha      = int(255 * alpha_frac)
+
+        portrait_size  = 80
+        margin         = 12
         chars_per_line = 28
-        words = bubble['text'].split()
+        line_h         = self.fnt_sm.get_height() + 2
+
+        lines = self._wrap_text(bubble['text'], chars_per_line)
+        bub_w  = chars_per_line * 9 + 16
+        bub_h  = line_h * len(lines) + 16
+        tail_h = 14
+
+        px    = self.width - portrait_size - margin
+        py    = self.height - portrait_size - margin
+        bub_x = px - bub_w - 10
+        bub_y = py + portrait_size - bub_h - tail_h
+
+        body_col = (240, 240, 240, alpha)
+        bord_col = (80,  80, 100, alpha)
+
+        bub_surf = pygame.Surface((bub_w, bub_h + tail_h), pygame.SRCALPHA)
+        pygame.draw.rect(bub_surf, body_col, (0, 0, bub_w, bub_h), border_radius=8)
+        pygame.draw.rect(bub_surf, bord_col, (0, 0, bub_w, bub_h), 2, border_radius=8)
+
+        tail_pts = [
+            (bub_w,          bub_h - 10),
+            (bub_w + tail_h, bub_h + 4),
+            (bub_w,          bub_h + 4),
+        ]
+        pygame.draw.polygon(bub_surf, body_col, tail_pts)
+        pygame.draw.lines(bub_surf, bord_col, False, tail_pts, 2)
+
+        for i, line in enumerate(lines):
+            ts = self.fnt_sm.render(line, True, (20, 20, 40))
+            ts.set_alpha(alpha)
+            bub_surf.blit(ts, (8, 8 + i * line_h))
+        self.screen.blit(bub_surf, (bub_x, bub_y))
+
+        self._draw_bubble_portrait(bubble, px, py, portrait_size, alpha)
+
+    def _draw_bubble_row(self, bubbles):
+        """Horizontal row layout across the bottom for multiple simultaneous bubbles."""
+        portrait_size  = 60
+        chars_per_line = 18
+        line_h         = self.fnt_sm.get_height() + 2
+        margin         = 10
+        gap            = 8   # gap between portrait and text within a card
+        card_margin    = 10  # horizontal gap between cards
+
+        # Compute a uniform card height based on the tallest message in the queue.
+        max_lines = max(
+            len(self._wrap_text(b['text'], chars_per_line)) for b in bubbles
+        )
+        max_lines = min(max_lines, 5)
+        bub_h  = line_h * max_lines + 16
+        bub_w  = chars_per_line * 9 + 16
+        card_w = portrait_size + gap + bub_w
+        card_h = max(portrait_size, bub_h)
+
+        # Distribute cards evenly; if they would overflow just pack from the left.
+        n          = len(bubbles)
+        total_w    = n * card_w + (n - 1) * card_margin
+        start_x    = max(margin, (self.width - total_w) // 2)
+        bottom_y   = self.height - margin
+        card_top   = bottom_y - card_h
+
+        body_col = (240, 240, 240)
+        bord_col = (80,  80, 100)
+
+        for i, bubble in enumerate(bubbles):
+            alpha_frac = min(1.0, bubble['ttl'] / 40)
+            alpha      = int(255 * alpha_frac)
+
+            cx = start_x + i * (card_w + card_margin)
+
+            # Portrait on the left of each card
+            self._draw_bubble_portrait(
+                bubble, cx, card_top + (card_h - portrait_size) // 2,
+                portrait_size, alpha)
+
+            # Text bubble to the right of the portrait
+            lines   = self._wrap_text(bubble['text'], chars_per_line)[:max_lines]
+            bub_x   = cx + portrait_size + gap
+            bub_y   = card_top + (card_h - bub_h) // 2
+            bc      = (*body_col, alpha)
+            brc     = (*bord_col, alpha)
+            surf    = pygame.Surface((bub_w, bub_h), pygame.SRCALPHA)
+            pygame.draw.rect(surf, bc,  (0, 0, bub_w, bub_h), border_radius=8)
+            pygame.draw.rect(surf, brc, (0, 0, bub_w, bub_h), 2, border_radius=8)
+            for j, line in enumerate(lines):
+                ts = self.fnt_sm.render(line, True, (20, 20, 40))
+                ts.set_alpha(alpha)
+                surf.blit(ts, (8, 8 + j * line_h))
+            self.screen.blit(surf, (bub_x, bub_y))
+
+    def _draw_bubble_portrait(self, bubble, px, py, size, alpha):
+        """Draw a portrait (or placeholder silhouette) at (px, py) scaled to size."""
+        portrait = bubble.get('portrait')
+        bord_col = (80, 80, 100, alpha)
+        if portrait:
+            ps = pygame.transform.smoothscale(portrait, (size, size))
+            ps.set_alpha(alpha)
+            self.screen.blit(ps, (px, py))
+            bord = pygame.Surface((size + 4, size + 4), pygame.SRCALPHA)
+            pygame.draw.rect(bord, bord_col, (0, 0, size + 4, size + 4), 2, border_radius=4)
+            self.screen.blit(bord, (px - 2, py - 2))
+        else:
+            ph = pygame.Surface((size, size), pygame.SRCALPHA)
+            ph.fill((60, 60, 80, alpha))
+            pygame.draw.rect(ph, bord_col, (0, 0, size, size), 2, border_radius=4)
+            cap_lbl = self.fnt_sm.render("CAPT", True, (180, 180, 200))
+            cap_lbl.set_alpha(alpha)
+            ph.blit(cap_lbl, ((size - cap_lbl.get_width()) // 2,
+                               size // 2 - cap_lbl.get_height() // 2))
+            self.screen.blit(ph, (px, py))
+
+    @staticmethod
+    def _wrap_text(text: str, chars_per_line: int) -> list[str]:
+        """Word-wrap text to a list of lines."""
+        words = text.split()
         lines, cur = [], ''
         for w in words:
             if len(cur) + len(w) + 1 <= chars_per_line:
@@ -1616,62 +1742,7 @@ class LockDamVisualizer:
                 cur = w
         if cur:
             lines.append(cur)
-        lines = lines[:6]   # cap to 6 lines
-
-        line_h   = self.fnt_sm.get_height() + 2
-        bub_w    = chars_per_line * 9 + 16
-        bub_h    = line_h * len(lines) + 16
-        tail_h   = 14
-        bub_x    = px - bub_w - 10
-        bub_y    = py + portrait_size - bub_h - tail_h
-
-        bub_surf = pygame.Surface((bub_w, bub_h + tail_h), pygame.SRCALPHA)
-
-        # Rounded rect body
-        body_col  = (240, 240, 240, alpha)
-        bord_col  = (80, 80, 100, alpha)
-        pygame.draw.rect(bub_surf, body_col, (0, 0, bub_w, bub_h), border_radius=8)
-        pygame.draw.rect(bub_surf, bord_col, (0, 0, bub_w, bub_h), 2, border_radius=8)
-
-        # Tail (triangle pointing right toward portrait)
-        tail_points = [
-            (bub_w,          bub_h - 10),
-            (bub_w + tail_h, bub_h + 4),
-            (bub_w,          bub_h + 4),
-        ]
-        pygame.draw.polygon(bub_surf, body_col, tail_points)
-        pygame.draw.lines(bub_surf, bord_col, False,
-                          [tail_points[0], tail_points[1], tail_points[2]], 2)
-
-        # Text lines
-        txt_col = (20, 20, 40, alpha)
-        for i, line in enumerate(lines):
-            ts = self.fnt_sm.render(line, True, (20, 20, 40))
-            ts.set_alpha(alpha)
-            bub_surf.blit(ts, (8, 8 + i * line_h))
-
-        self.screen.blit(bub_surf, (bub_x, bub_y))
-
-        # ── Portrait ──────────────────────────────────────────────────────────
-        portrait = bubble.get('portrait')
-        if portrait:
-            ps = pygame.transform.smoothscale(portrait, (portrait_size, portrait_size))
-            ps.set_alpha(alpha)
-            self.screen.blit(ps, (px, py))
-            # Border around portrait
-            bord = pygame.Surface((portrait_size + 4, portrait_size + 4), pygame.SRCALPHA)
-            pygame.draw.rect(bord, (80, 80, 100, alpha), (0, 0, portrait_size + 4, portrait_size + 4), 2, border_radius=4)
-            self.screen.blit(bord, (px - 2, py - 2))
-        else:
-            # Placeholder silhouette
-            ph = pygame.Surface((portrait_size, portrait_size), pygame.SRCALPHA)
-            ph.fill((60, 60, 80, alpha))
-            pygame.draw.rect(ph, (80, 80, 100, alpha), (0, 0, portrait_size, portrait_size), 2, border_radius=4)
-            cap_lbl = self.fnt_sm.render("CAPTAIN", True, (180, 180, 200))
-            cap_lbl.set_alpha(alpha)
-            ph.blit(cap_lbl, ((portrait_size - cap_lbl.get_width()) // 2,
-                               portrait_size // 2 - cap_lbl.get_height() // 2))
-            self.screen.blit(ph, (px, py))
+        return lines or ['']
 
     def _spawn_boat(self, direction, position=None):
         self._boat_counter += 1
