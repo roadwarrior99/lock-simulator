@@ -208,6 +208,7 @@ class LockDamVisualizer:
         self._radio_depart:   set[int]  = set()      # id(ag) already triggered (lines cleared)
         self._radio_bubbles: list[dict] = []         # active speech bubbles
         self._roster_buttons: list      = []         # [(pygame.Rect, Agent), ...] refreshed each frame
+        self._op_screen_pos: tuple      = (600, 390) # updated each frame in draw_shore_view
         self._db_operator_radio: dict[str, list[dict]] = {}  # vessel_name → [{id, message}]
         self._radio_popup: dict | None  = None       # active radio popup state
 
@@ -626,7 +627,8 @@ class LockDamVisualizer:
         op = self.operator
         ox = self._sx(op['x'])
         oy = wall_top - 5 if op['side'] == 0 else self._water_bot_y + 10
-            
+        self._op_screen_pos = (ox, oy)   # cached for speech-bubble anchoring
+
         body_col = self._dim((60, 80, 200), mult) # blue uniform
         pygame.draw.circle(self.screen, body_col, (ox, oy), 5) # body
         pygame.draw.circle(self.screen, self._dim((240, 200, 180), mult), (ox, oy - 8), 4) # head
@@ -1709,58 +1711,110 @@ class LockDamVisualizer:
         if not visible:
             return
 
-        if len(visible) == 1:
-            self._draw_bubble_single(visible[0])
-        else:
-            self._draw_bubble_row(visible)
+        # Operator bubbles are always drawn anchored to the operator figure.
+        # Ship bubbles use the corner layout (single) or horizontal row (multiple).
+        op_bubbles   = [b for b in visible if b.get('is_operator')]
+        ship_bubbles = [b for b in visible if not b.get('is_operator')]
+
+        for b in op_bubbles:
+            self._draw_bubble_single(b)
+
+        if len(ship_bubbles) == 1:
+            self._draw_bubble_single(ship_bubbles[0])
+        elif len(ship_bubbles) > 1:
+            self._draw_bubble_row(ship_bubbles)
 
     # ── Radio bubble rendering helpers ────────────────────────────────────────
 
     def _draw_bubble_single(self, bubble):
-        """Original bottom-right layout: text bubble left, portrait/icon right, tail."""
+        """Render a single speech bubble.
+
+        Operator bubbles float above the operator figure on the lock wall with
+        a cartoon tail pointing down to their head.  Ship bubbles use the
+        original bottom-right corner layout with a portrait to the right.
+        """
         alpha_frac = min(1.0, bubble['ttl'] / 40)
         alpha      = int(255 * alpha_frac)
         is_op      = bubble.get('is_operator', False)
 
-        portrait_size  = 80
-        margin         = 12
-        chars_per_line = 28
-        line_h         = self.fnt_sm.get_height() + 2
-
-        # Operator messages: blue tint; ship messages: light grey
         body_col = (210, 228, 255, alpha) if is_op else (240, 240, 240, alpha)
         bord_col = (55,  100, 200, alpha) if is_op else (80,  80,  100, alpha)
         text_col = (10,  20,  60)         if is_op else (20,  20,   40)
 
-        lines = self._wrap_text(bubble['text'], chars_per_line)
-        bub_w  = chars_per_line * 9 + 16
-        bub_h  = line_h * len(lines) + 16
-        tail_h = 14
+        line_h = self.fnt_sm.get_height() + 2
 
-        px    = self.width - portrait_size - margin
-        py    = self.height - portrait_size - margin
-        bub_x = px - bub_w - 10
-        bub_y = py + portrait_size - bub_h - tail_h
+        if is_op:
+            # ── Operator bubble anchored to the operator figure ───────────────
+            chars_per_line = 26
+            lines  = self._wrap_text(bubble['text'], chars_per_line)
+            bub_w  = chars_per_line * 9 + 20
+            bub_h  = line_h * len(lines) + 16
+            tail_h = 16
+            tail_w = 12
 
-        bub_surf = pygame.Surface((bub_w, bub_h + tail_h), pygame.SRCALPHA)
-        pygame.draw.rect(bub_surf, body_col, (0, 0, bub_w, bub_h), border_radius=8)
-        pygame.draw.rect(bub_surf, bord_col, (0, 0, bub_w, bub_h), 2, border_radius=8)
+            ox, oy = self._op_screen_pos
+            # Place bubble centered above the operator; clamp to screen edges.
+            bub_x = max(4, min(self.width - bub_w - 4, ox - bub_w // 2))
+            # Operator on top wall (oy low): bubble goes further up.
+            # Operator on bottom wall (oy high): bubble goes above them.
+            bub_y = oy - bub_h - tail_h - 18
 
-        tail_pts = [
-            (bub_w,          bub_h - 10),
-            (bub_w + tail_h, bub_h + 4),
-            (bub_w,          bub_h + 4),
-        ]
-        pygame.draw.polygon(bub_surf, body_col, tail_pts)
-        pygame.draw.lines(bub_surf, bord_col, False, tail_pts, 2)
+            surf = pygame.Surface((bub_w, bub_h + tail_h), pygame.SRCALPHA)
+            pygame.draw.rect(surf, body_col, (0, 0, bub_w, bub_h), border_radius=10)
+            pygame.draw.rect(surf, bord_col, (0, 0, bub_w, bub_h), 2, border_radius=10)
 
-        for i, line in enumerate(lines):
-            ts = self.fnt_sm.render(line, True, text_col)
-            ts.set_alpha(alpha)
-            bub_surf.blit(ts, (8, 8 + i * line_h))
-        self.screen.blit(bub_surf, (bub_x, bub_y))
+            # Tail points downward from bubble bottom-centre toward operator head
+            tail_cx = ox - bub_x   # tail centre in surf-local coords
+            tail_cx = max(tail_w + 2, min(bub_w - tail_w - 2, tail_cx))
+            tail_pts = [
+                (tail_cx - tail_w, bub_h),
+                (tail_cx + tail_w, bub_h),
+                (tail_cx,          bub_h + tail_h),
+            ]
+            pygame.draw.polygon(surf, body_col, tail_pts)
+            pygame.draw.lines(surf, bord_col, False, tail_pts, 2)
 
-        self._draw_bubble_portrait(bubble, px, py, portrait_size, alpha)
+            for i, line in enumerate(lines):
+                ts = self.fnt_sm.render(line, True, text_col)
+                ts.set_alpha(alpha)
+                surf.blit(ts, (10, 8 + i * line_h))
+            self.screen.blit(surf, (bub_x, bub_y))
+
+        else:
+            # ── Ship bubble: bottom-right corner, portrait to the right ───────
+            portrait_size  = 80
+            margin         = 12
+            chars_per_line = 28
+
+            lines  = self._wrap_text(bubble['text'], chars_per_line)
+            bub_w  = chars_per_line * 9 + 16
+            bub_h  = line_h * len(lines) + 16
+            tail_h = 14
+
+            px    = self.width - portrait_size - margin
+            py    = self.height - portrait_size - margin
+            bub_x = px - bub_w - 10
+            bub_y = py + portrait_size - bub_h - tail_h
+
+            bub_surf = pygame.Surface((bub_w, bub_h + tail_h), pygame.SRCALPHA)
+            pygame.draw.rect(bub_surf, body_col, (0, 0, bub_w, bub_h), border_radius=8)
+            pygame.draw.rect(bub_surf, bord_col, (0, 0, bub_w, bub_h), 2, border_radius=8)
+
+            tail_pts = [
+                (bub_w,          bub_h - 10),
+                (bub_w + tail_h, bub_h + 4),
+                (bub_w,          bub_h + 4),
+            ]
+            pygame.draw.polygon(bub_surf, body_col, tail_pts)
+            pygame.draw.lines(bub_surf, bord_col, False, tail_pts, 2)
+
+            for i, line in enumerate(lines):
+                ts = self.fnt_sm.render(line, True, text_col)
+                ts.set_alpha(alpha)
+                bub_surf.blit(ts, (8, 8 + i * line_h))
+            self.screen.blit(bub_surf, (bub_x, bub_y))
+
+            self._draw_bubble_portrait(bubble, px, py, portrait_size, alpha)
 
     def _draw_bubble_row(self, bubbles):
         """Horizontal row layout across the bottom for multiple simultaneous bubbles."""
