@@ -5,4 +5,4 @@ saves/*
 .env
 .DS_Store
 source_data
-
+logs

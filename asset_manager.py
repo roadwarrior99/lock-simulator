@@ -1231,7 +1231,147 @@ def build_parser():
     # -- summary
     sub.add_parser('summary', help='Print row counts for each DB table')
 
+    # -- audit
+    sub.add_parser('audit',
+                   help='Report content gaps: ships without crew, crew without '
+                        'portraits, captains without radio, crew without messages')
+
     return p
+
+
+def audit_gaps(db) -> dict:
+    """
+    Scan the database for common content gaps and return a report dict.
+
+    Checks:
+      ships_no_crew       — ships with no crew member assigned to them
+      crew_no_portrait    — crew with no art_asset tagged crew_id:<n>, or whose
+                            portrait file is missing from disk
+      crew_no_radio       — crew (captains) whose vessel has no lock_radio messages
+      crew_no_messages    — crew with no crew_messages rows at all
+
+    Each key maps to a list of dicts describing the affected records.
+    """
+    portrait_dir = PORTRAIT_OUTPUT_DIR
+    all_ships  = db.ships(limit=10_000)
+    all_crew   = db.crew_list()
+    all_assets = db.art_assets(category='character')
+
+    # Index crew by vessel_name for fast lookup
+    crew_by_vessel: dict[str, list[dict]] = {}
+    for c in all_crew:
+        vn = c.get('vessel_name')
+        if vn:
+            crew_by_vessel.setdefault(vn, []).append(c)
+
+    # Index art_assets by the crew_id tag they carry
+    asset_by_crew_id: dict[int, dict] = {}
+    for a in all_assets:
+        for tag in (a.get('tags') or '').split(','):
+            tag = tag.strip()
+            if tag.startswith('crew_id:'):
+                try:
+                    cid = int(tag.split(':')[1])
+                    asset_by_crew_id[cid] = a
+                except ValueError:
+                    pass
+
+    # Vessels that have at least one lock_radio message
+    radio_vessels: set[str] = {
+        m['vessel_name']
+        for m in db.lock_radio_messages(limit=100_000)
+        if m.get('vessel_name')
+    }
+
+    # crew_ids that have at least one crew_message
+    crew_ids_with_messages: set[int] = {
+        m['crew_id']
+        for m in db._rows(
+            "SELECT DISTINCT crew_id FROM crew_messages WHERE crew_id IS NOT NULL"
+        )
+    }
+
+    # ── 1. Ships with no crew ─────────────────────────────────────────────────
+    ships_no_crew = [
+        {'id': s['id'], 'name': s['name'],
+         'vessel_type': s.get('vessel_type'), 'direction': s.get('direction')}
+        for s in all_ships
+        if s.get('name') and s['name'] not in crew_by_vessel
+    ]
+
+    # ── 2. Crew with no portrait (asset missing or file absent) ───────────────
+    crew_no_portrait = []
+    for c in all_crew:
+        cid = c['id']
+        asset = asset_by_crew_id.get(cid)
+        if asset is None:
+            crew_no_portrait.append({
+                'crew_id': cid, 'name': c['name'], 'role': c.get('role'),
+                'vessel_name': c.get('vessel_name'),
+                'reason': 'no art_asset tagged crew_id:{}'.format(cid),
+            })
+        else:
+            filepath = os.path.join(portrait_dir, asset['filename'])
+            if not os.path.exists(filepath):
+                crew_no_portrait.append({
+                    'crew_id': cid, 'name': c['name'], 'role': c.get('role'),
+                    'vessel_name': c.get('vessel_name'),
+                    'reason': 'asset registered ({}) but file missing'.format(asset['filename']),
+                })
+
+    # ── 3. Captains whose vessel has no lock_radio messages ───────────────────
+    crew_no_radio = [
+        {'crew_id': c['id'], 'name': c['name'],
+         'vessel_name': c.get('vessel_name')}
+        for c in all_crew
+        if c.get('role') == 'captain'
+        and c.get('vessel_name')
+        and c['vessel_name'] not in radio_vessels
+    ]
+
+    # ── 4. Crew with no crew_messages at all ──────────────────────────────────
+    crew_no_messages = [
+        {'crew_id': c['id'], 'name': c['name'], 'role': c.get('role'),
+         'vessel_name': c.get('vessel_name')}
+        for c in all_crew
+        if c['id'] not in crew_ids_with_messages
+    ]
+
+    return {
+        'ships_no_crew':    ships_no_crew,
+        'crew_no_portrait': crew_no_portrait,
+        'crew_no_radio':    crew_no_radio,
+        'crew_no_messages': crew_no_messages,
+    }
+
+
+def _print_audit(report: dict):
+    """Pretty-print an audit_gaps() report to stdout."""
+    sections = [
+        ('ships_no_crew',
+         'Ships with no crew assigned',
+         lambda r: f"  ship {r['id']:>4}  {r['name']:<30}  {r['vessel_type'] or '?':<12}  {r['direction'] or '?'}"),
+        ('crew_no_portrait',
+         'Crew with no portrait (asset missing or file absent)',
+         lambda r: f"  crew {r['crew_id']:>4}  {r['name']:<28}  {r['role'] or '?':<10}  vessel={r['vessel_name'] or '—'}  [{r['reason']}]"),
+        ('crew_no_radio',
+         'Captains whose vessel has no lock_radio messages',
+         lambda r: f"  crew {r['crew_id']:>4}  {r['name']:<28}  vessel={r['vessel_name'] or '—'}"),
+        ('crew_no_messages',
+         'Crew with no crew_messages at all',
+         lambda r: f"  crew {r['crew_id']:>4}  {r['name']:<28}  {r['role'] or '?':<10}  vessel={r['vessel_name'] or '—'}"),
+    ]
+    any_gap = False
+    for key, title, fmt in sections:
+        rows = report[key]
+        status = f"({len(rows)} gap{'s' if len(rows) != 1 else ''})" if rows else "(OK)"
+        print(f"\n── {title} {status} ──")
+        for r in rows:
+            print(fmt(r))
+        if rows:
+            any_gap = True
+    if not any_gap:
+        print("\nAll checks passed — no gaps found.")
 
 
 def main():
@@ -1470,6 +1610,10 @@ def main():
             col = max(len(k) for k in s)
             for k, v in s.items():
                 print(f"  {k:<{col}}  {v}")
+
+        elif args.cmd == 'audit':
+            report = audit_gaps(db)
+            _print_audit(report)
 
     finally:
         db.close()

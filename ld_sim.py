@@ -1,3 +1,4 @@
+import logging
 import pygame
 import math
 import os
@@ -6,6 +7,8 @@ from lock_and_dam import LockAndDam
 from boat import Yacht, Barge, Kayak, PaddleBoat
 from waterway import Canal
 from assets import GameDatabase
+
+logger = logging.getLogger(__name__)
 
 
 # ── Boat agent ────────────────────────────────────────────────────────────────
@@ -193,13 +196,16 @@ class LockDamVisualizer:
         }
         self._db_ships_by_cls: dict[type, list[dict]] = {
             Barge: [], Yacht: [], Kayak: [], PaddleBoat: []}
-        # vessel_name → {direction_str: [message, ...]}
+        # vessel_name → {direction_str: [{'id': int, 'message': str}, ...]}
         # direction_str is 'downstream', 'upstream', or None (direction not set)
         self._db_radio: dict[str, dict] = {}
         self._captain_portraits: dict[str, pygame.Surface] = {}
+        # vessel_name → {'crew_id': int, 'filename': str} — for debug logging
+        self._captain_meta: dict[str, dict] = {}
         self._agent_ship_map: dict[int, dict] = {}   # id(ag) → ship record
         self._radio_triggered: set[int] = set()      # id(ag) already triggered (tie event)
-        self._radio_approach: set[int]  = set()      # id(ag) already triggered (gate approach)
+        self._radio_approach: set[int]  = set()      # id(ag) already triggered (lock entry)
+        self._radio_depart:   set[int]  = set()      # id(ag) already triggered (lines cleared)
         self._radio_bubbles: list[dict] = []         # active speech bubbles
 
         try:
@@ -211,14 +217,38 @@ class LockDamVisualizer:
 
             # Pre-load ship radio messages (ship→operator transmissions only).
             # Bucket by direction so a downstream boat gets downstream messages.
+            # Store full records {id, message} so debug logging can reference the DB row.
             for msg in _db.lock_radio_messages(sender_type='ship', limit=5000):
                 vn = msg.get('vessel_name') or msg.get('sender_name')
                 if vn:
                     dir_str = msg.get('direction') or None  # 'downstream'/'upstream'/None
-                    self._db_radio.setdefault(vn, {}).setdefault(dir_str, []).append(msg['message'])
+                    record = {'id': msg['id'], 'message': msg['message']}
+                    self._db_radio.setdefault(vn, {}).setdefault(dir_str, []).append(record)
 
             # Pre-load captain portraits
             self._captain_portraits = self._load_captain_portraits(_db)
+
+            # Cross-reference: log every vessel with radio messages that is missing
+            # a captain record or a captain portrait so gaps are easy to find.
+            vessels_with_radio = set(self._db_radio.keys())
+            vessels_with_portrait = set(self._captain_portraits.keys())
+            captain_vessels = {
+                c['vessel_name']
+                for c in _db.crew_list(role='captain')
+                if c.get('vessel_name')
+            }
+            no_captain = vessels_with_radio - captain_vessels
+            captain_no_portrait = (vessels_with_radio & captain_vessels) - vessels_with_portrait
+            if no_captain:
+                logger.debug("asset gap — vessels with radio messages but NO captain in crew table (%d): %s",
+                             len(no_captain), sorted(no_captain))
+            if captain_no_portrait:
+                logger.debug("asset gap — vessels with a captain but NO portrait loaded (%d): %s",
+                             len(captain_no_portrait), sorted(captain_no_portrait))
+            if not no_captain and not captain_no_portrait:
+                logger.debug("asset check OK — all %d radio vessels have a captain and portrait",
+                             len(vessels_with_radio))
+
             _db.close()
         except Exception:
             pass   # DB unavailable — game runs without it
@@ -1270,6 +1300,7 @@ class LockDamVisualizer:
                         else:
                             target_ag.tied_down = False
                             target_ag.tied_side = None
+                            self._trigger_radio_departure(target_ag)
                             op['target_boat'] = None # Task finished
         else:
             # No task: Return to idle position on top side (0) near upstream gate
@@ -1409,29 +1440,44 @@ class LockDamVisualizer:
         portraits = {}
         try:
             captains = db.crew_list(role='captain')
+            logger.debug("_load_captain_portraits: %d captains found", len(captains))
+            all_char_assets = db.art_assets(category='character')
             for cap in captains:
                 vessel = cap.get('vessel_name')
+                cid = cap['id']
                 if not vessel:
+                    logger.debug("  crew_id=%d (%s): no vessel_name, skipping",
+                                 cid, cap.get('name'))
                     continue
-                cid = str(cap['id'])
-                # Find portrait asset tagged with this crew id
                 tag_target = f"crew_id:{cid}"
                 matching = [
-                    a for a in db.art_assets(category='character')
+                    a for a in all_char_assets
                     if tag_target in [t.strip() for t in (a.get('tags') or '').split(',')]
                 ]
+                # Always record crew_id so debug logging works even without a portrait.
+                self._captain_meta[vessel] = {'crew_id': cid, 'filename': None}
+
                 if not matching:
+                    logger.debug("  crew_id=%d (%s) vessel=%r: no art_asset tagged %r",
+                                 cid, cap.get('name'), vessel, tag_target)
                     continue
-                filepath = os.path.join(portrait_dir, matching[0]['filename'])
+                filename = matching[0]['filename']
+                filepath = os.path.join(portrait_dir, filename)
                 if not os.path.exists(filepath):
+                    logger.debug("  crew_id=%d (%s) vessel=%r: asset %r registered but file missing at %r",
+                                 cid, cap.get('name'), vessel, filename, filepath)
                     continue
                 try:
                     surf = pygame.image.load(filepath).convert_alpha()
                     portraits[vessel] = surf
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                    self._captain_meta[vessel]['filename'] = filename
+                    logger.debug("  crew_id=%d (%s) vessel=%r: loaded portrait %r",
+                                 cid, cap.get('name'), vessel, filename)
+                except Exception as exc:
+                    logger.debug("  crew_id=%d (%s) vessel=%r: failed to load %r — %s",
+                                 cid, cap.get('name'), vessel, filename, exc)
+        except Exception as exc:
+            logger.debug("_load_captain_portraits: exception — %s", exc)
         return portraits
 
     @staticmethod
@@ -1441,34 +1487,98 @@ class LockDamVisualizer:
         return max(300, int((words / 3.5 + 1.5) * 60))
 
     # Keywords that identify a "currently entering the lock" transmission
-    _ENTRY_KEYWORDS = ('entering', 'proceeding to chamber', 'entering chamber')
+    _ENTRY_KEYWORDS  = ('entering', 'proceeding to chamber', 'entering chamber')
+    # Keywords that identify a "lines cleared / departing lock" transmission
+    _DEPART_KEYWORDS = ('departing', 'exiting', 'lockage complete', 'lines away', 'underway')
 
     def _trigger_radio_bubble(self, ag):
         """Fire a speech bubble for the captain of ag's vessel (if available)."""
         ship = self._agent_ship_map.get(id(ag))
         if not ship:
+            logger.debug("radio bubble: no ship record for agent %d (%s)",
+                         id(ag), ag.boat.name)
             return
         vessel_name = ship.get('name', '')
         buckets = self._db_radio.get(vessel_name)
         if not buckets:
+            logger.debug("radio bubble: no radio messages for vessel %r", vessel_name)
             return
         # Messages are written for the ship's canonical DB direction, not for the
         # direction it happens to be travelling this spawn.
         ship_dir = ship.get('direction')   # 'downstream' / 'upstream' / None
-        all_messages = buckets.get(ship_dir) or buckets.get(None) or []
-        if not all_messages:
+        all_records = buckets.get(ship_dir) or buckets.get(None) or []
+        if not all_records:
+            logger.debug("radio bubble: vessel=%r ship_dir=%r — no records in bucket",
+                         vessel_name, ship_dir)
             return
         # Prefer messages that are contextually about entering the lock.
-        entry_messages = [
-            m for m in all_messages
-            if any(k in m.lower() for k in self._ENTRY_KEYWORDS)
+        entry_records = [
+            r for r in all_records
+            if any(k in r['message'].lower() for k in self._ENTRY_KEYWORDS)
         ]
-        messages = entry_messages if entry_messages else all_messages
-        msg = random.choice(messages)
+        records = entry_records if entry_records else all_records
+        record = random.choice(records)
+
         portrait = self._captain_portraits.get(vessel_name)
-        ttl = self._reading_ttl(msg)
+        meta = self._captain_meta.get(vessel_name)
+        logger.debug(
+            "radio bubble: vessel=%r lock_radio.id=%d crew_id=%s portrait=%s  msg=%r",
+            vessel_name,
+            record['id'],
+            meta['crew_id'] if meta else 'none',
+            meta['filename'] if meta else 'none',
+            record['message'],
+        )
+
+        ttl = self._reading_ttl(record['message'])
         self._radio_bubbles.append({
-            'text':     msg,
+            'text':     record['message'],
+            'portrait': portrait,
+            'ttl':      ttl,
+            'max_ttl':  ttl,
+        })
+
+    def _trigger_radio_departure(self, ag):
+        """Fire a departure speech bubble when the operator clears mooring lines."""
+        if id(ag) in self._radio_depart:
+            return
+        self._radio_depart.add(id(ag))
+
+        ship = self._agent_ship_map.get(id(ag))
+        if not ship:
+            logger.debug("radio depart: no ship record for agent %d (%s)",
+                         id(ag), ag.boat.name)
+            return
+        vessel_name = ship.get('name', '')
+        buckets = self._db_radio.get(vessel_name)
+        if not buckets:
+            logger.debug("radio depart: no radio messages for vessel %r", vessel_name)
+            return
+        ship_dir    = ship.get('direction')
+        all_records = buckets.get(ship_dir) or buckets.get(None) or []
+        if not all_records:
+            return
+        depart_records = [
+            r for r in all_records
+            if any(k in r['message'].lower() for k in self._DEPART_KEYWORDS)
+        ]
+        records = depart_records if depart_records else all_records
+        record  = random.choice(records)
+
+        portrait = self._captain_portraits.get(vessel_name)
+        meta     = self._captain_meta.get(vessel_name)
+        logger.debug(
+            "radio depart: vessel=%r lock_radio.id=%d crew_id=%s portrait=%s  msg=%r",
+            vessel_name,
+            record['id'],
+            meta['crew_id'] if meta else 'none',
+            meta['filename'] if meta else 'none',
+            record['message'],
+        )
+
+        ttl = self._reading_ttl(record['message'])
+        self._radio_bubbles.append({
+            'text':     record['message'],
             'portrait': portrait,
             'ttl':      ttl,
             'max_ttl':  ttl,
@@ -1675,6 +1785,7 @@ class LockDamVisualizer:
             self._agent_ship_map.pop(aid, None)
             self._radio_triggered.discard(aid)
             self._radio_approach.discard(aid)
+            self._radio_depart.discard(aid)
         self.agents = [ag for ag in self.agents if ag.state != "done"]
 
     def _step_agent(self, ag, all_active):

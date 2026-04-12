@@ -5,6 +5,7 @@ import os
 import json
 import glob
 import argparse
+import logging
 
 from ld_sim import LockDamVisualizer
 from deckhand_sim import DeckHandSimulation
@@ -1038,7 +1039,22 @@ class GameEngine:
 
 
 if __name__ == "__main__":
+    import datetime
     ap = argparse.ArgumentParser()
     ap.add_argument('--dev', action='store_true', help='Enable developer mode')
     args = ap.parse_args()
+    if args.dev:
+        from assets import enable_debug_logging
+        enable_debug_logging()
+
+        # Mirror all DEBUG output to a timestamped log file in logs/
+        os.makedirs('logs', exist_ok=True)
+        stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_path = os.path.join('logs', f'dev_{stamp}.log')
+        fh = logging.FileHandler(log_path, encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter('%(asctime)s  %(name)s %(levelname)s  %(message)s'))
+        logging.getLogger().addHandler(fh)
+        print(f"[dev] logging to {log_path}")
+
     GameEngine(dev_mode=args.dev).run()

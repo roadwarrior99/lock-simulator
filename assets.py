@@ -17,7 +17,24 @@ try:
     sqlite3.connect(":memory:").close()  # verify _sqlite3 extension is available
 except Exception:
     import pysqlite3 as sqlite3  # type: ignore[no-redef]
+import logging
 import os
+
+logger = logging.getLogger(__name__)
+
+
+def enable_debug_logging():
+    """
+    Convenience helper — call once to send all assets.py DEBUG output to stdout.
+
+        from assets import enable_debug_logging
+        enable_debug_logging()
+
+    Or from the shell:
+        PYTHONPATH=. python -c "from assets import enable_debug_logging, GameDatabase; enable_debug_logging(); db=GameDatabase(); db.ships()"
+    """
+    logging.basicConfig(format='%(name)s %(levelname)s  %(message)s', level=logging.DEBUG)
+    logger.setLevel(logging.DEBUG)
 
 DB_PATH = os.path.join('assets', 'assets.db')
 
@@ -119,13 +136,18 @@ class GameDatabase:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _rows(self, sql: str, params: tuple = ()) -> list[dict]:
+        logger.debug("SELECT  sql=%r  params=%r", sql.strip(), params)
         cur = self._conn.execute(sql, params)
-        return [dict(r) for r in cur.fetchall()]
+        rows = [dict(r) for r in cur.fetchall()]
+        logger.debug("        → %d row(s)", len(rows))
+        return rows
 
     def _run(self, sql: str, params: tuple = ()) -> int:
         """Execute a write statement and return the new row id."""
+        logger.debug("WRITE   sql=%r  params=%r", sql.strip(), params)
         cur = self._conn.execute(sql, params)
         self._conn.commit()
+        logger.debug("        → rowid=%d", cur.lastrowid)
         return cur.lastrowid
 
     # ── Crew ──────────────────────────────────────────────────────────────────
@@ -148,7 +170,9 @@ class GameDatabase:
 
     def get_crew(self, crew_id: int) -> dict | None:
         rows = self._rows("SELECT * FROM crew WHERE id = ?", (crew_id,))
-        return rows[0] if rows else None
+        result = rows[0] if rows else None
+        logger.debug("get_crew id=%d → %s", crew_id, result.get('name') if result else 'not found')
+        return result
 
     def crew_list(self, *, role: str = None, vessel_name: str = None) -> list[dict]:
         clauses, params = [], []
@@ -157,7 +181,10 @@ class GameDatabase:
         if vessel_name:
             clauses.append("vessel_name = ?");  params.append(vessel_name)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        return self._rows(f"SELECT * FROM crew {where} ORDER BY name", tuple(params))
+        rows = self._rows(f"SELECT * FROM crew {where} ORDER BY name", tuple(params))
+        logger.debug("crew_list role=%r vessel_name=%r → %d crew: %s",
+                     role, vessel_name, len(rows), [r['name'] for r in rows])
+        return rows
 
     def update_crew(self, crew_id: int, **fields):
         """Update any subset of crew fields by keyword argument."""
@@ -204,7 +231,7 @@ class GameDatabase:
         if role:
             clauses.append("cm.role = ?");     params.append(role)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        return self._rows(
+        rows = self._rows(
             f"""SELECT cm.*, c.name AS sender, c.vessel_name
                 FROM crew_messages cm
                 LEFT JOIN crew c ON c.id = cm.crew_id
@@ -212,6 +239,9 @@ class GameDatabase:
                 ORDER BY cm.id DESC LIMIT ?""",
             (*params, limit),
         )
+        logger.debug("crew_messages crew_id=%r stage_id=%r role=%r → %d messages",
+                     crew_id, stage_id, role, len(rows))
+        return rows
 
     # ── Ships ─────────────────────────────────────────────────────────────────
 
@@ -245,10 +275,14 @@ class GameDatabase:
         if direction:
             clauses.append("direction = ?");   params.append(direction)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        return self._rows(
+        rows = self._rows(
             f"SELECT * FROM ships {where} ORDER BY id DESC LIMIT ?",
             (*params, limit),
         )
+        logger.debug("ships vessel_type=%r direction=%r → %d ships: %s",
+                     vessel_type, direction, len(rows),
+                     [(r['name'], r['vessel_type'], r['direction']) for r in rows])
+        return rows
 
     def ship_count(self, vessel_type: str = None) -> int:
         if vessel_type:
@@ -306,10 +340,14 @@ class GameDatabase:
         if tag:
             clauses.append("tags LIKE ?");     params.append(f'%{tag}%')
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        return self._rows(
+        rows = self._rows(
             f"SELECT * FROM art_assets {where} ORDER BY category, filename",
             tuple(params),
         )
+        logger.debug("art_assets category=%r campaign_id=%r tag=%r → %d assets: %s",
+                     category, campaign_id, tag, len(rows),
+                     [r['filename'] for r in rows])
+        return rows
 
     def remove_asset(self, filename: str):
         self._run("DELETE FROM art_assets WHERE filename = ?", (filename,))
@@ -363,10 +401,17 @@ class GameDatabase:
         if vessel_name:
             clauses.append("vessel_name = ?"); params.append(vessel_name)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        return self._rows(
+        rows = self._rows(
             f"SELECT * FROM lock_radio {where} ORDER BY id ASC LIMIT ?",
             (*params, limit),
         )
+        logger.debug("lock_radio_messages sender_type=%r thread_id=%r vessel_name=%r → %d messages",
+                     sender_type, thread_id, vessel_name, len(rows))
+        for r in rows:
+            logger.debug("  [thread=%d dir=%-10s %s] %s: %s",
+                         r['thread_id'], r.get('direction') or '?',
+                         r['sender_type'], r['sender_name'], r['message'])
+        return rows
 
     # ── Counts / summary ──────────────────────────────────────────────────────
 
