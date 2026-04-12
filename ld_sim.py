@@ -1785,7 +1785,10 @@ class LockDamVisualizer:
             if available:
                 db_ship = random.choice(available)
             else:
-                db_ship = random.choice(pool)
+                # Every named ship is already on screen — last resort: pick from
+                # the full pool but still exclude active names so we never duplicate.
+                fallback = [s for s in pool if s['name'] not in active_names]
+                db_ship = random.choice(fallback) if fallback else None
 
         name = db_ship['name'] if db_ship else f"{cls.__name__[0]}{self._boat_counter}"
         boat = cls(name)
