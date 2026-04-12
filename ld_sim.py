@@ -596,18 +596,20 @@ class LockDamVisualizer:
         leaf_h    = gate_h // 2                          # one leaf arm length
         dn_shift  = (leaf_h * 3) // 4                    # shift downstream gate upward
         dn_top    = dn_y - dn_shift + 5                  # +5 px down
-        dn_floor  = dn_top + gate_h
-        self._draw_miter_gate(inner_x   - 10, up_y,   self._water_bot_y,
-                              self._gate_anim_up, faces_right=True)
-        self._draw_miter_gate(dn_gate_x + 10, dn_top, dn_floor,
-                              self._gate_anim_dn, faces_right=False, top_face_scale=2.0)
+        dn_floor  = dn_top + gate_h + 10                 # +10 px so lower leaf meets shore
 
-        # Trees
+        # Trees (drawn before gates so gates appear in front)
         for tree in self.trees:
             sx = self._sx(tree['x'])
             if tree['type'] == 'up': sy = up_y - 38
             else: sy = dn_y - 38
             self._draw_tree(sx, sy)
+
+        self._draw_miter_gate(inner_x   - 10, up_y,   self._water_bot_y,
+                              self._gate_anim_up, faces_right=True)
+        self._draw_miter_gate(dn_gate_x + 10, dn_top, dn_floor,
+                              self._gate_anim_dn, faces_right=False,
+                              top_face_scale=2.0, top_shrink=100)
 
         # Boats
         for ag in self.agents:
@@ -958,7 +960,7 @@ class LockDamVisualizer:
         inst = self.fnt_sm.render("Press V to return to Shore View", True, (200, 200, 200))
         self.screen.blit(inst, (self.width // 2 - inst.get_width() // 2, 60))
 
-    def _draw_miter_gate(self, gate_x, wall_top, floor_y, progress, faces_right, top_face_scale=1.0):
+    def _draw_miter_gate(self, gate_x, wall_top, floor_y, progress, faces_right, top_face_scale=1.0, top_shrink=0):
         """Draw a miter gate pair animated by progress (0.0=closed, 1.0=open).
 
         Two leaves pivot on point hinges at opposite wall corners:
@@ -1000,14 +1002,19 @@ class LockDamVisualizer:
         # Leaf direction = (x_sign·sin_a, cos_a). Perpendicular = (cos_a, −x_sign·sin_a).
         # Face grows visible as the leaf rotates outward (edge-on→face-on).
         up_half = max(half, int(sin_a * L_u * 0.35 * top_face_scale))
-        up_px = int(cos_a          * up_half)
-        up_py = int(-x_sign * sin_a * up_half)
+        # top_shrink clips the "outward" edge (corners 0 & 3) so the leaf doesn't
+        # extend too far in the sky; the "inward" edge (corners 1 & 2) is unchanged.
+        shrunk  = max(half, up_half - int(sin_a * top_shrink))
+        up_px_a = int(cos_a          * shrunk)    # outward corners
+        up_py_a = int(-x_sign * sin_a * shrunk)
+        up_px_b = int(cos_a          * up_half)   # inward corners
+        up_py_b = int(-x_sign * sin_a * up_half)
 
         pts_u = [
-            (gate_x + up_px, wall_top + up_py),   # hinge end
-            (gate_x - up_px, wall_top - up_py),   # hinge end
-            (uf_x   - up_px, uf_y    - up_py),    # free end
-            (uf_x   + up_px, uf_y    + up_py),    # free end
+            (gate_x + up_px_a, wall_top + up_py_a),   # hinge end, outward
+            (gate_x - up_px_b, wall_top - up_py_b),   # hinge end, inward
+            (uf_x   - up_px_b, uf_y    - up_py_b),    # free end,  inward
+            (uf_x   + up_px_a, uf_y    + up_py_a),    # free end,  outward
         ]
 
         # ── Lower leaf ─────────────────────────────────────────────────────────
