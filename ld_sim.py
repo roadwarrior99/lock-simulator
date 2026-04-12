@@ -597,9 +597,9 @@ class LockDamVisualizer:
         dn_shift  = (leaf_h * 3) // 4                    # shift downstream gate upward
         dn_top    = dn_y - dn_shift + 5                  # +5 px down
         dn_floor  = dn_top + gate_h
-        self._draw_miter_gate(inner_x,   up_y,   self._water_bot_y,
+        self._draw_miter_gate(inner_x   - 10, up_y,   self._water_bot_y,
                               self._gate_anim_up, faces_right=True)
-        self._draw_miter_gate(dn_gate_x, dn_top, dn_floor,
+        self._draw_miter_gate(dn_gate_x + 10, dn_top, dn_floor,
                               self._gate_anim_dn, faces_right=False, top_face_scale=2.0)
 
         # Trees
@@ -983,7 +983,7 @@ class LockDamVisualizer:
         mid_y = (wall_top + floor_y) // 2
         L_u   = mid_y - wall_top   # upper leaf arm length (px)
         L_l   = floor_y - mid_y   # lower leaf arm length (px)
-        lw    = 9                  # leaf thickness (px) — the physical gate depth
+        lw    = 15                 # leaf thickness (px) — the physical gate depth
         half  = lw // 2
 
         # Direction the leaves sweep into when opening
