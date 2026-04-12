@@ -210,6 +210,8 @@ class LockDamVisualizer:
         self._radio_bubbles: list[dict] = []         # active speech bubbles
         self._roster_buttons: list      = []         # [(pygame.Rect, Agent), ...] refreshed each frame
         self._op_screen_pos: tuple      = (600, 390) # updated each frame in draw_shore_view
+        self._gate_anim_up: float       = 0.0        # 0.0=closed → 1.0=open
+        self._gate_anim_dn: float       = 0.0
         self._db_operator_radio: dict[str, list[dict]] = {}  # vessel_name → [{id, message}]
         self._radio_popup: dict | None  = None       # active radio popup state
 
@@ -515,83 +517,90 @@ class LockDamVisualizer:
 
         self._draw_sky(min(up_y, dn_y) - 40)
 
+        # Gate faces in screen x — water extends all the way to the gate face so
+        # no grey concrete gap is visible between the channel water and the gate.
+        mult    = self._get_ambient_mult()
+        inner_x = lk_sx + wall_t
+        inner_w = lk_w - 2 * wall_t
+
         # Ground strip (full width below water_bot_y — covers both channel floors)
         self._draw_ground_strip(lk_sx, lk_ex)
 
-        # Upstream channel
-        mult = self._get_ambient_mult()
+        # Upstream channel — water reaches the upstream gate face (inner_x)
         shimmer_col = self._dim(self.WATER_SHIMMER, mult)
-        self._draw_water_band(0, up_y, lk_sx)
-        self._lane_divider(0, lk_sx, up_y)
-        self._draw_bank_strip(0, up_y, lk_sx)
+        self._draw_water_band(0, up_y, inner_x)
+        self._lane_divider(0, inner_x, up_y)
+        self._draw_bank_strip(0, up_y, inner_x)
         t = self.time * 1.8
-        for wx in range(0, lk_sx - 10, 35):
+        for wx in range(0, inner_x - 10, 35):
             oy = int(3 * math.sin(t + wx * 0.06))
             pygame.draw.line(self.screen, shimmer_col,
                              (wx + 5, up_y + oy), (wx + 25, up_y + oy), 1)
 
-        # Downstream channel
-        self._draw_water_band(lk_ex, dn_y, self.width - lk_ex)
-        self._lane_divider(lk_ex, self.width - lk_ex, dn_y)
-        self._draw_bank_strip(lk_ex, dn_y, self.width - lk_ex)
-        for wx in range(lk_ex + 5, self.width - 10, 35):
+        # Downstream channel — water starts at the downstream gate face
+        dn_gate_x = inner_x + inner_w   # = lk_ex - wall_t
+        self._draw_water_band(dn_gate_x, dn_y, self.width - dn_gate_x)
+        self._lane_divider(dn_gate_x, self.width - dn_gate_x, dn_y)
+        self._draw_bank_strip(dn_gate_x, dn_y, self.width - dn_gate_x)
+        for wx in range(dn_gate_x + 5, self.width - 10, 35):
             oy = int(2 * math.sin(t + wx * 0.06))
             pygame.draw.line(self.screen, shimmer_col,
                              (wx, dn_y + oy), (wx + 20, dn_y + oy), 1)
 
         # Lock chamber — water fill
-        mult = self._get_ambient_mult()
-        inner_x = lk_sx + wall_t
-        inner_w = lk_w - 2 * wall_t
         self._gradient_rect(self._dim(self.LOCK_WATER_TOP, mult), self._dim(self.WATER_BOT, mult),
                             (inner_x, lk_y, inner_w, self._water_bot_y - lk_y))
         pygame.draw.line(self.screen, self._dim(self.WATER_SHIMMER, mult),
                          (inner_x, lk_y), (inner_x + inner_w, lk_y), 2)
         self._lane_divider(inner_x, inner_w, lk_y)
-        
+
         # Turbulent water effects when filling or draining
         if self.lock_dam.is_filling or self.lock_dam.is_draining:
-            t = self.time * 2
+            t2 = self.time * 2
             bubble_col = self._interp_col((220, 245, 255), (50, 60, 80), 1.0 - mult)
             streak_col = self._interp_col((240, 250, 255), (70, 80, 100), 1.0 - mult)
             for i in range(20):
-                # Deterministic positions with oscillation
-                rx = (math.sin(i * 1.5 + t) * 0.5 + 0.5) * inner_w
-                ry = (math.cos(i * 2.3 + t * 0.7) * 0.5 + 0.5) * 35
+                rx = (math.sin(i * 1.5 + t2) * 0.5 + 0.5) * inner_w
+                ry = (math.cos(i * 2.3 + t2 * 0.7) * 0.5 + 0.5) * 35
                 bx = inner_x + int(rx)
                 by = lk_y + int(ry)
                 if by < self._water_bot_y:
-                    size = 1 + int(2 * (math.sin(t * 2 + i) * 0.5 + 0.5))
+                    size = 1 + int(2 * (math.sin(t2 * 2 + i) * 0.5 + 0.5))
                     pygame.draw.circle(self.screen, bubble_col, (bx, by), size)
-                # Extra white surface streaks
-                sx = inner_x + ( (i * 17 + t * 40) % inner_w )
-                sw = 10 + 5 * math.sin(i + t)
+                sx2 = inner_x + int((i * 17 + t2 * 40) % inner_w)
+                sw  = 10 + 5 * math.sin(i + t2)
                 if lk_y < self._water_bot_y:
-                    pygame.draw.line(self.screen, streak_col, (sx, lk_y + 1), (sx + sw, lk_y + 1), 2)
+                    pygame.draw.line(self.screen, streak_col,
+                                     (sx2, lk_y + 1), (int(sx2 + sw), lk_y + 1), 2)
 
-        # Concrete cap and walls
-        conc_col = self._dim(self.CONCRETE, mult)
+        # Concrete headwall — top cap only (no side piers below waterline;
+        # the channel water now fills flush to the gate faces).
+        conc_col  = self._dim(self.CONCRETE, mult)
         conc_dark = self._dim(self.CONCRETE_DARK, mult)
         pygame.draw.rect(self.screen, conc_col,
                          (lk_sx, wall_top, lk_w, lk_y - wall_top))
         for cy in range(wall_top + 10, lk_y, 14):
             pygame.draw.line(self.screen, conc_dark,
                              (lk_sx, cy), (lk_sx + lk_w, cy), 1)
-        pygame.draw.rect(self.screen, conc_col,
-                         (lk_sx, wall_top, wall_t, self._water_bot_y - wall_top))
-        pygame.draw.rect(self.screen, conc_col,
-                         (lk_ex - wall_t, wall_top, wall_t, self._water_bot_y - wall_top))
-        # Bottom concrete wall cap
+        # Bottom chamber floor cap
         pygame.draw.rect(self.screen, conc_col,
                          (lk_sx, self._water_bot_y, lk_w, 20))
         pygame.draw.rect(self.screen, conc_dark,
                          (inner_x, self._water_bot_y, inner_w, 10))
 
-        # Gates
-        self._draw_miter_gate(lk_sx + wall_t, wall_top, self._water_bot_y,
-                              self.lock_dam.upstream_gates_open, faces_right=True)
-        self._draw_miter_gate(lk_ex - wall_t, wall_top, self._water_bot_y,
-                              self.lock_dam.downstream_gates_open, faces_right=False)
+        # Both gates must handle the full upstream head.
+        # Upstream gate: top at up_y, bottom at floor sill.
+        # Downstream gate: same total height, but its leaves sit 3/4 leaf-height higher
+        # so they land in the water column rather than in the ground.
+        gate_h    = self._water_bot_y - up_y             # total gate height (px)
+        leaf_h    = gate_h // 2                          # one leaf arm length
+        dn_shift  = (leaf_h * 3) // 4                    # shift downstream gate upward
+        dn_top    = dn_y - dn_shift + 5                  # +5 px down
+        dn_floor  = dn_top + gate_h
+        self._draw_miter_gate(inner_x,   up_y,   self._water_bot_y,
+                              self._gate_anim_up, faces_right=True)
+        self._draw_miter_gate(dn_gate_x, dn_top, dn_floor,
+                              self._gate_anim_dn, faces_right=False, top_face_scale=2.0)
 
         # Trees
         for tree in self.trees:
@@ -949,29 +958,97 @@ class LockDamVisualizer:
         inst = self.fnt_sm.render("Press V to return to Shore View", True, (200, 200, 200))
         self.screen.blit(inst, (self.width // 2 - inst.get_width() // 2, 60))
 
-    def _draw_miter_gate(self, gate_x, wall_top, floor_y, is_open, faces_right):
-        mult = self._get_ambient_mult()
-        mid_y  = (wall_top + floor_y) // 2
-        color  = self.GREEN if is_open else self.RED
-        color  = self._dim(color, mult)
-        shadow = (max(0, color[0] - 60), max(0, color[1] - 60), max(0, color[2] - 60))
-        leaf_w = 12
-        if is_open:
-            offset = 20 if faces_right else -20
-            pts_u = [(gate_x, wall_top), (gate_x + offset, wall_top + 8),
-                     (gate_x + offset, mid_y - 4), (gate_x, mid_y)]
-            pts_l = [(gate_x, mid_y), (gate_x + offset, mid_y + 4),
-                     (gate_x + offset, floor_y - 8), (gate_x, floor_y)]
-        else:
-            apex_off = 10 if faces_right else -10
-            ax = gate_x + apex_off
-            pts_u = [(gate_x, wall_top), (gate_x + leaf_w // 2, wall_top),
-                     (ax + leaf_w // 2, mid_y), (ax, mid_y)]
-            pts_l = [(ax, mid_y), (ax + leaf_w // 2, mid_y),
-                     (gate_x + leaf_w // 2, floor_y), (gate_x, floor_y)]
+    def _draw_miter_gate(self, gate_x, wall_top, floor_y, progress, faces_right, top_face_scale=1.0):
+        """Draw a miter gate pair animated by progress (0.0=closed, 1.0=open).
+
+        Two leaves pivot on point hinges at opposite wall corners:
+          - Upper leaf: hinge at (gate_x, wall_top); free end arcs into the outer channel.
+          - Lower leaf: hinge at (gate_x, floor_y);  free end arcs into the outer channel.
+
+        Upstream gate (faces_right=True):  leaves fold LEFT into the upstream channel.
+        Downstream gate (faces_right=False): leaves fold RIGHT into the downstream channel.
+        """
+        mult      = self._get_ambient_mult()
+        base      = (int(72 + 14 * progress), int(82 + 16 * progress), int(95 + 17 * progress))
+        color     = self._dim(base, mult)
+        edge      = self._dim((40, 46, 54), mult)
+        rib       = self._dim((56, 64, 76), mult)
+        hi        = self._dim((95, 108, 124), mult)
+        hinge_col = self._dim((30, 34, 40), mult)
+
+        angle = progress * math.pi / 2
+        sin_a = math.sin(angle)
+        cos_a = math.cos(angle)
+
+        mid_y = (wall_top + floor_y) // 2
+        L_u   = mid_y - wall_top   # upper leaf arm length (px)
+        L_l   = floor_y - mid_y   # lower leaf arm length (px)
+        lw    = 9                  # leaf thickness (px) — the physical gate depth
+        half  = lw // 2
+
+        # Direction the leaves sweep into when opening
+        x_sign = -1 if faces_right else 1   # −1 = left/upstream, +1 = right/downstream
+
+        # ── Upper leaf ─────────────────────────────────────────────────────────
+        # Hinge at (gate_x, wall_top) — top of the gate opening (= water surface).
+        # Closed: arm hangs down to mid_y.
+        # Opening: arm sweeps x_sign direction; free end arcs from mid_y back up to wall_top.
+        # When fully open the leaf lies flat at wall_top (water-surface) level.
+        uf_x = int(gate_x + x_sign * L_u * sin_a)
+        uf_y = int(wall_top + L_u * cos_a)   # = mid_y when closed, wall_top when open
+
+        # Leaf direction = (x_sign·sin_a, cos_a). Perpendicular = (cos_a, −x_sign·sin_a).
+        # Face grows visible as the leaf rotates outward (edge-on→face-on).
+        up_half = max(half, int(sin_a * L_u * 0.35 * top_face_scale))
+        up_px = int(cos_a          * up_half)
+        up_py = int(-x_sign * sin_a * up_half)
+
+        pts_u = [
+            (gate_x + up_px, wall_top + up_py),   # hinge end
+            (gate_x - up_px, wall_top - up_py),   # hinge end
+            (uf_x   - up_px, uf_y    - up_py),    # free end
+            (uf_x   + up_px, uf_y    + up_py),    # free end
+        ]
+
+        # ── Lower leaf ─────────────────────────────────────────────────────────
+        # Hinge at (gate_x, floor_y). Closed: points straight up to mid_y.
+        # Opening: free end arcs x_sign direction (DOWN and out into the channel).
+        lf_x = int(gate_x + x_sign * L_l * sin_a)
+        lf_y = int(floor_y - L_l * cos_a)
+
+        # Perpendicular to leaf direction (x_sign·sin_a, −cos_a) → (cos_a, x_sign·sin_a)
+        lo_px = int(cos_a   * half)
+        lo_py = int(x_sign  * sin_a * half)
+
+        pts_l = [
+            (gate_x + lo_px, floor_y + lo_py),
+            (gate_x - lo_px, floor_y - lo_py),
+            (lf_x   - lo_px, lf_y    - lo_py),
+            (lf_x   + lo_px, lf_y    + lo_py),
+        ]
+
         for pts in (pts_u, pts_l):
             pygame.draw.polygon(self.screen, color, pts)
-            pygame.draw.polygon(self.screen, shadow, pts, 2)
+            pygame.draw.polygon(self.screen, edge,  pts, 1)
+            # Cross-brace ribs on the panel face (visible when mostly closed)
+            if progress < 0.82:
+                pygame.draw.line(self.screen, rib, pts[0], pts[2], 1)
+                pygame.draw.line(self.screen, rib, pts[1], pts[3], 1)
+
+        # Hinge pin circles — upper leaf pivots at wall_top, lower at floor_y
+        for py in (wall_top + 4, wall_top + 14):
+            pygame.draw.circle(self.screen, hinge_col, (gate_x, py), 3)
+            pygame.draw.circle(self.screen, hi,         (gate_x, py), 3, 1)
+        for py in (floor_y - 14, floor_y - 4):
+            pygame.draw.circle(self.screen, hinge_col, (gate_x, py), 3)
+            pygame.draw.circle(self.screen, hi,         (gate_x, py), 3, 1)
+
+        # Status light
+        lx_light = gate_x - 5 if faces_right else gate_x + 5
+        pygame.draw.circle(self.screen,
+                           self._dim(self.GREEN if progress > 0.5 else self.RED, mult),
+                           (lx_light, wall_top + 8), 3)
+        pygame.draw.circle(self.screen, edge, (lx_light, wall_top + 8), 3, 1)
 
     def _draw_boat_shore(self, ag, up_y, dn_y, lk_y, lk_sx, lk_ex):
         boat  = ag.boat
@@ -1284,7 +1361,13 @@ class LockDamVisualizer:
 
         # Advance wall-crossing animation; block other logic until complete.
         if op['state'] == 'crossing':
-            op['cross_progress'] = min(1.0, op['cross_progress'] + 0.04)
+            # Match the same pixel-per-frame rate used for horizontal walking
+            # (1.2 sim-units/frame × screen scale) relative to the gate height.
+            walk_px_per_frame = 1.2 * self._sx_scale
+            top_y_px    = self._wy(self.lock_dam.upstream_level) - 35 - 5
+            bottom_y_px = self._water_bot_y + 10
+            cross_dist  = max(1, abs(bottom_y_px - top_y_px))
+            op['cross_progress'] = min(1.0, op['cross_progress'] + walk_px_per_frame / cross_dist)
             if op['cross_progress'] >= 1.0:
                 op['side']           = op['target_side']
                 op['cross_progress'] = 0.0
@@ -1432,6 +1515,22 @@ class LockDamVisualizer:
             # Gradually retract rope if visible
             if op['rope_progress'] > 0:
                 op['rope_progress'] = max(0.0, op['rope_progress'] - 0.05)
+
+    # ── Gate animation ────────────────────────────────────────────────────────
+
+    def _update_gate_anims(self):
+        """Advance gate open/close animation by one frame toward their target state."""
+        speed = 0.025  # ~40 frames = 0.67 s to fully open or close
+        target_up = 1.0 if self.lock_dam.upstream_gates_open   else 0.0
+        target_dn = 1.0 if self.lock_dam.downstream_gates_open else 0.0
+        if self._gate_anim_up < target_up:
+            self._gate_anim_up = min(target_up, self._gate_anim_up + speed)
+        elif self._gate_anim_up > target_up:
+            self._gate_anim_up = max(target_up, self._gate_anim_up - speed)
+        if self._gate_anim_dn < target_dn:
+            self._gate_anim_dn = min(target_dn, self._gate_anim_dn + speed)
+        elif self._gate_anim_dn > target_dn:
+            self._gate_anim_dn = max(target_dn, self._gate_anim_dn - speed)
 
     # ── Agent simulation ──────────────────────────────────────────────────────
 
@@ -2538,6 +2637,8 @@ class LockDamVisualizer:
                 'downstream_gates_open': self.lock_dam.downstream_gates_open,
                 'is_filling':            self.lock_dam.is_filling,
                 'is_draining':           self.lock_dam.is_draining,
+                'gate_anim_up':          self._gate_anim_up,
+                'gate_anim_dn':          self._gate_anim_dn,
             },
             'agents': [
                 {
@@ -2605,6 +2706,8 @@ class LockDamVisualizer:
         self.lock_dam.downstream_gates_open  = lk['downstream_gates_open']
         self.lock_dam.is_filling             = lk['is_filling']
         self.lock_dam.is_draining            = lk['is_draining']
+        self._gate_anim_up = lk.get('gate_anim_up', 1.0 if lk['upstream_gates_open']   else 0.0)
+        self._gate_anim_dn = lk.get('gate_anim_dn', 1.0 if lk['downstream_gates_open'] else 0.0)
 
         self.agents = []
         for ad in state['agents']:
@@ -2708,6 +2811,7 @@ class LockDamVisualizer:
                     self._update_weather(dt)
                     self._update_nature(dt)
                     self._update_operator(dt)
+                    self._update_gate_anims()
                     self._spawn_if_needed()
                     self._update_agents()
 
