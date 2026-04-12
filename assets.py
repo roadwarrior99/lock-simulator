@@ -12,7 +12,11 @@ lock_radio    : VHF radio traffic between vessels and the lock operator
 No pygame dependency; safe to import anywhere.
 """
 
-import sqlite3
+try:
+    import sqlite3
+    sqlite3.connect(":memory:").close()  # verify _sqlite3 extension is available
+except Exception:
+    import pysqlite3 as sqlite3  # type: ignore[no-redef]
 import os
 
 DB_PATH = os.path.join('assets', 'assets.db')
