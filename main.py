@@ -220,15 +220,6 @@ class GameEngine:
         self.debt            = 10000.0   # global debt shared across all stages
         self._save_notif     = 0.0   # countdown for "Saved" banner
         os.makedirs(self.SAVE_DIR, exist_ok=True)
-        # Auto-load campaign save if one exists
-        if os.path.exists(self.CAMPAIGN_SAVE):
-            try:
-                saved = load_campaign(self.CAMPAIGN_SAVE)
-                self.active_stage_id = saved['active_stage_id']
-                self.progressions    = saved['progressions']
-                self.debt            = saved['debt']
-            except Exception:
-                pass   # corrupt save — silently start fresh
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

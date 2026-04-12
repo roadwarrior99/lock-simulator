@@ -186,7 +186,8 @@ class LockDamVisualizer:
         self._db_radio: dict[str, list[str]] = {}   # vessel_name → [message, ...]
         self._captain_portraits: dict[str, pygame.Surface] = {}
         self._agent_ship_map: dict[int, dict] = {}   # id(ag) → ship record
-        self._radio_triggered: set[int] = set()      # id(ag) already triggered
+        self._radio_triggered: set[int] = set()      # id(ag) already triggered (tie event)
+        self._radio_approach: set[int]  = set()      # id(ag) already triggered (gate approach)
         self._radio_bubbles: list[dict] = []         # active speech bubbles
 
         try:
@@ -1248,9 +1249,6 @@ class LockDamVisualizer:
                             target_ag.tied_down = True
                             target_ag.tied_side = op['side']
                             op['target_boat'] = None # Task finished
-                            if id(target_ag) not in self._radio_triggered:
-                                self._radio_triggered.add(id(target_ag))
-                                self._trigger_radio_bubble(target_ag)
                     elif op['task'] == 'untie':
                         op['state'] = 'untying'
                         if op['rope_progress'] > 0.0:
@@ -1603,6 +1601,22 @@ class LockDamVisualizer:
         for ag in active:
             ag.is_moving = abs(ag.boat.position - old_pos.get(id(ag), ag.boat.position)) > 0.001
 
+        # Radio: fire when a boat first stops at the entry gate (waiting to enter)
+        gate_gap = 12
+        for ag in active:
+            if ag.is_moving or id(ag) in self._radio_approach:
+                continue
+            b = ag.boat
+            if ag.direction == 1:
+                # Downstream boat stopped just before upstream (entry) gate
+                at_gate = abs((b.position + b.length) - (self.lock_start - gate_gap)) < 8
+            else:
+                # Upstream boat stopped just after downstream (entry) gate
+                at_gate = abs(b.position - (self.lock_end + gate_gap)) < 8
+            if at_gate:
+                self._radio_approach.add(id(ag))
+                self._trigger_radio_bubble(ag)
+
         # Crash detection: same-direction boats share a lane and can collide.
         # Opposite-direction boats are always in separate lanes — no collision.
         for i in range(len(active)):
@@ -1625,6 +1639,7 @@ class LockDamVisualizer:
         for aid in done_ids:
             self._agent_ship_map.pop(aid, None)
             self._radio_triggered.discard(aid)
+            self._radio_approach.discard(aid)
         self.agents = [ag for ag in self.agents if ag.state != "done"]
 
     def _step_agent(self, ag, all_active):

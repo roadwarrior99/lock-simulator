@@ -15,7 +15,7 @@ No pygame dependency; safe to import anywhere.
 import sqlite3
 import os
 
-DB_PATH = os.path.join('saves', 'assets.db')
+DB_PATH = os.path.join('assets', 'assets.db')
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS crew (
