@@ -34,7 +34,7 @@ class LockDamVisualizer:
     HOURLY_WAGE     = 7.25  # $/hour
     BOAT_BONUS      = 15.0 # $ per boat passed; An incentive to keep it moving.
 
-    def __init__(self, shift_duration=None, shift_start_time=8.0, cfg_time_scale=5.0, dev_mode=False):
+    def __init__(self, shift_duration=None, shift_start_time=8.0, cfg_time_scale=5.0, dev_mode=False, ship_log=None):
         pygame.init()
         self.width  = 1200
         self.height = 800
@@ -50,6 +50,16 @@ class LockDamVisualizer:
         self._cfg_shift_start_time = shift_start_time
         self.dev_mode = dev_mode
         self._cfg_time_scale       = cfg_time_scale
+
+        # Ship sighting log — persisted in campaign, passed in from main.py.
+        # Structure: {'week': int, 'ships': {name: {'last_dir': +1 or -1}}}
+        # A ship cannot travel the same direction twice in the same week unless
+        # it has been seen returning in the opposite direction first.
+        if ship_log is None:
+            self.ship_log = {'week': 0, 'ships': {}}
+        else:
+            import copy
+            self.ship_log = copy.deepcopy(ship_log)
 
         # Shift tracking
         self.shift_hours_elapsed = 0.0
@@ -183,7 +193,9 @@ class LockDamVisualizer:
         }
         self._db_ships_by_cls: dict[type, list[dict]] = {
             Barge: [], Yacht: [], Kayak: [], PaddleBoat: []}
-        self._db_radio: dict[str, list[str]] = {}   # vessel_name → [message, ...]
+        # vessel_name → {direction_str: [message, ...]}
+        # direction_str is 'downstream', 'upstream', or None (direction not set)
+        self._db_radio: dict[str, dict] = {}
         self._captain_portraits: dict[str, pygame.Surface] = {}
         self._agent_ship_map: dict[int, dict] = {}   # id(ag) → ship record
         self._radio_triggered: set[int] = set()      # id(ag) already triggered (tie event)
@@ -197,11 +209,13 @@ class LockDamVisualizer:
                 if cls and s.get('name'):
                     self._db_ships_by_cls[cls].append(s)
 
-            # Pre-load ship radio messages (ship→operator transmissions only)
+            # Pre-load ship radio messages (ship→operator transmissions only).
+            # Bucket by direction so a downstream boat gets downstream messages.
             for msg in _db.lock_radio_messages(sender_type='ship', limit=5000):
                 vn = msg.get('vessel_name') or msg.get('sender_name')
                 if vn:
-                    self._db_radio.setdefault(vn, []).append(msg['message'])
+                    dir_str = msg.get('direction') or None  # 'downstream'/'upstream'/None
+                    self._db_radio.setdefault(vn, {}).setdefault(dir_str, []).append(msg['message'])
 
             # Pre-load captain portraits
             self._captain_portraits = self._load_captain_portraits(_db)
@@ -1426,15 +1440,30 @@ class LockDamVisualizer:
         words = len(text.split())
         return max(300, int((words / 3.5 + 1.5) * 60))
 
+    # Keywords that identify a "currently entering the lock" transmission
+    _ENTRY_KEYWORDS = ('entering', 'proceeding to chamber', 'entering chamber')
+
     def _trigger_radio_bubble(self, ag):
         """Fire a speech bubble for the captain of ag's vessel (if available)."""
         ship = self._agent_ship_map.get(id(ag))
         if not ship:
             return
         vessel_name = ship.get('name', '')
-        messages = self._db_radio.get(vessel_name)
-        if not messages:
+        buckets = self._db_radio.get(vessel_name)
+        if not buckets:
             return
+        # Messages are written for the ship's canonical DB direction, not for the
+        # direction it happens to be travelling this spawn.
+        ship_dir = ship.get('direction')   # 'downstream' / 'upstream' / None
+        all_messages = buckets.get(ship_dir) or buckets.get(None) or []
+        if not all_messages:
+            return
+        # Prefer messages that are contextually about entering the lock.
+        entry_messages = [
+            m for m in all_messages
+            if any(k in m.lower() for k in self._ENTRY_KEYWORDS)
+        ]
+        messages = entry_messages if entry_messages else all_messages
         msg = random.choice(messages)
         portrait = self._captain_portraits.get(vessel_name)
         ttl = self._reading_ttl(msg)
@@ -1558,6 +1587,20 @@ class LockDamVisualizer:
                 if id(ag) in self._agent_ship_map
             }
             available = [s for s in pool if s['name'] not in active_names]
+
+            # Filter out ships still "in transit" this week — a ship last seen going
+            # direction D may not travel D again until it has been seen returning (-D).
+            log_ships = self.ship_log.get('ships', {})
+            available_unrestricted = [
+                s for s in available
+                if log_ships.get(s['name'], {}).get('last_dir') != direction
+            ]
+            # Fall back to the unfiltered available pool (then full pool) so spawning
+            # never hard-stalls when every named ship has already transited this way.
+            if available_unrestricted:
+                available = available_unrestricted
+            # (if available_unrestricted is empty, we keep original available/pool as-is)
+
             if available:
                 db_ship = random.choice(available)
             else:
@@ -1601,19 +1644,11 @@ class LockDamVisualizer:
         for ag in active:
             ag.is_moving = abs(ag.boat.position - old_pos.get(id(ag), ag.boat.position)) > 0.001
 
-        # Radio: fire when a boat first stops at the entry gate (waiting to enter)
-        gate_gap = 12
+        # Radio: fire once when a boat first crosses into the lock interior
         for ag in active:
-            if ag.is_moving or id(ag) in self._radio_approach:
+            if id(ag) in self._radio_approach:
                 continue
-            b = ag.boat
-            if ag.direction == 1:
-                # Downstream boat stopped just before upstream (entry) gate
-                at_gate = abs((b.position + b.length) - (self.lock_start - gate_gap)) < 8
-            else:
-                # Upstream boat stopped just after downstream (entry) gate
-                at_gate = abs(b.position - (self.lock_end + gate_gap)) < 8
-            if at_gate:
+            if self._in_lock(ag.boat):
                 self._radio_approach.add(id(ag))
                 self._trigger_radio_bubble(ag)
 
@@ -1724,9 +1759,21 @@ class LockDamVisualizer:
         if d == 1 and boat.position > 1100:
             ag.state = "done"
             self.score += 1
+            self._record_ship_transit(ag, 1)
         elif d == -1 and boat.position + boat.length < -100:
             ag.state = "done"
             self.score += 1
+            self._record_ship_transit(ag, -1)
+
+    def _record_ship_transit(self, ag, direction):
+        """Record that a named ship has completed a transit in *direction* (+1/-1)."""
+        ship = self._agent_ship_map.get(id(ag))
+        if not ship:
+            return
+        name = ship.get('name', '')
+        if not name:
+            return
+        self.ship_log['ships'][name] = {'last_dir': direction}
 
     def _incident(self, text, color=None):
         self.incident_count += 1
@@ -1974,7 +2021,8 @@ class LockDamVisualizer:
                 'lightning_timer': self.lightning_timer,
                 'lightning_bolt':  self.lightning_bolt,
             },
-            'birds': self.birds,
+            'birds':    self.birds,
+            'ship_log': self.ship_log,
         }
 
     def load_state(self, state: dict):
@@ -2040,7 +2088,8 @@ class LockDamVisualizer:
         self.rain_drops      = w['rain_drops']
         self.lightning_timer = w['lightning_timer']
         self.lightning_bolt  = w['lightning_bolt']
-        self.birds           = state['birds']
+        self.birds    = state['birds']
+        self.ship_log = state.get('ship_log', {'week': 0, 'ships': {}})
 
     def save_to_file(self, path: str):
         """Write simulation state to a JSON file."""

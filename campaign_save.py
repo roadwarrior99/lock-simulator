@@ -22,7 +22,11 @@ def default_progressions():
             'story_seen':     False,
             'total_earnings': 0.0,
         }
-    return {sid: _fresh() for sid in STAGE_IDS}
+    progs = {sid: _fresh() for sid in STAGE_IDS}
+    # Operator tracks which ships have been seen and in which direction this week.
+    # 'week' increments every 7 shifts; 'ships' maps name → {'last_dir': +1 or -1}.
+    progs['operator']['ship_log'] = {'week': 0, 'ships': {}}
+    return progs
 
 
 def save_campaign(path, active_stage_id, progressions, debt):

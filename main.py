@@ -681,11 +681,20 @@ class GameEngine:
         prog     = self.progressions['operator']
         is_night = prog['phase'] == 'nights'
         start    = 20.0 if is_night else 8.0   # 8 PM nights, 8 AM days
+
+        # Compute current week (7 shifts per week) and reset ship log if a new
+        # week has started since the last recorded week in the log.
+        current_week = (prog['shift_num'] - 1) // 7
+        ship_log = prog.get('ship_log', {'week': 0, 'ships': {}})
+        if ship_log.get('week', 0) < current_week:
+            ship_log = {'week': current_week, 'ships': {}}
+
         vis = LockDamVisualizer(
             shift_duration=12.0,
             shift_start_time=start,
             cfg_time_scale=2.0,   # 2 game-hrs/real-min → 6 real minutes per shift
             dev_mode=self.dev_mode,
+            ship_log=ship_log,
         )
         # Attach display labels for the HUD
         vis._shift_phase_label = "Night" if is_night else "Day"
@@ -696,6 +705,9 @@ class GameEngine:
 
         if result == 'quit':
             return 'quit'
+
+        # Persist updated ship sighting log back into campaign progression
+        prog['ship_log'] = vis.ship_log
 
         # Compute shift earnings
         wages   = LockDamVisualizer.HOURLY_WAGE * vis.shift_hours_elapsed
