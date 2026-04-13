@@ -641,6 +641,12 @@ class LockDamVisualizer:
         top_y    = wall_top - 5
         bottom_y = self._water_bot_y + 10
         if op['state'] == 'crossing':
+            # Nudge operator 2 px inward so he appears to walk on the gate leaf
+            # rather than the outer wall edge.
+            if op['x'] <= (self.lock_start + self.lock_end) / 2:
+                ox += 8   # upstream gate: toward lock interior (right)
+            else:
+                ox -= 8   # downstream gate: toward lock interior (left)
             t  = op['cross_progress']
             # Ease in-out so the walk looks natural
             t  = t * t * (3 - 2 * t)
