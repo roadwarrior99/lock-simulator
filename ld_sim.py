@@ -1086,13 +1086,25 @@ class LockDamVisualizer:
         outline = self._dim(outline, mult)
         is_dark = self.game_time < 6.5 or self.game_time > 18.5
 
-        # Clip drawing to the boat's region so hulls never paint over lock walls.
-        wt  = self._WALL_T_PX
-        if cx < self.lock_start:
+        # Clip drawing so hulls don't paint over lock walls.
+        # Compare in screen-space pixels so the transition region matches the
+        # physical wall width exactly — no pop or premature clip.
+        wt      = self._WALL_T_PX
+        bx_r    = self._sx(boat.position + boat.length)  # right hull edge (px)
+        if bx_r <= lk_sx:
+            # Entirely upstream
             clip = pygame.Rect(0, 0, lk_sx, self.height)
-        elif cx > self.lock_end:
+        elif bx >= lk_ex:
+            # Entirely downstream
             clip = pygame.Rect(lk_ex, 0, self.width - lk_ex, self.height)
+        elif bx < lk_sx + wt:
+            # Left edge inside or before upstream wall — upstream + lock interior
+            clip = pygame.Rect(0, 0, lk_ex - wt, self.height)
+        elif bx_r > lk_ex - wt:
+            # Right edge inside or past downstream wall — lock interior + downstream
+            clip = pygame.Rect(lk_sx + wt, 0, self.width - (lk_sx + wt), self.height)
         else:
+            # Entirely inside lock
             clip = pygame.Rect(lk_sx + wt, 0, lk_ex - lk_sx - 2 * wt, self.height)
 
         prev_clip = self.screen.get_clip()
@@ -1103,7 +1115,7 @@ class LockDamVisualizer:
             wake_len = 20 + ag.speed * 10
             wake_col = (200, 220, 240, 100)
             wake_surf = pygame.Surface((wake_len, bh + 10), pygame.SRCALPHA)
-            
+
             # For barges, the wake starts behind the tug boat.
             wx = bx
             if vtype == "barge":
@@ -1112,12 +1124,22 @@ class LockDamVisualizer:
             else:
                 wx = bx if ag.direction == 1 else bx + bw
 
+            # Wake extends behind the boat, so widen the clip in the trailing
+            # direction so it isn't cut off by the hull clip boundary.
+            if ag.direction == 1:
+                wake_clip = pygame.Rect(0, 0, clip.right, self.height)
+            else:
+                wake_clip = pygame.Rect(clip.left, 0, self.width - clip.left, self.height)
+            self.screen.set_clip(wake_clip)
+
             if ag.direction == 1:
                 pygame.draw.polygon(wake_surf, wake_col, [(0, 5), (wake_len, 0), (wake_len, bh+10), (0, bh+5)])
                 self.screen.blit(wake_surf, (wx - wake_len, hull_y - bh//2 - 5))
             else:
                 pygame.draw.polygon(wake_surf, wake_col, [(wake_len, 5), (0, 0), (0, bh+10), (wake_len, bh+5)])
                 self.screen.blit(wake_surf, (wx, hull_y - bh//2 - 5))
+
+            self.screen.set_clip(clip)
 
         # ── Hull ──────────────────────────────────────────────────────────────
         ty = hull_y - bh // 2
