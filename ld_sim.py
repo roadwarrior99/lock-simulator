@@ -27,6 +27,8 @@ class Agent:
         self.tied_down = False
         self.tied_side = None        # 0=top, 1=bottom
         self.ttl       = None        # frames until removal after crash
+        # Kayaks enter freely; all other vessels wait for operator clearance.
+        self.cleared_to_enter = (boat.vessel_type == 'kayak')
 
 
 # ── Visualizer ────────────────────────────────────────────────────────────────
@@ -1391,6 +1393,55 @@ class LockDamVisualizer:
                     f"SURGE: downstream gate — {diff:.1f} m differential!")
         self.lock_dam.downstream_gates_open = not self.lock_dam.downstream_gates_open
 
+    def _gate_zone_clear(self, direction):
+        """Return True if no cleared boat is still crossing the entry gate zone.
+
+        Until the previous entrant has moved fully past the gate wall the zone
+        is considered occupied, so the operator won't signal the next boat.
+        """
+        safety = self._wall_t_sim * 3
+        for ag in self.agents:
+            if ag.state != "active" or ag.direction != direction:
+                continue
+            if not ag.cleared_to_enter:
+                continue
+            if direction == 1:
+                # Boat in upstream gate zone?
+                if ag.boat.position < self.lock_start + safety and \
+                   ag.boat.position + ag.boat.length > self.lock_start:
+                    return False
+            else:
+                # Boat in downstream gate zone?
+                if ag.boat.position + ag.boat.length > self.lock_end - safety and \
+                   ag.boat.position < self.lock_end:
+                    return False
+        return True
+
+    def _lock_has_room(self, next_boat):
+        """Return True if the lock has enough free space for next_boat.
+
+        Counts every boat already inside the lock plus any cleared boat that
+        is still approaching, so committed space is reserved before a boat
+        physically arrives.
+        """
+        boat_gap   = 25   # same gap the movement code uses
+        inner_gap  = int(20 / self._sx_scale)   # gap boats keep from the exit wall
+        # Usable queue length: from the outer entry face to where the first boat's
+        # right edge stops (exit inner wall face minus inner_gap).
+        lock_len   = (self.lock_end - self._wall_t_sim - inner_gap) - self.lock_start
+        occupied   = 0
+        for ag in self.agents:
+            if ag.state != "active":
+                continue
+            b = ag.boat
+            in_lock   = b.position + b.length > self.lock_start and b.position < self.lock_end
+            committed = ag.cleared_to_enter and not in_lock and \
+                        ((ag.direction == 1  and b.position + b.length <= self.lock_start) or
+                         (ag.direction == -1 and b.position >= self.lock_end))
+            if in_lock or committed:
+                occupied += b.length + boat_gap
+        return occupied + next_boat.length + boat_gap <= lock_len
+
     def _update_operator(self, dt):
         op = self.operator
 
@@ -1412,6 +1463,7 @@ class LockDamVisualizer:
         # 1. Identify tasks
         tying_tasks = []
         untying_tasks = []
+        clear_entry_tasks = []
         for ag in self.agents:
             if ag.state == "active":
                 # Tying: Stopped, not tied, MUST be fully inside
@@ -1428,6 +1480,17 @@ class LockDamVisualizer:
                             ready = True
                     if ready:
                         untying_tasks.append(ag)
+                # Clear entry: non-kayak waiting outside for operator signal.
+                # Only eligible when the gate zone is empty AND there is room.
+                if not ag.cleared_to_enter:
+                    if ag.direction == 1 and self.lock_dam.upstream_gates_open:
+                        if ag.boat.position + ag.boat.length <= self.lock_start:
+                            if self._gate_zone_clear(1) and self._lock_has_room(ag.boat):
+                                clear_entry_tasks.append(ag)
+                    elif ag.direction == -1 and self.lock_dam.downstream_gates_open:
+                        if ag.boat.position >= self.lock_end:
+                            if self._gate_zone_clear(-1) and self._lock_has_room(ag.boat):
+                                clear_entry_tasks.append(ag)
 
         # 2. Pick a task if none active
         if op['target_boat'] is None:
@@ -1438,6 +1501,16 @@ class LockDamVisualizer:
             elif tying_tasks:
                 op['target_boat'] = tying_tasks[0]
                 op['task'] = 'tie'
+                op['rope_progress'] = 0.0
+            elif clear_entry_tasks:
+                # Signal the boat closest to the gate
+                def _entry_dist(a):
+                    if a.direction == 1:
+                        return self.lock_start - (a.boat.position + a.boat.length)
+                    else:
+                        return a.boat.position - self.lock_end
+                op['target_boat'] = min(clear_entry_tasks, key=_entry_dist)
+                op['task'] = 'clear_entry'
                 op['rope_progress'] = 0.0
             else:
                 op['task'] = None
@@ -1452,9 +1525,15 @@ class LockDamVisualizer:
                     # Must stay stopped and mostly inside to tie
                     if target_ag.is_moving or not self._in_lock(target_ag.boat):
                         is_valid = False
-                else: # untie
+                elif op['task'] == 'untie':
                     # Must stay in lock to untie
                     if not self._in_lock(target_ag.boat):
+                        is_valid = False
+                elif op['task'] == 'clear_entry':
+                    # Valid until the boat has already been cleared or entered
+                    if target_ag.cleared_to_enter or \
+                       (target_ag.direction == 1 and not self.lock_dam.upstream_gates_open) or \
+                       (target_ag.direction == -1 and not self.lock_dam.downstream_gates_open):
                         is_valid = False
             
             if not is_valid:
@@ -1493,15 +1572,19 @@ class LockDamVisualizer:
                     # Both gates open? Wait at the best spot.
                     op['state'] = 'waiting'
             else:
-                # On the correct side, walk to boat center (clamped to lock wall)
-                target_x = target_ag.boat.position + target_ag.boat.length / 2
-                target_x = max(self.lock_start, min(self.lock_end, target_x))
+                # On the correct side; for clear_entry walk to the gate edge,
+                # for tie/untie walk to the boat centre inside the lock.
+                if op['task'] == 'clear_entry':
+                    target_x = self.lock_start if target_ag.direction == 1 else self.lock_end
+                else:
+                    target_x = target_ag.boat.position + target_ag.boat.length / 2
+                    target_x = max(self.lock_start, min(self.lock_end, target_x))
                 dx = target_x - op['x']
                 if abs(dx) > 1.0:
                     op['state'] = 'walking'
                     op['x'] += 1.2 if dx > 0 else -1.2
                 else:
-                    # At boat, perform tie or untie
+                    # At position, perform task
                     if op['task'] == 'tie':
                         op['state'] = 'tying'
                         if op['rope_progress'] < 1.0:
@@ -1519,12 +1602,28 @@ class LockDamVisualizer:
                             target_ag.tied_side = None
                             self._trigger_radio_departure(target_ag)
                             op['target_boat'] = None # Task finished
+                    elif op['task'] == 'clear_entry':
+                        # Wave the boat in — grant entry clearance immediately
+                        op['state'] = 'idle'
+                        target_ag.cleared_to_enter = True
+                        op['target_boat'] = None # Task finished
         else:
-            # No task: Return to idle position on top side (0) near upstream gate
-            if op['side'] != 0:
-                # Need to cross back
-                u_open = self.lock_dam.upstream_gates_open
-                d_open = self.lock_dam.downstream_gates_open
+            # No task: stand near whichever gate is open (ready for entering boats),
+            # or default to upstream side when both gates are closed.
+            u_open = self.lock_dam.upstream_gates_open
+            d_open = self.lock_dam.downstream_gates_open
+
+            if d_open and not u_open:
+                # Downstream gate open — ships entering from downstream use side 1
+                idle_side = 1
+                idle_x    = self.lock_end - 10
+            else:
+                # Upstream gate open or both closed — default upstream side 0
+                idle_side = 0
+                idle_x    = self.lock_start + 10
+
+            if op['side'] != idle_side:
+                # Need to cross to the idle side; find a closed gate to walk across
                 gate_x = self.lock_start if not u_open else (self.lock_end if not d_open else None)
                 if gate_x is not None:
                     dx = gate_x - op['x']
@@ -1532,15 +1631,13 @@ class LockDamVisualizer:
                         op['state'] = 'walking'
                         op['x'] += 1.2 if dx > 0 else -1.2
                     else:
-                        # Begin animated crossing back to top wall.
                         op['state']          = 'crossing'
-                        op['target_side']    = 0
+                        op['target_side']    = idle_side
                         op['cross_progress'] = 0.0
                 else:
                     op['state'] = 'idle'
             else:
-                target_x = self.lock_start + 10
-                dx = target_x - op['x']
+                dx = idle_x - op['x']
                 if abs(dx) > 1.0:
                     op['state'] = 'walking'
                     op['x'] += 0.8 if dx > 0 else -0.8
@@ -2396,6 +2493,13 @@ class LockDamVisualizer:
             ]
 
         for gate_x, open_, gap in gate_order:
+            # Non-kayaks must wait for operator clearance before entering the lock.
+            # Treat the entry gate as closed until cleared_to_enter is set.
+            if open_ and not ag.cleared_to_enter:
+                if (d == 1 and boat.position + boat.length <= gate_x) or \
+                   (d == -1 and boat.position >= gate_x):
+                    open_ = False   # hold at outer_gap as if gate were closed
+
             if open_:
                 continue
             if d == 1:
