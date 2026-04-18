@@ -967,6 +967,16 @@ class PilotGame:
                     return True
         return False
 
+    # ── Collision with AI traffic ───────────────────────────────────────────────
+    def _ai_collision(self):
+        for av in self.ai_vessels:
+            hw, hl = _AI_DIMS.get(av.vessel_type, (10, 30))
+            r = math.hypot(hw, hl) + 4
+            for px, py in self.vessel.corners():
+                if math.hypot(px - av.wx, py - av.wy) < r:
+                    return True
+        return False
+
     # ── Update ─────────────────────────────────────────────────────────────────
     def update(self, keys, dt):
         if self.game_over or self.show_intro:
@@ -984,7 +994,7 @@ class PilotGame:
 
         # Hit detection
         if self.vessel.hit_cd == 0:
-            if self._bank_collision() or self._obstacle_collision():
+            if self._bank_collision() or self._obstacle_collision() or self._ai_collision():
                 self.vessel.damage   += 1
                 self.incident_count  += 1
                 self.vessel.hit_cd    = HIT_COOLDOWN
