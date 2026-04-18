@@ -531,7 +531,7 @@ class LockDamVisualizer:
         # Upstream channel — water reaches the upstream gate face (inner_x)
         shimmer_col = self._dim(self.WATER_SHIMMER, mult)
         self._draw_water_band(0, up_y, inner_x)
-        self._lane_divider(0, inner_x, up_y)
+        #self._lane_divider(0, inner_x, up_y)
         self._draw_bank_strip(0, up_y, inner_x)
         t = self.time * 1.8
         for wx in range(0, inner_x - 10, 35):
@@ -542,7 +542,7 @@ class LockDamVisualizer:
         # Downstream channel — water starts at the downstream gate face
         dn_gate_x = inner_x + inner_w   # = lk_ex - wall_t
         self._draw_water_band(dn_gate_x, dn_y, self.width - dn_gate_x)
-        self._lane_divider(dn_gate_x, self.width - dn_gate_x, dn_y)
+        #self._lane_divider(dn_gate_x, self.width - dn_gate_x, dn_y)
         self._draw_bank_strip(dn_gate_x, dn_y, self.width - dn_gate_x)
         for wx in range(dn_gate_x + 5, self.width - 10, 35):
             oy = int(2 * math.sin(t + wx * 0.06))
@@ -554,7 +554,7 @@ class LockDamVisualizer:
                             (inner_x, lk_y, inner_w, self._water_bot_y - lk_y))
         pygame.draw.line(self.screen, self._dim(self.WATER_SHIMMER, mult),
                          (inner_x, lk_y), (inner_x + inner_w, lk_y), 2)
-        self._lane_divider(inner_x, inner_w, lk_y)
+        #self._lane_divider(inner_x, inner_w, lk_y)
 
         # Turbulent water effects when filling or draining
         if self.lock_dam.is_filling or self.lock_dam.is_draining:
@@ -1426,9 +1426,12 @@ class LockDamVisualizer:
         """
         boat_gap   = 25   # same gap the movement code uses
         inner_gap  = int(20 / self._sx_scale)   # gap boats keep from the exit wall
-        # Usable queue length: from the outer entry face to where the first boat's
-        # right edge stops (exit inner wall face minus inner_gap).
-        lock_len   = (self.lock_end - self._wall_t_sim - inner_gap) - self.lock_start
+        gate_safety = self._wall_t_sim * 3       # gate-zone depth (_gate_zone_clear uses same)
+        # Usable queue length: start *past* the gate-zone so the last committed
+        # boat always clears the gate before stopping.  Without this offset a
+        # third barge would stop inside the gate zone, permanently blocking entry
+        # until the exit gate opens.
+        lock_len   = (self.lock_end - self._wall_t_sim - inner_gap) - (self.lock_start + gate_safety)
         occupied   = 0
         for ag in self.agents:
             if ag.state != "active":
