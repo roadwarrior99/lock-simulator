@@ -30,7 +30,7 @@ VREF_Y  = int(SH * 0.10)   # towboat sits this many pixels from the top of scree
 # ── River geometry (world units; 1 wu ≈ 1 px at 1:1 zoom) ────────────────────
 RIVER_HALF   = 400    # half-width of the full river
 CHANNEL_HALF = 210     # half-width of the safe navigable channel
-BUOY_SPACING = 215    # world-Y between consecutive buoy pairs
+BUOY_SPACING = 645    # world-Y between consecutive buoy pairs
 OBS_STEP     = 365    # world-Y between obstacle placement tries
 OBS_CHANCE   = 0.62   # probability an obstacle slot is actually filled
 DOCK_INTERVAL= 2500   # world-Y between terminal docks
@@ -56,6 +56,48 @@ YAW_MAX  = 0.55   # degrees/frame at full steer and full speed (bow-pivot: long 
 YAW_DAMP = 0.82   # angular-velocity damped each frame
 CURRENT_Y  = 1.2  # river current speed downstream (+Y), world units/frame
 CURRENT_CD = 0.05 # hydrodynamic drag coefficient (quadratic: F ∝ Cd·v_rel²)
+
+# ── AI river traffic ───────────────────────────────────────────────────────────
+TRAFFIC_SPAWN_INTERVAL = 38.0   # real seconds between spawn attempts
+TRAFFIC_MAX            = 2      # max simultaneous AI vessels on screen
+TRAFFIC_SPAWN_AHEAD    = 1400   # world units ahead of player to spawn
+TRAFFIC_CULL_DIST      = 1800   # cull when this far behind the vessel's own travel direction
+
+_AI_DIMS = {          # (half-width, half-length) in world units
+    'kayak':      ( 3,   6),
+    'yacht':      ( 6,  14),
+    'paddleboat': (16,  28),
+    'towboat':    (22,  45),
+    'barge':      (28, 100),
+}
+_AI_SPEEDS = {        # base world units/frame
+    'kayak':      1.9,
+    'yacht':      2.3,
+    'paddleboat': 1.1,
+    'towboat':    1.6,
+    'barge':      1.0,
+}
+_AI_COLORS = {
+    'kayak':      (220, 110,  40),
+    'yacht':      (210, 210, 215),
+    'paddleboat': (170,  55,  55),
+    'towboat':    (130,  68,  24),
+    'barge':      (105,  95,  68),
+}
+_FALLBACK_POOL = [
+    ('MV River Queen',   'towboat',    'Capt. Harris'),
+    ('Lone Star',        'barge',      None),
+    ('Cape May',         'yacht',      None),
+    ('MV Prairie Star',  'towboat',    'Capt. Nolan'),
+    ('Sundancer',        'kayak',      None),
+    ('Betty Ann',        'paddleboat', None),
+    ('MV Delta Pride',   'barge',      None),
+    ('Island Spirit',    'yacht',      None),
+    ('MV Ohio Lady',     'towboat',    'Capt. Reyes'),
+    ('Whispering Pines', 'paddleboat', None),
+    ('MV Shawnee',       'barge',      None),
+    ('Blue Heron',       'kayak',      None),
+]
 
 # ── Game time ──────────────────────────────────────────────────────────────────
 MINS_PER_SEC = 2.5    # game-minutes per real second
@@ -535,16 +577,18 @@ def draw_river(surf, river: RiverCurve, cam_x, cam_y, ambient, wave_t):
         pygame.draw.lines(surf, edge_col, False, left_pts,  2)
         pygame.draw.lines(surf, edge_col, False, right_pts, 2)
 
-    # Simple trees on banks (daytime only)
+    # Simple trees on banks (daytime only) — seeded per strip so positions are fixed
     if ambient > 0.5:
         tree_col   = dim3((28, 90, 28), ambient)
         trunk_col  = dim3((80, 55, 20), ambient)
-        rng = random.Random(int(cam_y // 400))
-        for i in range(22):
-            wy = top_y + rng.randint(0, bot_y - top_y)
-            cx = river.cx(wy)
+        STRIP = 90   # world-Y between tree strips
+        strip_start = top_y - (top_y % STRIP)
+        for strip_wy in range(strip_start, bot_y + STRIP, STRIP):
+            rng  = random.Random(strip_wy)
             side = rng.choice((-1, 1))
             off  = rng.uniform(RIVER_HALF + 12, RIVER_HALF + 65)
+            cx   = river.cx(strip_wy)
+            wy   = strip_wy
             tx = int(cx + side * off - cam_x + SW // 2)
             ty = int(wy - cam_y + VREF_Y)
             if 0 <= tx < SW and 0 <= ty < SH:
@@ -754,6 +798,73 @@ def draw_intro(surf, font_lg, font):
         y += fnt.size('A')[1] + 8
 
 
+# ── AI river traffic vessel ────────────────────────────────────────────────────
+class AIVessel:
+    def __init__(self, wx, wy, direction, vessel_type, name, captain=None):
+        self.wx          = float(wx)
+        self.wy          = float(wy)
+        self.direction   = direction      # +1 downstream, -1 upstream
+        self.vessel_type = vessel_type
+        self.name        = name
+        self.captain     = captain
+        self.speed       = (_AI_SPEEDS.get(vessel_type, 1.5)
+                            * random.uniform(0.85, 1.15))
+
+    def update(self, river: RiverCurve):
+        self.wy += self.speed * self.direction
+        self.wx  = river.cx(self.wy)
+
+    def draw(self, surf, cam_x, cam_y, ambient, river: RiverCurve, wave_t, font_sm):
+        sx = int(self.wx - cam_x + SW // 2)
+        sy = int(self.wy - cam_y + VREF_Y)
+        if not (-200 < sx < SW + 200 and -200 < sy < SH + 200):
+            return
+
+        # Heading follows river tangent; flip 180° for upstream
+        slope   = river.dcx(self.wy)
+        L       = math.hypot(slope, 1.0)
+        fx, fy  = slope / L * self.direction, 1.0 / L * self.direction
+        rx, ry  = fy, -fx   # right-hand perpendicular
+
+        hw, hl = _AI_DIMS.get(self.vessel_type, (10, 30))
+        col    = dim3(_AI_COLORS.get(self.vessel_type, (120, 120, 120)),
+                      ambient * 0.55 + 0.15)
+        trim   = dim3(_AI_COLORS.get(self.vessel_type, (120, 120, 120)),
+                      ambient * 0.30 + 0.10)
+
+        def ws(dx, dy):
+            return (int(sx + dx), int(sy + dy))
+
+        pts = [
+            ws( fx*hl - rx*hw,  fy*hl - ry*hw),
+            ws( fx*hl + rx*hw,  fy*hl + ry*hw),
+            ws(-fx*hl + rx*hw, -fy*hl + ry*hw),
+            ws(-fx*hl - rx*hw, -fy*hl - ry*hw),
+        ]
+        pygame.draw.polygon(surf, col, pts)
+        pygame.draw.polygon(surf, trim, pts, 2)
+
+        # Nav lights at night
+        glow_a = int(max(0, min(200, (0.55 - ambient) * 500)))
+        port_s  = ws(-rx * hw * 0.9, -ry * hw * 0.9)
+        stbd_s  = ws( rx * hw * 0.9,  ry * hw * 0.9)
+        stern_s = ws(-fx * hl * 0.9, -fy * hl * 0.9)
+        for pos, ncol, r in [(port_s, NAV_RED, 3), (stbd_s, NAV_GREEN, 3),
+                              (stern_s, NAV_WHITE, 2)]:
+            pygame.draw.circle(surf, ncol, pos, r)
+            if glow_a > 20:
+                gr = r * 4
+                gs = pygame.Surface((gr*2, gr*2), pygame.SRCALPHA)
+                pygame.draw.circle(gs, (*ncol, glow_a), (gr, gr), gr)
+                surf.blit(gs, (pos[0]-gr, pos[1]-gr))
+
+        # Name label
+        if ambient > 0.25:
+            label = self.name if not self.captain else f'{self.name}'
+            lbl   = font_sm.render(label, True, dim3((220, 220, 200), ambient * 0.7 + 0.15))
+            surf.blit(lbl, (sx - lbl.get_width() // 2, sy - hl - 14))
+
+
 # ── Main game class ────────────────────────────────────────────────────────────
 class PilotGame:
 
@@ -785,6 +896,41 @@ class PilotGame:
         self.unload_timer = 0.0
 
         self.wave_t = 0.0
+
+        # AI traffic
+        self.ai_vessels     = []
+        self.traffic_timer  = 0.0
+        self._traffic_pool  = self._load_traffic_pool()
+
+    # ── Traffic pool ───────────────────────────────────────────────────────────
+    def _load_traffic_pool(self):
+        try:
+            from assets import GameDatabase
+            db   = GameDatabase()
+            rows = db.ships(limit=200)
+            caps = {r['vessel_name']: r['name']
+                    for r in db.crew_list(role='captain')}
+            db.close()
+            pool = [(r['name'], r['vessel_type'], caps.get(r['name']))
+                    for r in rows
+                    if r['vessel_type'] in _AI_DIMS and r['name']]
+            if pool:
+                return pool
+        except Exception:
+            pass
+        return list(_FALLBACK_POOL)
+
+    def _maybe_spawn_traffic(self):
+        if len(self.ai_vessels) >= TRAFFIC_MAX:
+            return
+        direction   = random.choice((-1, 1))
+        spawn_ahead = random.uniform(TRAFFIC_SPAWN_AHEAD * 0.7,
+                                     TRAFFIC_SPAWN_AHEAD * 1.3)
+        wy  = self.vessel.y + spawn_ahead
+        wx  = self.river.cx(wy)
+        name, vtype, captain = random.choice(self._traffic_pool)
+        self.ai_vessels.append(
+            AIVessel(wx, wy, direction, vtype, name, captain))
 
     # ── Camera ─────────────────────────────────────────────────────────────────
     @property
@@ -847,6 +993,18 @@ class PilotGame:
                     self.game_over = True
                     return
 
+        # AI traffic: spawn and update
+        self.traffic_timer += dt
+        if self.traffic_timer >= TRAFFIC_SPAWN_INTERVAL:
+            self.traffic_timer = 0.0
+            self._maybe_spawn_traffic()
+        for av in self.ai_vessels:
+            av.update(self.river)
+        self.ai_vessels = [
+            av for av in self.ai_vessels
+            if (av.wy - self.vessel.y) * av.direction > -TRAFFIC_CULL_DIST
+        ]
+
         # Docking logic
         if self.active_dock:
             self.unload_timer -= dt
@@ -884,7 +1042,12 @@ class PilotGame:
         draw_buoys(surf, self.buoys, self.cam_x, self.cam_y,
                    ambient, self.wave_t)
 
-        # Vessel (drawn on top of buoys so it occludes them)
+        # AI traffic
+        for av in self.ai_vessels:
+            av.draw(surf, self.cam_x, self.cam_y, ambient,
+                    self.river, self.wave_t, font_sm)
+
+        # Vessel (drawn on top of everything so it is always visible)
         self.vessel.draw(surf, self.cam_x, self.cam_y, ambient)
 
         # Night overlay — darkens the whole view
