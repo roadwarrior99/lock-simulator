@@ -25,7 +25,7 @@ import pygame
 # ── Display ────────────────────────────────────────────────────────────────────
 SW, SH  = 1200, 800
 FPS     = 60
-VREF_Y  = int(SH * 0.18)   # towboat sits this many pixels from the top of screen
+VREF_Y  = int(SH * 0.10)   # towboat sits this many pixels from the top of screen
 
 # ── River geometry (world units; 1 wu ≈ 1 px at 1:1 zoom) ────────────────────
 RIVER_HALF   = 400    # half-width of the full river
