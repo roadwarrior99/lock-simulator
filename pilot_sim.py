@@ -1028,21 +1028,6 @@ def draw_hud(surf, vessel: Vessel, game_hour, score, dock_dist,
         rl = font.render(reward_msg, True, rc)
         surf.blit(rl, (SW // 2 - rl.get_width() // 2, SH - 100))
 
-
-def draw_goals(surf, goals, font_sm):
-    """Draw the daily goals list in the top-right below the earnings line."""
-    if not goals:
-        return
-    GX = SW - 310
-    GY = 70
-    for goal in goals:
-        done   = goal.completed
-        col    = (80, 220, 100) if done else (200, 195, 140)
-        prefix = '[x] ' if done else '[ ] '
-        lbl    = font_sm.render(prefix + goal.describe(), True, col)
-        surf.blit(lbl, (GX, GY))
-        GY += lbl.get_height() + 3
-
     # Dock approach indicator
     if dock_dist is not None and not active_dock:
         if dock_dist < 600:
@@ -1077,6 +1062,21 @@ def draw_goals(surf, goals, font_sm):
     pygame.draw.circle(surf, (220, 220, 220), (hx, hy), 3)
     surf.blit(font_sm.render('N', True, (200, 200, 200)),
               (hx - 4, hy - 30 - 14))
+
+
+def draw_goals(surf, goals, font_sm):
+    """Draw the daily goals list in the top-right below the earnings line."""
+    if not goals:
+        return
+    GX = SW - 310
+    GY = 70
+    for goal in goals:
+        done   = goal.completed
+        col    = (80, 220, 100) if done else (200, 195, 140)
+        prefix = '[x] ' if done else '[ ] '
+        lbl    = font_sm.render(prefix + goal.describe(), True, col)
+        surf.blit(lbl, (GX, GY))
+        GY += lbl.get_height() + 3
 
 
 # ── Game over / pause overlays ─────────────────────────────────────────────────
