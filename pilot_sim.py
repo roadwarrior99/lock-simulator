@@ -54,6 +54,8 @@ ACCEL    = 0.055  # speed change per frame while key held
 DRAG     = 0.988  # speed multiplied each frame (water resistance)
 YAW_MAX  = 0.55   # degrees/frame at full steer and full speed (bow-pivot: long lever arm)
 YAW_DAMP = 0.82   # angular-velocity damped each frame
+CURRENT_Y  = 1.2  # river current speed downstream (+Y), world units/frame
+CURRENT_CD = 0.05 # hydrodynamic drag coefficient (quadratic: F ∝ Cd·v_rel²)
 
 # ── Game time ──────────────────────────────────────────────────────────────────
 MINS_PER_SEC = 2.5    # game-minutes per real second
@@ -273,6 +275,13 @@ class Vessel:
         by += fy * self.speed
         self.x = bx - fx * bow_d
         self.y = by - fy * bow_d
+
+        # Hydrodynamic current drag: F = Cd · v_rel · |v_rel|  (quadratic)
+        # River flows +Y; relative velocity is (current - vessel world velocity).
+        vrel_x = 0.0 - fx * self.speed
+        vrel_y = CURRENT_Y - fy * self.speed
+        self.x += CURRENT_CD * vrel_x * abs(vrel_x)
+        self.y += CURRENT_CD * vrel_y * abs(vrel_y)
 
     # ── Draw ───────────────────────────────────────────────────────────────────
     def draw(self, surf, cam_x, cam_y, ambient):
