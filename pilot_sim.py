@@ -57,46 +57,70 @@ YAW_DAMP = 0.82   # angular-velocity damped each frame
 CURRENT_Y  = 1.2  # river current speed downstream (+Y), world units/frame
 CURRENT_CD = 0.05 # hydrodynamic drag coefficient (quadratic: F ∝ Cd·v_rel²)
 
+# ── Deckhands ──────────────────────────────────────────────────────────────────
+DECKHAND_WALK  = 1.4   # wu/frame on deck
+DECKHAND_COUNT = 3
+CARGO_TYPES = [
+    ('coal',   ( 32,  32,  40)),
+    ('grain',  (195, 170,  68)),
+    ('steel',  (118, 130, 140)),
+    ('gravel', (110, 100,  78)),
+    ('corn',   (210, 180,  50)),
+]
+DECKHAND_COLORS = [
+    (210,  85,  45),   # orange vest
+    ( 48, 108, 200),   # blue vest
+    ( 48, 172,  72),   # green vest
+]
+_DH_FALLBACK_NAMES = ['Pat', 'Lou', 'Sam', 'Casey', 'River', 'Dale', 'Jo', 'Mac']
+
 # ── AI river traffic ───────────────────────────────────────────────────────────
 TRAFFIC_SPAWN_INTERVAL = 38.0   # real seconds between spawn attempts
 TRAFFIC_MAX            = 2      # max simultaneous AI vessels on screen
 TRAFFIC_SPAWN_AHEAD    = 1400   # world units ahead of player to spawn
 TRAFFIC_CULL_DIST      = 1800   # cull when this far behind the vessel's own travel direction
 
-_AI_DIMS = {          # (half-width, half-length) in world units
+_AI_DIMS = {          # (half-width, half-length) in world units — barges excluded: no self-propulsion
     'kayak':      ( 3,   6),
     'yacht':      ( 6,  14),
     'paddleboat': (16,  28),
     'towboat':    (22,  45),
-    'barge':      (28, 100),
 }
 _AI_SPEEDS = {        # base world units/frame
     'kayak':      1.9,
     'yacht':      2.3,
     'paddleboat': 1.1,
     'towboat':    1.6,
-    'barge':      1.0,
 }
 _AI_COLORS = {
     'kayak':      (220, 110,  40),
     'yacht':      (210, 210, 215),
     'paddleboat': (170,  55,  55),
     'towboat':    (130,  68,  24),
-    'barge':      (105,  95,  68),
 }
 _FALLBACK_POOL = [
     ('MV River Queen',   'towboat',    'Capt. Harris'),
-    ('Lone Star',        'barge',      None),
     ('Cape May',         'yacht',      None),
     ('MV Prairie Star',  'towboat',    'Capt. Nolan'),
     ('Sundancer',        'kayak',      None),
     ('Betty Ann',        'paddleboat', None),
-    ('MV Delta Pride',   'barge',      None),
     ('Island Spirit',    'yacht',      None),
     ('MV Ohio Lady',     'towboat',    'Capt. Reyes'),
     ('Whispering Pines', 'paddleboat', None),
-    ('MV Shawnee',       'barge',      None),
     ('Blue Heron',       'kayak',      None),
+]
+
+_FALLBACK_DOCK_NAMES = [
+    {'name': 'Riverside Terminal', 'accepts': 'coal,steel',  'produces': 'grain'},
+    {'name': 'Harbor Freight',     'accepts': 'grain,corn',  'produces': 'steel'},
+    {'name': 'Mill Creek Landing', 'accepts': 'gravel',      'produces': 'coal'},
+    {'name': 'Valley Port',        'accepts': 'corn,grain',  'produces': 'gravel'},
+    {'name': 'Iron Bridge Dock',   'accepts': 'steel',       'produces': 'corn'},
+    {'name': 'South Bend Wharf',   'accepts': 'coal,gravel', 'produces': 'grain'},
+    {'name': 'River Bend Station', 'accepts': 'grain',       'produces': 'steel'},
+    {'name': 'Lakeside Terminal',  'accepts': 'corn',        'produces': 'coal'},
+    {'name': 'Crescent City Dock', 'accepts': 'steel,coal',  'produces': 'gravel'},
+    {'name': 'Bayou Freight',      'accepts': 'gravel,corn', 'produces': 'grain'},
 ]
 
 # ── Game time ──────────────────────────────────────────────────────────────────
@@ -201,15 +225,185 @@ class Obstacle:
         self.r    = {'rock': 20, 'sandbar': 34, 'log': 11}[self.kind]
 
 
-class Dock:
-    __slots__ = ('wx', 'wy', 'side', 'visited')
-
-    def __init__(self, wx, wy, side):
+class DockedBarge:
+    """A barge left at a dock — persists in world space."""
+    def __init__(self, wx, wy, heading, cargo=None):
         self.wx      = wx
         self.wy      = wy
-        self.side    = side    # +1 = river-right, -1 = river-left
-        self.visited = False
+        self.heading = heading   # degrees; preserves orientation at detach
+        self.cargo   = cargo     # None or (label, rgb)
 
+
+class FreeBargeCluster:
+    """Barge tow floating free after towboat disconnects — drifts with current."""
+    CONNECT_RADIUS = 80   # world units: how close the towboat must be to reconnect
+
+    def __init__(self, wx, wy, heading, barges):
+        self.wx      = float(wx)
+        self.wy      = float(wy)
+        self.heading = heading
+        self.barges  = barges   # list of TowBarge
+
+    def update(self):
+        # Drift downstream with hydrodynamic current (speed ≈ 0)
+        self.wy += CURRENT_CD * CURRENT_Y * abs(CURRENT_Y)
+
+    def draw(self, surf, cam_x, cam_y, ambient):
+        sx = int(self.wx - cam_x + SW // 2)
+        sy = int(self.wy - cam_y + VREF_Y)
+        if not (-220 < sx < SW + 220 and -220 < sy < SH + 220):
+            return
+        r   = math.radians(self.heading)
+        fx  = math.sin(r);  fy  = math.cos(r)
+        rx  = math.cos(r);  ry  = -math.sin(r)
+        bc  = dim3(BARGE_COL, ambient * 0.55 + 0.12)
+        be  = dim3(BARGE_TRIM, ambient * 0.50 + 0.12)
+        for b in self.barges:
+            fwd_off = TH / 2 + PUSH + b.row * (BH + BGAP) + BH / 2
+            lat_off = (b.col - (B_COLS - 1) / 2.0) * (BW + BGAP)
+            bcx = sx + fx * fwd_off + rx * lat_off
+            bcy = sy + fy * fwd_off + ry * lat_off
+            hw, hl = BW / 2, BH / 2
+            def _p(dx, dy, _x=bcx, _y=bcy):
+                return (int(_x + dx), int(_y + dy))
+            pts = [_p(fx*hl - rx*hw, fy*hl - ry*hw),
+                   _p(fx*hl + rx*hw, fy*hl + ry*hw),
+                   _p(-fx*hl + rx*hw, -fy*hl + ry*hw),
+                   _p(-fx*hl - rx*hw, -fy*hl - ry*hw)]
+            pygame.draw.polygon(surf, bc, pts)
+            pygame.draw.polygon(surf, be, pts, 2)
+            if b.cargo:
+                _, cc = b.cargo
+                cc = dim3(cc, ambient * 0.50 + 0.12)
+                cpts = [_p(fx*hl*0.7 - rx*hw*0.6, fy*hl*0.7 - ry*hw*0.6),
+                        _p(fx*hl*0.7 + rx*hw*0.6, fy*hl*0.7 + ry*hw*0.6),
+                        _p(-fx*hl*0.7 + rx*hw*0.6, -fy*hl*0.7 + ry*hw*0.6),
+                        _p(-fx*hl*0.7 - rx*hw*0.6, -fy*hl*0.7 - ry*hw*0.6)]
+                pygame.draw.polygon(surf, cc, cpts)
+
+
+class Dock:
+    def __init__(self, wx, wy, side, name='', accepts=None, produces=None):
+        self.wx             = wx
+        self.wy             = wy
+        self.side           = side       # +1 = river-right, -1 = river-left
+        self.visited        = False
+        self.name           = name
+        self.accepts        = accepts or []   # cargo types this dock receives
+        self.produces       = produces or []  # cargo types available to load here
+        self.available_barge= None            # DockedBarge waiting for pickup, or None
+
+
+# ── Barge unit ────────────────────────────────────────────────────────────────
+_barge_id_counter = 0
+
+class TowBarge:
+    def __init__(self, row: int, col: int, cargo=None, bid: str = None):
+        global _barge_id_counter
+        self.row   = row
+        self.col   = col
+        self.cargo = cargo   # None  or  (label_str, rgb_tuple)
+        self.tied  = False
+        if bid:
+            self.bid = bid
+        else:
+            self.bid = f'B{_barge_id_counter}'
+            _barge_id_counter += 1
+
+# Gap edges a deckhand must jump when walking between towboat and barges
+_GAP_EDGES = [TH / 2, TH / 2 + PUSH]   # towboat-bow → barge-stern crossing
+
+# ── Deckhand ───────────────────────────────────────────────────────────────────
+class Deckhand:
+    JUMP_DUR  = 0.28   # seconds airborne per gap crossing
+    JUMP_HEIGHT = 10   # screen pixels at apex
+
+    def __init__(self, name: str, color):
+        self.name  = name
+        self.color = color
+        self.fwd   = 0.0
+        self.lat   = 0.0
+        self._tfwd = 0.0
+        self._tlat = 0.0
+        self.state      = 'idle'
+        self.task       = None
+        self._work_t    = 0.0
+        self._work_dur  = 0.0
+        self._on_done   = None
+        self._jump_t    = 0.0   # > 0 while airborne
+
+    def assign(self, task: str, tfwd: float, tlat: float, duration: float, on_done=None):
+        self.task      = task
+        self._tfwd     = tfwd
+        self._tlat     = tlat
+        self._work_dur = duration
+        self._work_t   = 0.0
+        self._on_done  = on_done
+        self.state     = 'walking'
+
+    def return_to_boat(self):
+        """Override current task and walk back to towboat centre."""
+        self.assign('return', 0.0, 0.0, 0.01)
+
+    def update(self, dt):
+        if self._jump_t > 0:
+            self._jump_t = max(0.0, self._jump_t - dt)
+
+        if self.state == 'idle':
+            return
+
+        if self.state == 'walking':
+            prev_fwd = self.fwd
+            dfwd = self._tfwd - self.fwd
+            dlat = self._tlat - self.lat
+            dist = math.hypot(dfwd, dlat)
+            if dist <= DECKHAND_WALK:
+                self.fwd, self.lat = self._tfwd, self._tlat
+                self.state   = 'working'
+                self._work_t = 0.0
+            else:
+                self.fwd += dfwd / dist * DECKHAND_WALK
+                self.lat += dlat / dist * DECKHAND_WALK
+            # Detect gap crossing → trigger jump
+            for edge in _GAP_EDGES:
+                if (prev_fwd - edge) * (self.fwd - edge) < 0:
+                    self._jump_t = self.JUMP_DUR
+                    break
+
+        elif self.state == 'working':
+            self._work_t += dt
+            if self._work_t >= self._work_dur:
+                self.state = 'idle'
+                if self._on_done:
+                    self._on_done()
+                    self._on_done = None
+
+    def world_pos(self, vessel):
+        fx, fy = vessel.fwd
+        rx, ry = vessel.rgt
+        return (vessel.x + fx * self.fwd + rx * self.lat,
+                vessel.y + fy * self.fwd + ry * self.lat)
+
+    def draw(self, surf, vessel, cam_x, cam_y, ambient):
+        if ambient < 0.15:
+            return
+        wx, wy = self.world_pos(vessel)
+        sx = int(wx - cam_x + SW // 2)
+        sy = int(wy - cam_y + VREF_Y)
+        if not (-12 < sx < SW + 12 and -12 < sy < SH + 12):
+            return
+        # Vertical offsets: work bob or jump arc
+        if self._jump_t > 0:
+            frac = self._jump_t / self.JUMP_DUR
+            rise = int(math.sin(frac * math.pi) * self.JUMP_HEIGHT)
+        else:
+            rise = 0
+        bob  = int(math.sin(self._work_t * 9) * 2) if self.state == 'working' else 0
+        lift = -(rise + bob)   # screen Y goes up when negative
+        col  = dim3(self.color, ambient * 0.6 + 0.2)
+        skin = dim3((220, 182, 135), ambient * 0.65 + 0.15)
+        pygame.draw.circle(surf, col,  (sx, sy + lift),     4)
+        pygame.draw.circle(surf, skin, (sx, sy - 6 + lift), 3)
 
 # ── Vessel ─────────────────────────────────────────────────────────────────────
 class Vessel:
@@ -231,6 +425,9 @@ class Vessel:
         self.damage     = 0
         self.hit_cd     = 0     # frames of invulnerability remaining
         self.horn_timer = 0
+        self.barges     = [TowBarge(r, c)
+                           for r in range(B_ROWS) for c in range(B_COLS)]
+        self.deckhands  = []   # populated by PilotGame
 
     # ── Direction helpers ──────────────────────────────────────────────────────
     @property
@@ -247,15 +444,22 @@ class Vessel:
 
     # ── Key positions ──────────────────────────────────────────────────────────
     @property
+    def form_length(self):
+        if not self.barges:
+            return 0.0
+        max_row = max(b.row for b in self.barges)
+        return (max_row + 1) * BH + max_row * BGAP
+
+    @property
     def bow_pos(self):
         fx, fy = self.fwd
-        d = TH / 2 + PUSH + FORM_L
+        d = TH / 2 + PUSH + self.form_length
         return self.x + fx * d, self.y + fy * d
 
     @property
     def barge_center(self):
         fx, fy = self.fwd
-        d = TH / 2 + PUSH + FORM_L / 2
+        d = TH / 2 + PUSH + self.form_length / 2
         return self.x + fx * d, self.y + fy * d
 
     @property
@@ -263,11 +467,18 @@ class Vessel:
         fx, fy = self.fwd
         return self.x - fx * TH / 2, self.y - fy * TH / 2
 
+    @property
+    def form_half_width(self):
+        if not self.barges:
+            return TW / 2
+        lats = [(b.col - (B_COLS - 1) / 2.0) * (BW + BGAP) for b in self.barges]
+        return max(abs(l) for l in lats) + BW / 2
+
     def corners(self):
-        """Four approximate hull corners for collision checks."""
+        """Hull corners sized to actual barge formation."""
         fx, fy = self.fwd
         rx, ry = self.rgt
-        hw = FORM_W / 2 + 3
+        hw = self.form_half_width + 3
         bx, by = self.bow_pos
         sx, sy = self.stern_pos
         return [
@@ -314,7 +525,7 @@ class Vessel:
         # Pivot around the barge bow: towboat (at rear) swings the stern,
         # bow traces the path — like forklift / rear-wheel steering.
         fx_old, fy_old = self.fwd
-        bow_d = TH / 2 + PUSH + FORM_L
+        bow_d = (TH / 2 + PUSH + self.form_length) if self.barges else TH / 2
         bx = self.x + fx_old * bow_d
         by = self.y + fy_old * bow_d
         self.heading = (self.heading + self.yaw_vel) % 360.0
@@ -341,30 +552,48 @@ class Vessel:
         dark   = ambient < 0.5
 
         # ── Barges ────────────────────────────────────────────────────────────
-        for row in range(B_ROWS):
-            for col in range(B_COLS):
-                fwd_off = TH / 2 + PUSH + row * (BH + BGAP) + BH / 2
-                lat_off = (col - (B_COLS - 1) / 2.0) * (BW + BGAP)
-                bcx = self.x + fx * fwd_off + rx * lat_off
-                bcy = self.y + fy * fwd_off + ry * lat_off
-                hw, hl = BW / 2, BH / 2
-                pts = [
-                    ws(bcx + fx * hl - rx * hw, bcy + fy * hl - ry * hw),
-                    ws(bcx + fx * hl + rx * hw, bcy + fy * hl + ry * hw),
-                    ws(bcx - fx * hl + rx * hw, bcy - fy * hl + ry * hw),
-                    ws(bcx - fx * hl - rx * hw, bcy - fy * hl - ry * hw),
+        bc_base = dim3(BARGE_COL, ambient * 0.60 + 0.12)
+        be_base = dim3(BARGE_TRIM, ambient * 0.55 + 0.12)
+        for barge in self.barges:
+            fwd_off = TH / 2 + PUSH + barge.row * (BH + BGAP) + BH / 2
+            lat_off = (barge.col - (B_COLS - 1) / 2.0) * (BW + BGAP)
+            bcx = self.x + fx * fwd_off + rx * lat_off
+            bcy = self.y + fy * fwd_off + ry * lat_off
+            hw, hl = BW / 2, BH / 2
+            pts = [
+                ws(bcx + fx * hl - rx * hw, bcy + fy * hl - ry * hw),
+                ws(bcx + fx * hl + rx * hw, bcy + fy * hl + ry * hw),
+                ws(bcx - fx * hl + rx * hw, bcy - fy * hl + ry * hw),
+                ws(bcx - fx * hl - rx * hw, bcy - fy * hl - ry * hw),
+            ]
+            pygame.draw.polygon(surf, bc_base, pts)
+            pygame.draw.polygon(surf, be_base, pts, 2)
+            # cargo load fill
+            if barge.cargo:
+                _, cargo_col = barge.cargo
+                cc = dim3(cargo_col, ambient * 0.55 + 0.12)
+                cargo_pts = [
+                    ws(bcx + fx * (hl * 0.72) - rx * (hw * 0.62),
+                       bcy + fy * (hl * 0.72) - ry * (hw * 0.62)),
+                    ws(bcx + fx * (hl * 0.72) + rx * (hw * 0.62),
+                       bcy + fy * (hl * 0.72) + ry * (hw * 0.62)),
+                    ws(bcx - fx * (hl * 0.72) + rx * (hw * 0.62),
+                       bcy - fy * (hl * 0.72) + ry * (hw * 0.62)),
+                    ws(bcx - fx * (hl * 0.72) - rx * (hw * 0.62),
+                       bcy - fy * (hl * 0.72) - ry * (hw * 0.62)),
                 ]
-                bc = dim3(BARGE_COL, ambient * 0.60 + 0.12)
-                be = dim3(BARGE_TRIM, ambient * 0.55 + 0.12)
-                pygame.draw.polygon(surf, bc, pts)
-                pygame.draw.polygon(surf, be, pts, 2)
-                # cargo hatch
-                if ambient > 0.35:
-                    mf = ws(bcx + fx * (hl * 0.5) - rx * (hw * 0.7),
-                            bcy + fy * (hl * 0.5) - ry * (hw * 0.7))
-                    mr = ws(bcx + fx * (hl * 0.5) + rx * (hw * 0.7),
-                            bcy + fy * (hl * 0.5) + ry * (hw * 0.7))
-                    pygame.draw.line(surf, be, mf, mr, 1)
+                pygame.draw.polygon(surf, cc, cargo_pts)
+            elif ambient > 0.35:
+                # empty hatch line
+                mf = ws(bcx + fx * (hl * 0.5) - rx * (hw * 0.7),
+                        bcy + fy * (hl * 0.5) - ry * (hw * 0.7))
+                mr = ws(bcx + fx * (hl * 0.5) + rx * (hw * 0.7),
+                        bcy + fy * (hl * 0.5) + ry * (hw * 0.7))
+                pygame.draw.line(surf, be_base, mf, mr, 1)
+            # tied indicator (small dot at bow edge)
+            if barge.tied:
+                bp = ws(bcx + fx * hl, bcy + fy * hl)
+                pygame.draw.circle(surf, (220, 200, 80), bp, 3)
 
         # ── Towboat hull ───────────────────────────────────────────────────────
         hw, hl = TW / 2, TH / 2
@@ -408,6 +637,10 @@ class Vessel:
                 pygame.draw.circle(gsurf, (*col, glow_a), (gr, gr), gr)
                 surf.blit(gsurf, (pos[0] - gr, pos[1] - gr))
 
+        # Deckhands
+        for dh in self.deckhands:
+            dh.draw(surf, self, cam_x, cam_y, ambient)
+
         # Hit flash
         if self.hit_cd > HIT_COOLDOWN - 15:
             fl = pygame.Surface((SW, SH), pygame.SRCALPHA)
@@ -415,10 +648,26 @@ class Vessel:
             surf.blit(fl, (0, 0))
 
 
+# ── Daily goal ─────────────────────────────────────────────────────────────────
+class DailyGoal:
+    def __init__(self, bid: str, dock_name: str, cargo_label: str, bonus: float = 180.0):
+        self.bid        = bid          # which barge (e.g. 'B0')
+        self.dock_name  = dock_name
+        self.cargo_label= cargo_label  # required cargo type
+        self.bonus      = bonus
+        self.completed  = False
+
+    def describe(self) -> str:
+        return f'{self.bid}  →  {self.dock_name}  [{self.cargo_label}]'
+
+
 # ── World generation ───────────────────────────────────────────────────────────
-def generate_world(river: RiverCurve):
+def generate_world(river: RiverCurve, dock_name_pool=None):
     """Pre-generate buoys, obstacles and docks for the full GEN_LIMIT range."""
     buoys, obstacles, docks = [], [], []
+    if dock_name_pool is None:
+        dock_name_pool = list(_FALLBACK_DOCK_NAMES)
+    rng_dock = random.Random(42)   # stable names across restarts within a session
 
     # Buoy pairs
     y = BUOY_SPACING
@@ -476,7 +725,16 @@ def generate_world(river: RiverCurve):
         dist = RIVER_HALF - 20
         dx = cx + side * px * dist
         dy = y  + side * py * dist
-        docks.append(Dock(dx, dy, side))
+        info = rng_dock.choice(dock_name_pool)
+        accepts  = [s.strip() for s in info.get('accepts', '').split(',') if s.strip()]
+        produces = [s.strip() for s in info.get('produces', '').split(',') if s.strip()]
+        dock = Dock(dx, dy, side, name=info['name'], accepts=accepts, produces=produces)
+        # 35 % chance a barge is already waiting at this dock
+        if rng_dock.random() < 0.35 and produces:
+            cargo_label = rng_dock.choice(produces)
+            cargo_col   = next((c for n, c in CARGO_TYPES if n == cargo_label), (120,120,80))
+            dock.available_barge = DockedBarge(dx, dy, 0.0, (cargo_label, cargo_col))
+        docks.append(dock)
         y += DOCK_INTERVAL
 
     return buoys, obstacles, docks
@@ -646,6 +904,43 @@ def draw_obstacles(surf, obstacles, cam_x, cam_y, ambient):
                     (sx - o.r * 2, sy - o.r // 2, o.r * 4, o.r))
 
 
+def draw_docked_barges(surf, docked_barges, cam_x, cam_y, ambient):
+    for db in docked_barges:
+        sx = int(db.wx - cam_x + SW // 2)
+        sy = int(db.wy - cam_y + VREF_Y)
+        if not (-120 < sx < SW + 120 and -120 < sy < SH + 120):
+            continue
+        r   = math.radians(db.heading)
+        fx  = math.sin(r);  fy  = math.cos(r)
+        rx  = math.cos(r);  ry  = -math.sin(r)
+        hw, hl = BW / 2, BH / 2
+        def _ws(dx, dy, _sx=sx, _sy=sy):
+            return (int(_sx + dx), int(_sy + dy))
+        pts = [
+            _ws( fx*hl - rx*hw,  fy*hl - ry*hw),
+            _ws( fx*hl + rx*hw,  fy*hl + ry*hw),
+            _ws(-fx*hl + rx*hw, -fy*hl + ry*hw),
+            _ws(-fx*hl - rx*hw, -fy*hl - ry*hw),
+        ]
+        bc = dim3(BARGE_COL, ambient * 0.55 + 0.12)
+        be = dim3(BARGE_TRIM, ambient * 0.50 + 0.12)
+        pygame.draw.polygon(surf, bc, pts)
+        pygame.draw.polygon(surf, be, pts, 2)
+        if db.cargo:
+            _, cc = db.cargo
+            cc = dim3(cc, ambient * 0.50 + 0.12)
+            cpts = [
+                _ws( fx*hl*0.7 - rx*hw*0.6,  fy*hl*0.7 - ry*hw*0.6),
+                _ws( fx*hl*0.7 + rx*hw*0.6,  fy*hl*0.7 + ry*hw*0.6),
+                _ws(-fx*hl*0.7 + rx*hw*0.6, -fy*hl*0.7 + ry*hw*0.6),
+                _ws(-fx*hl*0.7 - rx*hw*0.6, -fy*hl*0.7 - ry*hw*0.6),
+            ]
+            pygame.draw.polygon(surf, cc, cpts)
+        # Mooring line to dock
+        pygame.draw.line(surf, dim3((180, 155, 90), ambient * 0.5 + 0.1),
+                         _ws(0, 0), (sx + int(rx * (hw + 14)), sy + int(ry * (hw + 14))), 1)
+
+
 def draw_docks(surf, docks, cam_x, cam_y, ambient, active_dock, unload_t, game_hour):
     for d in docks:
         sx = int(d.wx - cam_x + SW // 2)
@@ -689,7 +984,8 @@ def draw_docks(surf, docks, cam_x, cam_y, ambient, active_dock, unload_t, game_h
 
 # ── HUD ────────────────────────────────────────────────────────────────────────
 def draw_hud(surf, vessel: Vessel, game_hour, score, dock_dist,
-             active_dock, unload_t, font, font_sm):
+             active_dock, unload_t, font, font_sm,
+             earnings=0.0, reward_msg='', reward_timer=0.0):
     h = int(game_hour)
     m = int((game_hour - h) * 60)
     time_str = f"{h:02d}:{m:02d}"
@@ -723,8 +1019,29 @@ def draw_hud(surf, vessel: Vessel, game_hour, score, dock_dist,
     # Time and score (top right)
     ts = font.render(time_str, True, (230, 220, 190))
     surf.blit(ts, (SW - ts.get_width() - 16, 14))
-    sc = font_sm.render(f"MILES: {int(score / 100)}", True, (190, 210, 190))
+    sc = font_sm.render(f"MILES: {int(score / 100)}   ${earnings:.0f}", True, (190, 210, 190))
     surf.blit(sc, (SW - sc.get_width() - 16, 14 + ts.get_height() + 4))
+
+    if reward_msg and reward_timer > 0:
+        alpha = min(255, int(reward_timer * 120))
+        rc = (80, 235, 120) if reward_timer > 1.0 else (235, 220, 80)
+        rl = font.render(reward_msg, True, rc)
+        surf.blit(rl, (SW // 2 - rl.get_width() // 2, SH - 100))
+
+
+def draw_goals(surf, goals, font_sm):
+    """Draw the daily goals list in the top-right below the earnings line."""
+    if not goals:
+        return
+    GX = SW - 310
+    GY = 70
+    for goal in goals:
+        done   = goal.completed
+        col    = (80, 220, 100) if done else (200, 195, 140)
+        prefix = '[x] ' if done else '[ ] '
+        lbl    = font_sm.render(prefix + goal.describe(), True, col)
+        surf.blit(lbl, (GX, GY))
+        GY += lbl.get_height() + 3
 
     # Dock approach indicator
     if dock_dist is not None and not active_dock:
@@ -874,8 +1191,10 @@ class PilotGame:
     def __init__(self, shift_duration=None, shift_start_time=START_HOUR,
                  cfg_time_scale=None, dev_mode=False):
         seed = random.randint(0, 99999)
-        self.river     = RiverCurve(seed)
-        self.buoys, self.obstacles, self.docks = generate_world(self.river)
+        self.river          = RiverCurve(seed)
+        self._dock_name_pool = self._load_dock_name_pool()
+        self.buoys, self.obstacles, self.docks = generate_world(
+            self.river, self._dock_name_pool)
 
         start_cx = self.river.cx(0)
         self.vessel = Vessel(start_cx, 0.0)
@@ -901,6 +1220,378 @@ class PilotGame:
         self.ai_vessels     = []
         self.traffic_timer  = 0.0
         self._traffic_pool  = self._load_traffic_pool()
+
+        # Deckhands
+        dh_names = self._load_deckhand_names()
+        self.vessel.deckhands = [
+            Deckhand(dh_names[i % len(dh_names)],
+                     DECKHAND_COLORS[i % len(DECKHAND_COLORS)])
+            for i in range(DECKHAND_COUNT)
+        ]
+        # Stagger starting positions across the towboat deck
+        offsets = [(-TH * 0.1, -8), (-TH * 0.1, 8), (TH * 0.25, 0)]
+        for dh, (f, l) in zip(self.vessel.deckhands, offsets):
+            dh.fwd, dh.lat = f, l
+        self._prev_docked   = False
+        self._barge_buttons = []
+        self.docked_barges       = []
+        self.free_barge_clusters = []
+        self.earnings       = 0.0
+        self._reward_msg    = ''
+        self._reward_timer  = 0.0
+
+        # Populate available barges from dock slots into the world
+        for dock in self.docks:
+            if dock.available_barge is not None:
+                self.docked_barges.append(dock.available_barge)
+                dock.available_barge = None
+
+        # Daily goals
+        self.daily_goals = self._generate_goals()
+
+    # ── Deckhand names ─────────────────────────────────────────────────────────
+    def _load_deckhand_names(self):
+        try:
+            from assets import GameDatabase
+            h = self.game_time % 24
+            shift = 'night' if (h >= 18 or h < 6) else 'day'
+            db   = GameDatabase()
+            rows = db.crew_list(vessel_name='MV Prairie Star')
+            db.close()
+            deck_roles = {'Deck Hand', 'Deck Lead'}
+            matched = [r['name'] for r in rows
+                       if r['name'] and r.get('role') in deck_roles
+                       and r.get('shift') == shift]
+            if not matched:
+                matched = [r['name'] for r in rows
+                           if r['name'] and r.get('role') in deck_roles]
+            if matched:
+                return matched
+        except Exception:
+            pass
+        return list(_DH_FALLBACK_NAMES)
+
+    # ── Dock name pool ────────────────────────────────────────────────────────
+    def _load_dock_name_pool(self):
+        try:
+            from assets import GameDatabase
+            db   = GameDatabase()
+            rows = db.dock_names()
+            db.close()
+            pool = [{'name': r['name'],
+                     'accepts':  r.get('accepts', '') or '',
+                     'produces': r.get('produces', '') or ''}
+                    for r in rows if r.get('name')]
+            if pool:
+                return pool
+        except Exception:
+            pass
+        return list(_FALLBACK_DOCK_NAMES)
+
+    # ── Daily goals ───────────────────────────────────────────────────────────
+    def _generate_goals(self):
+        """Pick 2-3 delivery goals: barge bid → dock accepting its cargo."""
+        goals = []
+        # Assign cargo to starting barges if they don't have any
+        for b in self.vessel.barges:
+            if not b.cargo:
+                b.cargo = random.choice(CARGO_TYPES)
+
+        cargo_labels = [b.cargo[0] for b in self.vessel.barges if b.cargo]
+        # Find docks that accept at least one starting cargo
+        candidate_docks = [d for d in self.docks
+                           if any(c in d.accepts for c in cargo_labels)]
+        random.shuffle(candidate_docks)
+
+        n_goals = min(3, len(candidate_docks), len(self.vessel.barges))
+        barges  = list(self.vessel.barges)
+        random.shuffle(barges)
+
+        used_docks = set()
+        for dock in candidate_docks:
+            if len(goals) >= n_goals:
+                break
+            if dock.name in used_docks:
+                continue
+            # Find a barge whose cargo this dock accepts
+            barge = next((b for b in barges
+                          if b.cargo and b.cargo[0] in dock.accepts), None)
+            if not barge:
+                continue
+            goals.append(DailyGoal(barge.bid, dock.name, barge.cargo[0],
+                                   bonus=180.0))
+            used_docks.add(dock.name)
+            barges.remove(barge)
+
+        return goals
+
+    def _check_goals(self, barge: TowBarge, dock):
+        """After a TIE action, check if any goal is satisfied."""
+        if not dock or not barge.cargo:
+            return
+        for goal in self.daily_goals:
+            if goal.completed:
+                continue
+            if goal.bid == barge.bid and goal.dock_name == dock.name \
+                    and goal.cargo_label == barge.cargo[0]:
+                goal.completed = True
+                self.earnings       += goal.bonus
+                self._reward_msg     = f'+${goal.bonus:.0f}  GOAL: {goal.describe()}'
+                self._reward_timer   = 4.0
+                break
+
+    # ── Deckhand surface / recall ──────────────────────────────────────────────
+    def _is_on_surface(self, fwd: float, lat: float) -> bool:
+        """Return True if (fwd, lat) is over the towboat deck or any attached barge."""
+        if abs(fwd) <= TH / 2 + 2 and abs(lat) <= TW / 2 + 2:
+            return True
+        for b in self.vessel.barges:
+            bf  = TH / 2 + PUSH + b.row * (BH + BGAP)
+            bl  = (b.col - (B_COLS - 1) / 2.0) * (BW + BGAP)
+            if bf - 2 <= fwd <= bf + BH + 2 and abs(lat - bl) <= BW / 2 + 2:
+                return True
+        return False
+
+    def _recall_stranded_deckhands(self):
+        """Send any deckhand standing over water back to the towboat."""
+        for dh in self.vessel.deckhands:
+            if not self._is_on_surface(dh.fwd, dh.lat):
+                dh.return_to_boat()
+
+    # ── Deckhand helpers ───────────────────────────────────────────────────────
+    def _idle_dh(self):
+        return next((dh for dh in self.vessel.deckhands if dh.state == 'idle'), None)
+
+    def _barge_local_pos(self, barge: TowBarge):
+        fwd = TH / 2 + PUSH + barge.row * (BH + BGAP) + BH / 2
+        lat = (barge.col - (B_COLS - 1) / 2.0) * (BW + BGAP)
+        return fwd, lat
+
+    def _update_deckhands(self, dt):
+        for dh in self.vessel.deckhands:
+            dh.update(dt)
+
+    # ── Barge button actions ───────────────────────────────────────────────────
+    def _handle_barge_button(self, action: str, row: int, col: int):
+        dh = self._idle_dh()
+        if not dh:
+            return
+        barge = next((b for b in self.vessel.barges
+                      if b.row == row and b.col == col), None)
+
+        if action == 'tie' and barge and not barge.tied:
+            tfwd, tlat = self._barge_local_pos(barge)
+            active = self.active_dock
+            def _tie(b=barge, g=self, d=active):
+                b.tied = True
+                g.earnings       += 20.0
+                g._reward_msg     = '+$20  BARGE TIED'
+                g._reward_timer   = 2.0
+                g._check_goals(b, d)
+            dh.assign('tie', tfwd, tlat, 2.0, _tie)
+
+        elif action == 'untie' and barge and barge.tied:
+            tfwd, tlat = self._barge_local_pos(barge)
+            def _untie(b=barge): b.tied = False
+            dh.assign('untie', tfwd, tlat, 1.5, _untie)
+
+        elif action == 'detach' and barge:
+            tfwd, tlat = self._barge_local_pos(barge)
+            fx, fy = self.vessel.fwd
+            rx, ry = self.vessel.rgt
+            bwx = self.vessel.x + fx * tfwd + rx * tlat
+            bwy = self.vessel.y + fy * tfwd + ry * tlat
+            hdg = self.vessel.heading
+            dl  = self.docked_barges
+            def _detach(b=barge, v=self.vessel,
+                        wx=bwx, wy=bwy, h=hdg, c=barge.cargo, g=self):
+                if b in v.barges:
+                    v.barges.remove(b)
+                    dl.append(DockedBarge(wx, wy, h, c))
+                g._recall_stranded_deckhands()
+            dh.assign('detach', tfwd, tlat, 2.2, _detach)
+
+        elif action == 'pickup':
+            # barge argument is a DockedBarge index stored in col
+            db_idx = col
+            if db_idx < len(self.docked_barges):
+                db = self.docked_barges[db_idx]
+                occupied = {(b.row, b.col) for b in self.vessel.barges}
+                free = [(r, c) for r in range(B_ROWS) for c in range(B_COLS)
+                        if (r, c) not in occupied]
+                if not free:
+                    return
+                nr, nc = free[0]
+                new_b  = TowBarge(nr, nc, db.cargo)
+                tfwd   = TH / 2 + PUSH + nr * (BH + BGAP) + BH / 2
+                tlat   = (nc - (B_COLS - 1) / 2.0) * (BW + BGAP)
+                dl     = self.docked_barges
+                def _pickup(b=new_b, v=self.vessel, di=db_idx):
+                    v.barges.append(b)
+                    if di < len(dl):
+                        dl.pop(di)
+                dh.assign('attach', tfwd, tlat, 2.5, _pickup)
+
+        elif action == 'load' and barge and not barge.cargo:
+            tfwd, tlat = self._barge_local_pos(barge)
+            cargo = random.choice(CARGO_TYPES)
+            def _load(b=barge, c=cargo): b.cargo = c
+            dh.assign('load', tfwd, tlat, 1.8, _load)
+
+        elif action == 'disconnect' and self.vessel.barges:
+            fx, fy = self.vessel.fwd
+            fl = self.vessel.form_length
+            cwx = self.vessel.x + fx * (TH / 2 + PUSH + fl / 2)
+            cwy = self.vessel.y + fy * (TH / 2 + PUSH + fl / 2)
+            cluster = FreeBargeCluster(cwx, cwy, self.vessel.heading,
+                                       list(self.vessel.barges))
+            self.free_barge_clusters.append(cluster)
+            self.vessel.barges.clear()
+            self._recall_stranded_deckhands()
+
+        elif action == 'connect':
+            fc_idx = col   # encoded as col
+            if fc_idx < len(self.free_barge_clusters):
+                fc = self.free_barge_clusters[fc_idx]
+                self.vessel.barges.extend(fc.barges)
+                self.free_barge_clusters.pop(fc_idx)
+
+        elif action == 'attach' and not barge:
+            new_b = TowBarge(row, col)
+            tfwd = TH / 2 + PUSH + row * (BH + BGAP) + BH / 2
+            tlat = (col - (B_COLS - 1) / 2.0) * (BW + BGAP)
+            def _attach(b=new_b, v=self.vessel): v.barges.append(b)
+            dh.assign('attach', tfwd, tlat, 2.5, _attach)
+
+    # ── Barge operations panel ─────────────────────────────────────────────────
+    def _draw_barge_panel(self, surf, font_sm, near_dock: bool):
+        self._barge_buttons = []
+        if not near_dock:
+            return
+
+        all_slots   = [(r, c) for r in range(B_ROWS) for c in range(B_COLS)]
+        occupied    = {(b.row, b.col): b for b in self.vessel.barges}
+        nearby_db   = self.docked_barges
+        # Free clusters within connect range
+        nearby_fc   = [(i, fc) for i, fc in enumerate(self.free_barge_clusters)
+                       if math.hypot(fc.wx - self.vessel.x,
+                                     fc.wy - self.vessel.y) < FreeBargeCluster.CONNECT_RADIUS * 3]
+
+        PX, BTN_W, BTN_H, ROW_H = 16, 54, 18, 30
+        PW = 16 + 110 + 3 * (BTN_W + 3) + 8
+        extra_rows = len(nearby_db) + len(nearby_fc) + (1 if self.vessel.barges else 0)
+        PH = 22 + (len(all_slots) + extra_rows) * ROW_H + 6
+        PY = SH - PH - 70   # sit just above compass / speed block
+
+        bg = pygame.Surface((PW, PH), pygame.SRCALPHA)
+        bg.fill((12, 18, 24, 190))
+        surf.blit(bg, (PX, PY))
+        pygame.draw.rect(surf, (55, 78, 88), (PX, PY, PW, PH), 1)
+
+        hdr = font_sm.render('BARGE OPS', True, (140, 195, 175))
+        surf.blit(hdr, (PX + 6, PY + 4))
+
+        y = PY + 22
+        for row, col in all_slots:
+            barge = occupied.get((row, col))
+
+            # Slot indicator
+            ind = (55, 190, 80) if (barge and barge.tied) else \
+                  (190, 160, 50) if barge else (60, 60, 70)
+            pygame.draw.rect(surf, ind, (PX + 6, y + 5, 9, 9))
+            lbl_txt = f'B{row}{col}' + (' [tied]' if barge and barge.tied else
+                                         ' [load]' if barge and barge.cargo else '')
+            surf.blit(font_sm.render(lbl_txt, True, (190, 190, 190)),
+                      (PX + 20, y + 2))
+
+            bx = PX + 118
+            if barge:
+                # TIE / UNTIE
+                if not barge.tied:
+                    tr = pygame.Rect(bx, y + 1, BTN_W, BTN_H)
+                    pygame.draw.rect(surf, (35, 110, 48), tr)
+                    pygame.draw.rect(surf, (70, 160, 85), tr, 1)
+                    surf.blit(font_sm.render('TIE', True, (170, 235, 175)),
+                              (tr.x + (BTN_W - font_sm.size('TIE')[0]) // 2, tr.y + 2))
+                    self._barge_buttons.append(('tie', row, col, tr))
+                else:
+                    tr = pygame.Rect(bx, y + 1, BTN_W, BTN_H)
+                    pygame.draw.rect(surf, (80, 55, 20), tr)
+                    pygame.draw.rect(surf, (140, 100, 45), tr, 1)
+                    surf.blit(font_sm.render('UNTIE', True, (235, 200, 140)),
+                              (tr.x + (BTN_W - font_sm.size('UNTIE')[0]) // 2, tr.y + 2))
+                    self._barge_buttons.append(('untie', row, col, tr))
+                bx += BTN_W + 3
+
+                # LOAD (send deckhand to load cargo)
+                lr = pygame.Rect(bx, y + 1, BTN_W, BTN_H)
+                pygame.draw.rect(surf, (30, 60, 110), lr)
+                pygame.draw.rect(surf, (60, 100, 165), lr, 1)
+                surf.blit(font_sm.render('LOAD', True, (160, 190, 240)),
+                          (lr.x + (BTN_W - font_sm.size('LOAD')[0]) // 2, lr.y + 2))
+                self._barge_buttons.append(('load', row, col, lr))
+                bx += BTN_W + 3
+
+                # DETACH
+                dr = pygame.Rect(bx, y + 1, BTN_W, BTN_H)
+                pygame.draw.rect(surf, (115, 38, 22), dr)
+                pygame.draw.rect(surf, (175, 72, 45), dr, 1)
+                surf.blit(font_sm.render('DETACH', True, (240, 172, 152)),
+                          (dr.x + (BTN_W - font_sm.size('DETACH')[0]) // 2, dr.y + 2))
+                self._barge_buttons.append(('detach', row, col, dr))
+
+            else:
+                # Empty slot — ATTACH
+                ar = pygame.Rect(bx, y + 1, BTN_W * 3 + 6, BTN_H)
+                pygame.draw.rect(surf, (28, 50, 90), ar)
+                pygame.draw.rect(surf, (55, 85, 140), ar, 1)
+                surf.blit(font_sm.render('ATTACH BARGE', True, (150, 185, 235)),
+                          (ar.x + (ar.width - font_sm.size('ATTACH BARGE')[0]) // 2,
+                           ar.y + 2))
+                self._barge_buttons.append(('attach', row, col, ar))
+
+            y += ROW_H
+
+        # Disconnect towboat from barge formation
+        if self.vessel.barges:
+            dc_r = pygame.Rect(PX + 6, y + 1, PW - 12, BTN_H)
+            pygame.draw.rect(surf, (90, 30, 30), dc_r)
+            pygame.draw.rect(surf, (160, 60, 50), dc_r, 1)
+            surf.blit(font_sm.render('DISCONNECT TOW FROM BARGES',
+                                     True, (240, 160, 140)),
+                      (dc_r.x + (dc_r.width - font_sm.size('DISCONNECT TOW FROM BARGES')[0]) // 2,
+                       dc_r.y + 2))
+            self._barge_buttons.append(('disconnect', 0, 0, dc_r))
+            y += ROW_H
+
+        # Connect to a nearby free cluster
+        for fc_idx, fc in nearby_fc:
+            n  = len(fc.barges)
+            lr = pygame.Rect(PX + 6, y + 1, PW - 12, BTN_H)
+            pygame.draw.rect(surf, (30, 75, 40), lr)
+            pygame.draw.rect(surf, (60, 140, 75), lr, 1)
+            surf.blit(font_sm.render(f'CONNECT TOW  ({n} barge{"s" if n != 1 else ""})',
+                                     True, (155, 235, 170)),
+                      (lr.x + (lr.width - font_sm.size(f'CONNECT TOW  ({n} barge{"s" if n != 1 else ""})')[0]) // 2,
+                       lr.y + 2))
+            self._barge_buttons.append(('connect', 0, fc_idx, lr))
+            y += ROW_H
+
+        # Docked barges available to pick up
+        for db_idx, db in enumerate(nearby_db):
+            cargo_lbl = db.cargo[0] if db.cargo else 'empty'
+            lbl = font_sm.render(f'DOCK {db_idx}  [{cargo_lbl}]',
+                                 True, (160, 180, 200))
+            surf.blit(lbl, (PX + 6, y + 2))
+            pu_r = pygame.Rect(PX + 118, y + 1, BTN_W * 3 + 6, BTN_H)
+            pygame.draw.rect(surf, (40, 80, 55), pu_r)
+            pygame.draw.rect(surf, (70, 140, 90), pu_r, 1)
+            surf.blit(font_sm.render('PICK UP', True, (160, 230, 175)),
+                      (pu_r.x + (pu_r.width - font_sm.size('PICK UP')[0]) // 2,
+                       pu_r.y + 2))
+            # row unused for pickup; col encodes index into docked_barges
+            self._barge_buttons.append(('pickup', 0, db_idx, pu_r))
+            y += ROW_H
 
     # ── Traffic pool ───────────────────────────────────────────────────────────
     def _load_traffic_pool(self):
@@ -942,13 +1633,37 @@ class PilotGame:
         return self.vessel.y
 
     # ── Nearest upcoming dock info ─────────────────────────────────────────────
+    def _barge_sample_points(self):
+        """Corners, edge midpoints, and centre of every barge in the formation."""
+        fx, fy = self.vessel.fwd
+        rx, ry = self.vessel.rgt
+        pts = []
+        for b in self.vessel.barges:
+            fwd_off = TH / 2 + PUSH + b.row * (BH + BGAP) + BH / 2
+            lat_off = (b.col - (B_COLS - 1) / 2.0) * (BW + BGAP)
+            cx = self.vessel.x + fx * fwd_off + rx * lat_off
+            cy = self.vessel.y + fy * fwd_off + ry * lat_off
+            hw, hl = BW / 2, BH / 2
+            pts += [
+                (cx, cy),                                          # centre
+                (cx + fx*hl - rx*hw, cy + fy*hl - ry*hw),         # bow-port
+                (cx + fx*hl + rx*hw, cy + fy*hl + ry*hw),         # bow-stbd
+                (cx - fx*hl - rx*hw, cy - fy*hl - ry*hw),         # stern-port
+                (cx - fx*hl + rx*hw, cy - fy*hl + ry*hw),         # stern-stbd
+                (cx + fx*hl,         cy + fy*hl        ),          # bow mid
+                (cx - fx*hl,         cy - fy*hl        ),          # stern mid
+                (cx - rx*hw,         cy - ry*hw        ),          # port mid
+                (cx + rx*hw,         cy + ry*hw        ),          # stbd mid
+            ]
+        return pts
+
     def _nearest_dock_dist(self):
-        bcx, bcy = self.vessel.barge_center
+        sample_pts = self._barge_sample_points()
         for d in self.docks:
             if not d.visited and d.wy > self.vessel.y:
-                dx = d.wx - bcx
-                dy = d.wy - bcy
-                return math.hypot(dx, dy), d
+                dist = min(math.hypot(px - d.wx, py - d.wy)
+                           for px, py in sample_pts) if sample_pts else float('inf')
+                return dist, d
         return None, None
 
     # ── Collision with banks ────────────────────────────────────────────────────
@@ -983,6 +1698,10 @@ class PilotGame:
             return
 
         self.vessel.update(keys)
+        if any(b.tied for b in self.vessel.barges):
+            self.vessel.speed    = 0.0
+            self.vessel.throttle = 0.0
+            self.vessel.yaw_vel  = 0.0
         self.wave_t += dt
 
         # Advance game time and shift clock
@@ -1003,6 +1722,13 @@ class PilotGame:
                     self.game_over = True
                     return
 
+        # Deckhands
+        self._update_deckhands(dt)
+
+        # Free barge clusters drift with current
+        for fc in self.free_barge_clusters:
+            fc.update()
+
         # AI traffic: spawn and update
         self.traffic_timer += dt
         if self.traffic_timer >= TRAFFIC_SPAWN_INTERVAL:
@@ -1015,14 +1741,24 @@ class PilotGame:
             if (av.wy - self.vessel.y) * av.direction > -TRAFFIC_CULL_DIST
         ]
 
+        # Earnings: hourly wage
+        self.earnings += self.HOURLY_WAGE * game_dt
+        if self._reward_timer > 0:
+            self._reward_timer -= dt
+
         # Docking logic
         if self.active_dock:
             self.unload_timer -= dt
             if self.unload_timer <= 0:
+                tied = sum(1 for b in self.vessel.barges if b.tied)
+                bonus = self.DOCK_BONUS + tied * 45.0
+                self.earnings        += bonus
+                self._reward_msg      = f'+${bonus:.0f}  DOCK COMPLETE'
+                self._reward_timer    = 3.5
                 self.active_dock.visited = True
                 self.active_dock  = None
                 self.unload_timer = 0.0
-                self.score       += 1   # count completed dock visits
+                self.score       += 1
         else:
             dist, nearest = self._nearest_dock_dist()
             if nearest and dist is not None and dist < DOCK_RADIUS:
@@ -1044,6 +1780,9 @@ class PilotGame:
 
         # Objects
         draw_obstacles(surf, self.obstacles, self.cam_x, self.cam_y, ambient)
+        draw_docked_barges(surf, self.docked_barges, self.cam_x, self.cam_y, ambient)
+        for fc in self.free_barge_clusters:
+            fc.draw(surf, self.cam_x, self.cam_y, ambient)
 
         dock_dist_val, nearest_d = self._nearest_dock_dist()
         draw_docks(surf, self.docks, self.cam_x, self.cam_y,
@@ -1070,7 +1809,19 @@ class PilotGame:
         # HUD
         draw_hud(surf, self.vessel, self.game_time, self.score,
                  dock_dist_val, self.active_dock, self.unload_timer,
-                 font, font_sm)
+                 font, font_sm,
+                 earnings=self.earnings,
+                 reward_msg=self._reward_msg,
+                 reward_timer=self._reward_timer)
+
+        # Daily goals panel
+        draw_goals(surf, self.daily_goals, font_sm)
+
+        # Barge operations panel (visible near dock)
+        dock_dist, _ = self._nearest_dock_dist()
+        near = (self.active_dock is not None or
+                (dock_dist is not None and dock_dist < DOCK_RADIUS * 2.5))
+        self._draw_barge_panel(surf, font_sm, near)
 
         if self.show_intro:
             draw_intro(surf, font_lg, font)
@@ -1120,6 +1871,11 @@ class PilotGame:
                             self.show_intro = False
                         else:
                             self.vessel.horn_timer = 30
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    for action, row, col, rect in self._barge_buttons:
+                        if rect.collidepoint(event.pos):
+                            self._handle_barge_button(action, row, col)
+                            break
 
             # Shift complete check
             if (self._shift_duration is not None

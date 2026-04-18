@@ -89,6 +89,15 @@ CREATE TABLE IF NOT EXISTS lock_radio (
     direction   TEXT,                        -- upstream / downstream
     message     TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS dock_names (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL UNIQUE,
+    side        TEXT,                        -- river-left / river-right / either
+    accepts     TEXT,                        -- comma-separated cargo types accepted for delivery
+    produces    TEXT,                        -- comma-separated cargo types available to load
+    notes       TEXT
+);
 """
 
 class GameDatabase:
@@ -413,6 +422,51 @@ class GameDatabase:
                          r['sender_type'], r['sender_name'], r['message'])
         return rows
 
+    # ── Dock names ────────────────────────────────────────────────────────────
+
+    def add_dock_name(
+        self,
+        name:     str,
+        *,
+        side:     str = None,
+        accepts:  str = None,
+        produces: str = None,
+        notes:    str = None,
+    ) -> int:
+        """Insert or update a dock record (upsert on name)."""
+        existing = self._rows(
+            "SELECT id FROM dock_names WHERE name = ?", (name,))
+        if existing:
+            self._run(
+                """UPDATE dock_names SET side=?, accepts=?, produces=?, notes=?
+                   WHERE name=?""",
+                (side, accepts, produces, notes, name),
+            )
+            return existing[0]['id']
+        return self._run(
+            """INSERT INTO dock_names (name, side, accepts, produces, notes)
+               VALUES (?, ?, ?, ?, ?)""",
+            (name, side, accepts, produces, notes),
+        )
+
+    def dock_names(
+        self,
+        *,
+        side:    str = None,
+        accepts: str = None,
+        limit:   int = 200,
+    ) -> list[dict]:
+        clauses, params = [], []
+        if side:
+            clauses.append("side = ?");      params.append(side)
+        if accepts:
+            clauses.append("accepts LIKE ?"); params.append(f'%{accepts}%')
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        return self._rows(
+            f"SELECT * FROM dock_names {where} ORDER BY name LIMIT ?",
+            (*params, limit),
+        )
+
     # ── Counts / summary ──────────────────────────────────────────────────────
 
     def summary(self) -> dict:
@@ -423,4 +477,5 @@ class GameDatabase:
             'ships':         self._rows("SELECT COUNT(*) AS n FROM ships")[0]['n'],
             'art_assets':    self._rows("SELECT COUNT(*) AS n FROM art_assets")[0]['n'],
             'lock_radio':    self._rows("SELECT COUNT(*) AS n FROM lock_radio")[0]['n'],
+            'dock_names':    self._rows("SELECT COUNT(*) AS n FROM dock_names")[0]['n'],
         }

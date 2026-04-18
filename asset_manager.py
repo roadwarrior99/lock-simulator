@@ -77,6 +77,7 @@ _SOURCE_DIR      = Path(__file__).parent / 'source_data'
 _FIRST_NAMES_CSV = _SOURCE_DIR / 'Popular_Baby_Names.csv'
 _LAST_NAMES_CSV  = _SOURCE_DIR / 'surnames.csv'
 _VESSELS_CSV     = _SOURCE_DIR / 'vessels.csv'
+_CITIES_CSV      = _SOURCE_DIR / 'us_cities.csv'
 
 # Cache so CSVs are only parsed once per process
 _name_pool_cache: dict = {}
@@ -264,6 +265,102 @@ def random_ship_record() -> dict:
         'cargo':       cargo,
         'notes':       None,
     }
+
+
+# ── Dock name generation ──────────────────────────────────────────────────────
+
+_DOCK_CARGO_TYPES = ['coal', 'grain', 'steel', 'gravel', 'corn']
+
+_DOCK_NAME_PATTERNS = [
+    '{city} Terminal',
+    '{city} Freight',
+    '{city} Wharf',
+    '{city} Landing',
+    '{city} River Dock',
+    '{city} Harbor',
+    '{county} Port',
+    '{county} Landing',
+    '{city} Grain Elevator',
+    '{city} Bulk Terminal',
+    '{county} River Terminal',
+    '{city} Industrial Dock',
+]
+
+_city_pool_cache: list = []
+
+
+def _load_city_pool() -> list[dict]:
+    """Parse us_cities.csv and return a list of {city, state, county} dicts."""
+    if _city_pool_cache:
+        return _city_pool_cache
+    with open(_CITIES_CSV, newline='', encoding='utf-8') as fh:
+        for row in csv.DictReader(fh):
+            city   = row.get('CITY', '').strip()
+            state  = row.get('STATE_CODE', '').strip()
+            county = row.get('COUNTY', '').strip()
+            if city and state:
+                _city_pool_cache.append({'city': city, 'state': state, 'county': county})
+    return _city_pool_cache
+
+
+def random_dock_name(city_pool: list[dict] = None) -> dict:
+    """
+    Return a dict ready for ``db.add_dock_name()`` built from a random US city.
+
+    Keys: name, side, accepts, produces, notes
+    """
+    pool = city_pool or _load_city_pool()
+    entry   = random.choice(pool)
+    pattern = random.choice(_DOCK_NAME_PATTERNS)
+    name    = pattern.format(city=entry['city'], county=entry['county'] or entry['city'])
+
+    # Assign 1-2 accepted cargo types and 1 produced type (no overlap)
+    shuffled = random.sample(_DOCK_CARGO_TYPES, len(_DOCK_CARGO_TYPES))
+    n_accepts  = random.randint(1, 2)
+    accepts    = shuffled[:n_accepts]
+    produces   = [shuffled[n_accepts]] if len(shuffled) > n_accepts else []
+
+    side = random.choice(['north', 'south', 'east', 'west', None])
+
+    return {
+        'name':     name,
+        'side':     side,
+        'accepts':  ','.join(accepts),
+        'produces': ','.join(produces),
+        'notes':    f"{entry['city']}, {entry['state']}",
+    }
+
+
+def gen_dock_names(db, count: int = 10, skip_existing: bool = True) -> list[dict]:
+    """
+    Generate *count* dock name records from us_cities.csv and save them to the DB.
+
+    Returns a list of the inserted dicts.
+    """
+    pool = _load_city_pool()
+    existing = {r['name'] for r in db.dock_names()} if skip_existing else set()
+
+    created = []
+    attempts = 0
+    max_attempts = count * 20   # avoid infinite loop on tiny pools
+    while len(created) < count and attempts < max_attempts:
+        attempts += 1
+        record = random_dock_name(pool)
+        if record['name'] in existing:
+            continue
+        db.add_dock_name(
+            record['name'],
+            side=record['side'],
+            accepts=record['accepts'],
+            produces=record['produces'],
+            notes=record['notes'],
+        )
+        existing.add(record['name'])
+        created.append(record)
+        logger.info("  [dock_name] %s  accepts=%s  produces=%s",
+                    record['name'], record['accepts'], record['produces'])
+
+    return created
 
 
 # ── Lock radio generation ─────────────────────────────────────────────────────
@@ -1228,6 +1325,14 @@ def build_parser():
                     help='Force a specific vessel type')
     gs.add_argument('--save',   action='store_true', help='Insert records into the ships table')
 
+    # -- gen-dock-names
+    gdn = sub.add_parser('gen-dock-names',
+                         help='Generate dock names from us_cities.csv and save to DB')
+    gdn.add_argument('--count',  type=int, default=10,
+                     help='Number of dock names to generate (default: 10)')
+    gdn.add_argument('--dry-run', action='store_true',
+                     help='Print names without saving to DB')
+
     # -- summary
     sub.add_parser('summary', help='Print row counts for each DB table')
 
@@ -1604,6 +1709,20 @@ def main():
                     row_id = db.add_ship(**ship)
                     logger.info("  [ship %d] %s", row_id, ship['name'])
                 print(f"\nSaved {len(records)} ship(s) to DB.")
+
+        elif args.cmd == 'gen-dock-names':
+            pool = _load_city_pool()
+            if args.dry_run:
+                records = [random_dock_name(pool) for _ in range(args.count)]
+                col = max(len(r['name']) for r in records)
+                for r in records:
+                    print(f"  {r['name']:<{col}}  accepts={r['accepts']:<20}  produces={r['produces']}")
+            else:
+                created = gen_dock_names(db, count=args.count)
+                col = max((len(r['name']) for r in created), default=0)
+                for r in created:
+                    print(f"  {r['name']:<{col}}  accepts={r['accepts']:<20}  produces={r['produces']}")
+                print(f"\n{len(created)} dock name(s) saved to DB.")
 
         elif args.cmd == 'summary':
             s = db.summary()
