@@ -25,20 +25,20 @@ import pygame
 # ── Display ────────────────────────────────────────────────────────────────────
 SW, SH  = 1200, 800
 FPS     = 60
-VREF_Y  = int(SH * 0.38)   # towboat sits this many pixels from the top of screen
+VREF_Y  = int(SH * 0.18)   # towboat sits this many pixels from the top of screen
 
 # ── River geometry (world units; 1 wu ≈ 1 px at 1:1 zoom) ────────────────────
-RIVER_HALF   = 165    # half-width of the full river
-CHANNEL_HALF = 90     # half-width of the safe navigable channel
-BUOY_SPACING = 195    # world-Y between consecutive buoy pairs
-OBS_STEP     = 265    # world-Y between obstacle placement tries
+RIVER_HALF   = 400    # half-width of the full river
+CHANNEL_HALF = 210     # half-width of the safe navigable channel
+BUOY_SPACING = 215    # world-Y between consecutive buoy pairs
+OBS_STEP     = 365    # world-Y between obstacle placement tries
 OBS_CHANCE   = 0.62   # probability an obstacle slot is actually filled
 DOCK_INTERVAL= 2500   # world-Y between terminal docks
 GEN_LIMIT    = 60_000 # world-Y extent of pre-generated world
 
 # ── Vessel dimensions ──────────────────────────────────────────────────────────
-TW, TH   = 42, 54          # towboat width × length along heading
-BW, BH   = 55, 76          # single barge width × length
+TW, TH   = 42, 74          # towboat width × length along heading
+BW, BH   = 55, 176          # single barge width × length
 BGAP     = 5               # gap between adjacent barge units
 PUSH     = 12              # space between towboat bow and barge stern
 
@@ -52,8 +52,8 @@ MAX_FWD  = 3.0    # world units/frame at full forward throttle
 MAX_REV  = 0.7    # world units/frame at full reverse
 ACCEL    = 0.055  # speed change per frame while key held
 DRAG     = 0.988  # speed multiplied each frame (water resistance)
-YAW_MAX  = 1.5    # degrees/frame at full steer and full speed
-YAW_DAMP = 0.78   # angular-velocity damped each frame
+YAW_MAX  = 0.55   # degrees/frame at full steer and full speed (bow-pivot: long lever arm)
+YAW_DAMP = 0.82   # angular-velocity damped each frame
 
 # ── Game time ──────────────────────────────────────────────────────────────────
 MINS_PER_SEC = 2.5    # game-minutes per real second
@@ -258,14 +258,21 @@ class Vessel:
         # Yaw  (sluggish barge tow — harder to turn at low speed)
         spd_f = min(1.0, abs(self.speed) / (MAX_FWD * 0.4))
         target_yaw = self.steer * YAW_MAX * spd_f
-        self.yaw_vel += (target_yaw - self.yaw_vel) * 0.18
+        self.yaw_vel += (target_yaw - self.yaw_vel) * 0.07
         self.yaw_vel *= YAW_DAMP
-        self.heading  = (self.heading + self.yaw_vel) % 360.0
 
-        # Translate
+        # Pivot around the barge bow: towboat (at rear) swings the stern,
+        # bow traces the path — like forklift / rear-wheel steering.
+        fx_old, fy_old = self.fwd
+        bow_d = TH / 2 + PUSH + FORM_L
+        bx = self.x + fx_old * bow_d
+        by = self.y + fy_old * bow_d
+        self.heading = (self.heading + self.yaw_vel) % 360.0
         fx, fy = self.fwd
-        self.x += fx * self.speed
-        self.y += fy * self.speed
+        bx += fx * self.speed
+        by += fy * self.speed
+        self.x = bx - fx * bow_d
+        self.y = by - fy * bow_d
 
     # ── Draw ───────────────────────────────────────────────────────────────────
     def draw(self, surf, cam_x, cam_y, ambient):
