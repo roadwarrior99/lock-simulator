@@ -211,6 +211,12 @@ class Vessel:
         return self.x + fx * d, self.y + fy * d
 
     @property
+    def barge_center(self):
+        fx, fy = self.fwd
+        d = TH / 2 + PUSH + FORM_L / 2
+        return self.x + fx * d, self.y + fy * d
+
+    @property
     def stern_pos(self):
         fx, fy = self.fwd
         return self.x - fx * TH / 2, self.y - fy * TH / 2
@@ -791,10 +797,11 @@ class PilotGame:
 
     # ── Nearest upcoming dock info ─────────────────────────────────────────────
     def _nearest_dock_dist(self):
+        bcx, bcy = self.vessel.barge_center
         for d in self.docks:
             if not d.visited and d.wy > self.vessel.y:
-                dx = d.wx - self.vessel.x
-                dy = d.wy - self.vessel.y
+                dx = d.wx - bcx
+                dy = d.wy - bcy
                 return math.hypot(dx, dy), d
         return None, None
 
