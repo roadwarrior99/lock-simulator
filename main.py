@@ -10,6 +10,7 @@ import logging
 from ld_sim import LockDamVisualizer
 from deckhand_sim import DeckHandSimulation
 from engineer_sim import EngineerSimulation
+from pilot_sim import PilotGame
 from campaign_save import save_campaign, load_campaign, default_progressions
 
 
@@ -46,9 +47,9 @@ class GameEngine:
         {
             'id':        'captain',
             'title':     'Boat Captain',
-            'desc':      ['Navigate your vessel', 'through the lock system.'],
+            'desc':      ['Pilot the towboat downriver.', 'Stay in the channel.'],
             'color':     (40, 145, 80),
-            'available': False,
+            'available': True,
         },
     ]
 
@@ -175,7 +176,40 @@ class GameEngine:
                 'cta': 'Press SPACE to begin',
             },
         ],
-        'captain':  [],
+        'captain': [
+            {
+                'location': 'MV Prairie Star  —  Upper Mississippi River',
+                'clock':    '5:30 AM',
+                'lines': [
+                    "The mate finds you on the deck before sunrise.",
+                    "The river is dark and the current is running hard.",
+                ],
+            },
+            {
+                'location': None,
+                'clock':    None,
+                'lines': [
+                    '"You know the tow. You know the locks."',
+                    '"Time to see if you know the river."',
+                    '',
+                    '"Stay in the channel — green to starboard, red to port."',
+                    '"Hit a sandbar and we lose half a day. Hit a rock and we',
+                    ' lose a lot more than that."',
+                ],
+            },
+            {
+                'location': None,
+                'clock':    None,
+                'lines': [
+                    '"Terminals will signal when they need unloading."',
+                    '"Come in slow. Real slow."',
+                    '',
+                    "He walks back to the engine room.",
+                    "The river doesn't wait.",
+                ],
+                'cta': 'Press SPACE to begin',
+            },
+        ],
     }
 
     STAGE_TIPS = {
@@ -195,7 +229,9 @@ class GameEngine:
             "The alternator charges batteries automatically while the engine runs clean.",
         ],
         'captain': [
-            "Coming soon.",
+            "Green buoys on your right, red on your left going downriver.",
+            "Come in dead slow to dock — under 0.9 knots to register contact.",
+            "[ESC] returns to menu and auto-saves your progress.",
         ],
     }
 
@@ -856,6 +892,60 @@ class GameEngine:
         self.screen_name = 'debrief'
         return result
 
+    def _launch_captain_shift(self):
+        """Configure and run one captain (towboat pilot) shift."""
+        prog     = self.progressions['captain']
+        is_night = prog['phase'] == 'nights'
+        start    = 20.0 if is_night else 6.0
+
+        vis = PilotGame(
+            shift_duration=12.0,
+            shift_start_time=start,
+            dev_mode=self.dev_mode,
+        )
+        vis._shift_phase_label = "Night" if is_night else "Day"
+        vis._shift_num_label   = f"{prog['shift_num']}"
+        vis._shift_clean_label = f"({prog['clean_shifts']}/5 clean)"
+
+        result = vis.run()
+
+        if result == 'quit':
+            return 'quit'
+
+        wages          = PilotGame.HOURLY_WAGE * vis.shift_hours_elapsed
+        bonuses        = PilotGame.DOCK_BONUS  * vis.score
+        shift_earnings = wages + bonuses
+        prog['total_earnings'] += shift_earnings
+
+        self.debrief_data = {
+            'completed':        result == 'shift_complete',
+            'incidents':        vis.incident_count,
+            'score':            vis.score,
+            'promoted_to_days': False,
+            'advanced':         False,
+            'wages':            wages,
+            'bonuses':          bonuses,
+            'shift_earnings':   shift_earnings,
+            'total_earnings':   prog['total_earnings'],
+            'debt':             self.debt,
+        }
+
+        if result == 'shift_complete':
+            prog['shift_num'] += 1
+            if vis.incident_count == 0:
+                prog['clean_shifts'] += 1
+                if prog['clean_shifts'] >= 5:
+                    if is_night:
+                        prog['phase']        = 'days'
+                        prog['clean_shifts'] = 0
+                        prog['shift_num']    = 1
+                        self.debrief_data['promoted_to_days'] = True
+                    else:
+                        self.debrief_data['advanced'] = True
+
+        self.screen_name = 'debrief'
+        return result
+
     def _launch_placeholder_shift(self, stage_id):
         """Stub for stages not yet implemented — shows a debrief immediately."""
         prog = self.progressions[stage_id]
@@ -884,6 +974,8 @@ class GameEngine:
             return self._launch_deckhand_shift()
         elif stage_id == 'engineer':
             return self._launch_engineer_shift()
+        elif stage_id == 'captain':
+            return self._launch_captain_shift()
         else:
             return self._launch_placeholder_shift(stage_id)
 
