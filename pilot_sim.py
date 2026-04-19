@@ -1897,13 +1897,16 @@ class PilotGame:
         if self.active_dock:
             self.unload_timer -= dt
             if self.unload_timer <= 0:
-                # Unloading complete — cast off automatically
-                tied = sum(1 for b in self.vessel.barges if b.tied)
+                # Unloading complete — check goals for every barge, then cast off
+                dock = self.active_dock
+                for b in self.vessel.barges:
+                    self._check_goals(b, dock)
+                tied  = sum(1 for b in self.vessel.barges if b.tied)
                 bonus = self.DOCK_BONUS + tied * 45.0
                 self.earnings             += bonus
                 self._reward_msg           = f'+${bonus:.0f}  DOCK COMPLETE'
                 self._reward_timer         = 3.5
-                self.active_dock.visited   = True
+                dock.visited               = True
                 self.active_dock           = None
                 self.unload_timer          = 0.0
                 self.tied_to_dock          = False
