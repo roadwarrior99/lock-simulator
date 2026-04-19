@@ -125,7 +125,7 @@ _FALLBACK_DOCK_NAMES = [
 
 # ── Game time ──────────────────────────────────────────────────────────────────
 MINS_PER_SEC = 2.5    # game-minutes per real second
-START_HOUR   = 6.1    # 6:06 AM  (pre-dawn → dawn → full day → dusk → night)
+START_HOUR   = 9.0    # 9:00 AM  — full daylight to ease the player in
 
 # ── Docking ────────────────────────────────────────────────────────────────────
 DOCK_SLOW    = 0.85   # max speed to register docking contact

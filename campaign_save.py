@@ -23,6 +23,7 @@ def default_progressions():
             'total_earnings': 0.0,
         }
     progs = {sid: _fresh() for sid in STAGE_IDS}
+    progs['captain']['phase'] = 'days'   # captain starts on day shifts
     # Operator tracks which ships have been seen and in which direction this week.
     # 'week' increments every 7 shifts; 'ships' maps name → {'last_dir': +1 or -1}.
     progs['operator']['ship_log'] = {'week': 0, 'ships': {}}

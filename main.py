@@ -896,7 +896,7 @@ class GameEngine:
         """Configure and run one captain (towboat pilot) shift."""
         prog     = self.progressions['captain']
         is_night = prog['phase'] == 'nights'
-        start    = 20.0 if is_night else 6.0
+        start    = 20.0 if is_night else 9.0   # day shifts start at 9 AM
 
         vis = PilotGame(
             shift_duration=12.0,
