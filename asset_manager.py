@@ -44,6 +44,9 @@ import random
 import sys
 from pathlib import Path
 
+from diffusers import ZImagePipeline, ZImageTransformer2DModel, GGUFQuantizationConfig
+import torch
+
 # Load .env from the project root if present (no external dependency needed)
 _env_path = Path(__file__).parent / '.env'
 if _env_path.exists():
@@ -1301,6 +1304,13 @@ def build_parser():
     img.add_argument('--out-dir',     default=IMAGE_OUTPUT_DIR)
     img.add_argument('--dry-run',     action='store_true',
                      help='Print the prompt, do not call the API')
+    #Zimage local generation
+    zimg = sub.add_parser('zimage', help='zimage local generation')
+    zimg.add_argument('--prompt', required=True)
+    zimg.add_argument('--out', default="test.png",)
+    zimg.add_argument('--count', default=1, type=int)
+    zimg.add_argument('--model', default="zimage", choices=["zimage", "qwen"])
+    zimg.add_argument('--negative', default="", type=str)
 
     # -- browse
     sub.add_parser('browse', help='Open the art_assets browser UI')
@@ -1733,9 +1743,84 @@ def main():
         elif args.cmd == 'audit':
             report = audit_gaps(db)
             _print_audit(report)
+        elif args.cmd == 'zimage':
+            local_image_gen(args.prompt, file_template=args.out, images_to_make=args.count, model=args.model, negative=args.negative)
 
     finally:
         db.close()
+
+def local_image_gen(prompt, file_template="test.png", images_to_make=1, model="zimage", negative=" "):
+    prompt = prompt
+    height = 1024
+    width = 1024
+
+    for i in range(images_to_make):
+        seed = random.randint(0, 2 ** 32 - 1)
+        # hf_path = "https://huggingface.co/jayn7/Z-Image-Turbo-GGUF/blob/main/z_image_turbo-Q3_K_M.gguf"
+        local_path = "/Users/colinhayes/.lmstudio/models/jayn7/Z-Image-Turbo-GGUF/z_image_turbo-Q4_K_S.gguf"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        if model == "zimage":
+
+            transformer = ZImageTransformer2DModel.from_single_file(
+                local_path,
+                quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
+                dtype=torch.bfloat16,
+            )
+
+            pipeline = ZImagePipeline.from_pretrained(
+                "Tongyi-MAI/Z-Image-Turbo",
+                transformer=transformer,
+                local_files_only=True,
+            ).to("mps")
+
+            images = pipeline(
+                prompt=prompt,
+                num_inference_steps=5,  # This actually results in 8 DiT forwards
+                guidance_scale=0.0,  # Guidance should be 0 for the Turbo models
+                height=height,
+                width=width,
+                generator=torch.Generator("cpu").manual_seed(seed)
+            ).images[0]
+            images.save(f"{file_template}_{i}.png")
+        elif model == "qwen":
+            #https://huggingface.co/unsloth/Qwen-Image-GGUF
+            from diffusers import DiffusionPipeline
+            model_name = "Qwen/Qwen-Image"
+            torch_dtype = torch.float32
+            device = "cpu"
+            pipe = DiffusionPipeline.from_pretrained(model_name, torch_dtype=torch_dtype)
+            pipe = pipe.to(device)
+
+            positive_magic = {
+                "en": ", Ultra HD, 4K, cinematic composition.",  # for english prompt
+            }
+
+
+            # Generate with different aspect ratios
+            aspect_ratios = {
+                "1:1": (1328, 1328),
+                "16:9": (1664, 928),
+                "9:16": (928, 1664),
+                "4:3": (1472, 1140),
+                "3:4": (1140, 1472),
+                "3:2": (1584, 1056),
+                "2:3": (1056, 1584),
+            }
+
+            width, height = aspect_ratios["1:1"]
+            logger.debug("Generating: ")
+            image = pipe(
+                prompt=prompt + positive_magic["en"],
+                negative_prompt=negative,
+                width=width,
+                height=height,
+                num_inference_steps=5,
+                true_cfg_scale=4.0,
+                generator=torch.Generator(device="cpu").manual_seed(seed)
+            ).images[0]
+
+            image.save(f"{file_template}_{i}.png")
+
 
 
 if __name__ == '__main__':
