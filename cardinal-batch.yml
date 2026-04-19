@@ -1,10 +1,11 @@
 # Batch configuration file for Cardinal directions
 # Specify the batch size, model, and other parameters for batch processing
 
-batch_size: 3
-model: zimage
+batch_size: 2
+model: qwen
 prompt: "cartoon missippi river barge cargo: {cargo} boat facing: {direction} weathered"
 negative_prompt: "no river background"
+inference_steps: 15
 tags: ["cargo", "direction"]
 cargo: ["coal", "empty"]
 direction: ["east", "west", "north", "south", "northeast", "southeast", "southwest", "northwest"]

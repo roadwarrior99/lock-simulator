@@ -44,6 +44,7 @@ import random
 import sys
 from pathlib import Path
 import yaml
+from diffusers import DiffusionPipeline
 
 from diffusers import ZImagePipeline, ZImageTransformer2DModel, GGUFQuantizationConfig
 import torch
@@ -1769,12 +1770,31 @@ def local_image_batch(config):
             file_names.append(config["file_template"])
         prompts = prompt_keyword_replacement(prompts,tag, config[tag])
         file_names = prompt_keyword_replacement(file_names,tag, config[tag])
+    pipe=None
+    if config["model"] == "zimage":
+        local_path = "/Users/colinhayes/.lmstudio/models/jayn7/Z-Image-Turbo-GGUF/z_image_turbo-Q4_K_S.gguf"
+        transformer = ZImageTransformer2DModel.from_single_file(
+            local_path,
+            quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
+            dtype=torch.bfloat16,
+        )
+        pipe = ZImagePipeline.from_pretrained(
+            "Tongyi-MAI/Z-Image-Turbo",
+            transformer=transformer,
+            local_files_only=True,
+        ).to("mps")
+    elif config["model"] == "qwen":
+        pipe = DiffusionPipeline.from_pretrained(
+            "Qwen/Qwen-Image", torch_dtype=torch.float32, local_files_only=True,
+        ).to("cpu")
+
     i = 0
     for prompt in prompts:
         file_name = file_names[i]
         logger.info("Starting batch for prompt %s with file: %s", prompt, file_name)
         local_image_gen(prompt, file_template=file_name, images_to_make=config["batch_size"],
-                        model=config["model"], negative=config["negative_prompt"])
+                        model=config["model"], negative=config["negative_prompt"], iterations=config["inference_steps"],
+                        pipe=pipe)
         i += 1
 
 def prompt_keyword_replacement(prompts,tag, *tags):
@@ -1788,77 +1808,58 @@ def prompt_keyword_replacement(prompts,tag, *tags):
 
 
 
-def local_image_gen(prompt, file_template="test.png", images_to_make=1, model="zimage", negative=" "):
-    prompt = prompt
+def local_image_gen(prompt, file_template="test.png", images_to_make=1, model="zimage", negative=" ", iterations=9
+                    , pipe=None):
     height = 1024
     width = 1024
 
-    for i in range(images_to_make):
-        seed = random.randint(0, 2 ** 32 - 1)
-        #https://huggingface.co/jayn7/Z-Image-Turbo-GGUF
-        # hf_path = "https://huggingface.co/jayn7/Z-Image-Turbo-GGUF/blob/main/z_image_turbo-Q3_K_M.gguf"
-        local_path = "/Users/colinhayes/.lmstudio/models/jayn7/Z-Image-Turbo-GGUF/z_image_turbo-Q4_K_S.gguf"
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        if model == "zimage":
+    os.environ["HF_HUB_OFFLINE"] = "1"
 
+    if model == "zimage":
+        if pipe is None:
+            local_path = "/Users/colinhayes/.lmstudio/models/jayn7/Z-Image-Turbo-GGUF/z_image_turbo-Q4_K_S.gguf"
             transformer = ZImageTransformer2DModel.from_single_file(
                 local_path,
                 quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
                 dtype=torch.bfloat16,
             )
-
             pipeline = ZImagePipeline.from_pretrained(
                 "Tongyi-MAI/Z-Image-Turbo",
                 transformer=transformer,
                 local_files_only=True,
             ).to("mps")
+        else:
+            pipeline = pipe
 
-            images = pipeline(
+        for i in range(images_to_make):
+            seed = random.randint(0, 2 ** 32 - 1)
+            image = pipeline(
                 prompt=prompt,
-                num_inference_steps=5,  # This actually results in 8 DiT forwards
-                guidance_scale=0.0,  # Guidance should be 0 for the Turbo models
+                num_inference_steps=iterations,
+                guidance_scale=0.0,
                 height=height,
                 width=width,
                 generator=torch.Generator("cpu").manual_seed(seed)
             ).images[0]
-            images.save(f"{file_template}_{i}.png")
-        elif model == "qwen":
-            #https://huggingface.co/unsloth/Qwen-Image-GGUF
-            from diffusers import DiffusionPipeline
-            model_name = "Qwen/Qwen-Image"
-            torch_dtype = torch.float32
-            device = "cpu"
-            pipe = DiffusionPipeline.from_pretrained(model_name, torch_dtype=torch_dtype)
-            pipe = pipe.to(device)
+            image.save(f"{file_template}_{i}.png")
 
-            positive_magic = {
-                "en": ", Ultra HD, 4K, cinematic composition.",  # for english prompt
-            }
+    elif model == "qwen":
+        if pipe is None:
+            pipe = DiffusionPipeline.from_pretrained(
+                "Qwen/Qwen-Image", torch_dtype=torch.float32, local_files_only=True,
+            ).to("cpu")
 
-
-            # Generate with different aspect ratios
-            aspect_ratios = {
-                "1:1": (1328, 1328),
-                "16:9": (1664, 928),
-                "9:16": (928, 1664),
-                "4:3": (1472, 1140),
-                "3:4": (1140, 1472),
-                "3:2": (1584, 1056),
-                "2:3": (1056, 1584),
-            }
-
-            width, height = aspect_ratios["1:1"]
-            logger.debug("Generating: ")
+        for i in range(images_to_make):
+            seed = random.randint(0, 2 ** 32 - 1)
             image = pipe(
-                prompt=prompt + positive_magic["en"],
+                prompt=prompt + ", Ultra HD, 4K, cinematic composition.",
                 negative_prompt=negative,
                 width=width,
                 height=height,
-                num_inference_steps=5,
+                num_inference_steps=iterations,
                 true_cfg_scale=4.0,
                 generator=torch.Generator(device="cpu").manual_seed(seed)
             ).images[0]
-
             image.save(f"{file_template}_{i}.png")
 
 
