@@ -43,6 +43,7 @@ import os
 import random
 import sys
 from pathlib import Path
+import yaml
 
 from diffusers import ZImagePipeline, ZImageTransformer2DModel, GGUFQuantizationConfig
 import torch
@@ -1295,7 +1296,7 @@ def build_parser():
 
     # -- image
     img = sub.add_parser('image', help='Generate an image with DALL-E 3')
-    img.add_argument('--prompt',      required=True)
+    img.add_argument('--prompt')
     img.add_argument('--category',    default=None,
                      help='Art category (background/character/ui/boat/environment)')
     img.add_argument('--campaign-id', default=None)
@@ -1305,12 +1306,13 @@ def build_parser():
     img.add_argument('--dry-run',     action='store_true',
                      help='Print the prompt, do not call the API')
     #Zimage local generation
-    zimg = sub.add_parser('zimage', help='zimage local generation')
-    zimg.add_argument('--prompt', required=True)
+    zimg = sub.add_parser('local_image', help='local image generation')
+    zimg.add_argument('--prompt')
     zimg.add_argument('--out', default="test.png",)
     zimg.add_argument('--count', default=1, type=int)
     zimg.add_argument('--model', default="zimage", choices=["zimage", "qwen"])
-    zimg.add_argument('--negative', default="", type=str)
+    zimg.add_argument('--negative', default=" ", type=str)
+    zimg.add_argument('--config', type=str, default=None)
 
     # -- browse
     sub.add_parser('browse', help='Open the art_assets browser UI')
@@ -1743,11 +1745,48 @@ def main():
         elif args.cmd == 'audit':
             report = audit_gaps(db)
             _print_audit(report)
-        elif args.cmd == 'zimage':
-            local_image_gen(args.prompt, file_template=args.out, images_to_make=args.count, model=args.model, negative=args.negative)
+        elif args.cmd == 'local_image':
+            if args.config:
+                if os.path.exists(args.config):
+                    with open(args.config, 'r') as f:
+                        config = yaml.safe_load(f)
+                        logger.info("Loaded config from %s", args.config)
+                        local_image_batch(config)
+            else:
+                local_image_gen(args.prompt, file_template=args.out, images_to_make=args.count, model=args.model, negative=args.negative)
 
     finally:
         db.close()
+
+def local_image_batch(config):
+    logger.info("Starting local image batch")
+    prompts = []
+    file_names = []
+    for tag in config["tags"]:
+        logger.info("Starting batch for tag %s", tag)
+        if len(prompts) == 0:
+            prompts.append(config["prompt"])
+            file_names.append(config["file_template"])
+        prompts = prompt_keyword_replacement(prompts,tag, config[tag])
+        file_names = prompt_keyword_replacement(file_names,tag, config[tag])
+    i = 0
+    for prompt in prompts:
+        file_name = file_names[i]
+        logger.info("Starting batch for prompt %s with file: %s", prompt, file_name)
+        local_image_gen(prompt, file_template=file_name, images_to_make=config["batch_size"],
+                        model=config["model"], negative=config["negative_prompt"])
+        i += 1
+
+def prompt_keyword_replacement(prompts,tag, *tags):
+        new_prompts = []
+        for prompt in prompts:
+            for keyword in tags[0]:
+                temp_prompt = prompt.replace("{" + tag + "}", keyword)
+                new_prompts.append(temp_prompt)
+        return new_prompts
+
+
+
 
 def local_image_gen(prompt, file_template="test.png", images_to_make=1, model="zimage", negative=" "):
     prompt = prompt
@@ -1756,6 +1795,7 @@ def local_image_gen(prompt, file_template="test.png", images_to_make=1, model="z
 
     for i in range(images_to_make):
         seed = random.randint(0, 2 ** 32 - 1)
+        #https://huggingface.co/jayn7/Z-Image-Turbo-GGUF
         # hf_path = "https://huggingface.co/jayn7/Z-Image-Turbo-GGUF/blob/main/z_image_turbo-Q3_K_M.gguf"
         local_path = "/Users/colinhayes/.lmstudio/models/jayn7/Z-Image-Turbo-GGUF/z_image_turbo-Q4_K_S.gguf"
         os.environ["HF_HUB_OFFLINE"] = "1"
