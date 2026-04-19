@@ -1206,10 +1206,27 @@ class AIVessel:
         self.captain     = captain
         self.speed       = (_AI_SPEEDS.get(vessel_type, 1.5)
                             * random.uniform(0.85, 1.15))
+        # Collision physics
+        self.vx_def    = 0.0   # lateral/longitudinal deflection velocity (wu/frame)
+        self.vy_def    = 0.0
+        self.hit_flash = 0     # frames remaining for red flash
 
     def update(self, river: RiverCurve):
+        # Forward travel along river
         self.wy += self.speed * self.direction
-        self.wx  = river.cx(self.wy)
+
+        # Apply deflection from collision impulse
+        self.wx += self.vx_def
+        self.wy += self.vy_def
+
+        # Decay deflection and drift back toward the channel centreline
+        self.vx_def *= 0.88
+        self.vy_def *= 0.88
+        channel_x    = river.cx(self.wy)
+        self.wx     += (channel_x - self.wx) * 0.04   # gradual return
+
+        if self.hit_flash > 0:
+            self.hit_flash -= 1
 
     def draw(self, surf, cam_x, cam_y, ambient, river: RiverCurve, wave_t, font_sm):
         sx = int(self.wx - cam_x + SW // 2)
@@ -1240,6 +1257,8 @@ class AIVessel:
         ]
         pygame.draw.polygon(surf, col, pts)
         pygame.draw.polygon(surf, trim, pts, 2)
+        if self.hit_flash > 0:
+            pygame.draw.polygon(surf, (255, 80, 80), pts, 3)
 
         # Nav lights at night
         glow_a = int(max(0, min(200, (0.55 - ambient) * 500)))
@@ -1739,9 +1758,16 @@ class PilotGame:
         return pts
 
     def _nearest_dock_dist(self):
+        """Return (distance, dock) for the nearest unvisited dock within range.
+
+        self.vessel.y is the towboat stern; barges extend ~VESSEL_L units forward.
+        We look from slightly behind the stern to well ahead of the bow so the
+        dock is findable while the formation is alongside it.
+        """
         sample_pts = self._barge_sample_points()
+        look_behind = VESSEL_L + DOCK_RADIUS   # how far behind stern to still check
         for d in self.docks:
-            if not d.visited and d.wy > self.vessel.y:
+            if not d.visited and d.wy > self.vessel.y - look_behind:
                 dist = min(math.hypot(px - d.wx, py - d.wy)
                            for px, py in sample_pts) if sample_pts else float('inf')
                 return dist, d
@@ -1765,13 +1791,53 @@ class PilotGame:
 
     # ── Collision with AI traffic ───────────────────────────────────────────────
     def _ai_collision(self):
+        """Detect and resolve collisions between the player tow and AI vessels.
+
+        Uses circle-vs-corner broadphase.  On contact, applies an impulse that:
+          • pushes the AI vessel away along the collision normal
+          • bounces the player vessel back and slightly sideways
+        Returns True on first hit frame so the damage / cooldown system fires.
+        """
+        hit = False
         for av in self.ai_vessels:
             hw, hl = _AI_DIMS.get(av.vessel_type, (10, 30))
-            r = math.hypot(hw, hl) + 4
+            radius = math.hypot(hw, hl) + 6   # slightly generous for feel
+
             for px, py in self.vessel.corners():
-                if math.hypot(px - av.wx, py - av.wy) < r:
-                    return True
-        return False
+                dist = math.hypot(px - av.wx, py - av.wy)
+                if dist >= radius:
+                    continue
+
+                # Collision normal: from player corner outward toward AI centre
+                if dist > 0.1:
+                    nx = (av.wx - px) / dist
+                    ny = (av.wy - py) / dist
+                else:
+                    nx, ny = 0.0, 1.0   # fallback if exactly overlapping
+
+                overlap   = radius - dist
+                # Push AI away (scaled by overlap depth + relative closing speed)
+                ai_mass   = 1.0   # relative; player tow is heavier
+                player_mass = 2.5
+                total     = ai_mass + player_mass
+                ai_push   = max(overlap * 0.6, 2.5)
+                av.vx_def += nx * ai_push * (player_mass / total)
+                av.vy_def += ny * ai_push * (player_mass / total)
+                av.hit_flash = 20
+
+                # Bounce player back along the reverse normal
+                fx, fy = self.vessel.fwd
+                # project normal onto vessel forward axis for longitudinal bounce
+                fwd_dot = nx * fx + ny * fy
+                player_push = ai_push * (ai_mass / total)
+                self.vessel.speed += -fwd_dot * player_push * 0.4
+                self.vessel.speed = max(-MAX_REV,
+                                        min(MAX_FWD, self.vessel.speed))
+
+                hit = True
+                break   # one corner per AI vessel per frame is enough
+
+        return hit
 
     # ── Update ─────────────────────────────────────────────────────────────────
     def update(self, keys, dt):
