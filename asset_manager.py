@@ -1771,6 +1771,8 @@ def local_image_batch(config):
         prompts = prompt_keyword_replacement(prompts,tag, config[tag])
         file_names = prompt_keyword_replacement(file_names,tag, config[tag])
     pipe=None
+
+    #load the models ahead of the main loop to save time between prompts.
     if config["model"] == "zimage":
         local_path = "/Users/colinhayes/.lmstudio/models/jayn7/Z-Image-Turbo-GGUF/z_image_turbo-Q4_K_S.gguf"
         transformer = ZImageTransformer2DModel.from_single_file(

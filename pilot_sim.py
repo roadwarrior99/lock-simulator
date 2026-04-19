@@ -941,7 +941,8 @@ def draw_docked_barges(surf, docked_barges, cam_x, cam_y, ambient):
                          _ws(0, 0), (sx + int(rx * (hw + 14)), sy + int(ry * (hw + 14))), 1)
 
 
-def draw_docks(surf, docks, cam_x, cam_y, ambient, active_dock, unload_t, game_hour):
+def draw_docks(surf, docks, cam_x, cam_y, ambient, active_dock, unload_t, game_hour,
+               tied_to_dock=False):
     for d in docks:
         sx = int(d.wx - cam_x + SW // 2)
         sy = int(d.wy - cam_y + VREF_Y)
@@ -972,14 +973,20 @@ def draw_docks(surf, docks, cam_x, cam_y, ambient, active_dock, unload_t, game_h
                     gsurf = pygame.Surface((24, 24), pygame.SRCALPHA)
                     pygame.draw.circle(gsurf, (*DOCK_LIT, 80), (12, 12), 12)
                     surf.blit(gsurf, (lx - 12, sy - 28))
-            # "DOCK" approach arrow if not visited
-            if not d.visited:
-                arrow_col = (255, 230, 60)
-                if is_active:
-                    arrow_col = (60, 255, 60)
-                font_sm = pygame.font.SysFont('monospace', 11, bold=True)
-                lbl = font_sm.render('DOCK', True, arrow_col)
-                surf.blit(lbl, (sx - lbl.get_width() // 2, sy - 38))
+            # Dock name label — always visible
+            name_font = pygame.font.SysFont('monospace', 11, bold=True)
+            name_col  = dim3((230, 220, 170), ambient * 0.6 + 0.35)
+            name_lbl  = name_font.render(d.name or 'TERMINAL', True, name_col)
+            surf.blit(name_lbl, (sx - name_lbl.get_width() // 2, sy - 52))
+            # Status prompt
+            if is_active and tied_to_dock:
+                prompt = name_font.render('TIED OFF  — T to cast off', True, (60, 255, 60))
+                surf.blit(prompt, (sx - prompt.get_width() // 2, sy - 38))
+            elif not d.visited:
+                prompt_col = (255, 230, 60)
+                prompt_txt = '[T] TIE OFF'
+                prompt = name_font.render(prompt_txt, True, prompt_col)
+                surf.blit(prompt, (sx - prompt.get_width() // 2, sy - 38))
 
 
 # ── HUD ────────────────────────────────────────────────────────────────────────
@@ -1103,7 +1110,7 @@ def draw_intro(surf, font_lg, font):
         ('Avoid rocks, sandbars and logs outside the channel', font, (210, 210, 210)),
         ('Pull into terminals when signalled — keep speed low', font, (210, 210, 210)),
         ('', font, (0, 0, 0)),
-        ('W/S  throttle     A/D  steer     SPACE  horn', font, (160, 200, 160)),
+        ('W/S  throttle     A/D  steer     SPACE  horn     T  tie/cast off', font, (160, 200, 160)),
         ('', font, (0, 0, 0)),
         ('Press  SPACE  to begin', font, (255, 220, 60)),
     ]
@@ -1113,6 +1120,58 @@ def draw_intro(surf, font_lg, font):
             r = fnt.render(txt, True, col)
             surf.blit(r, (SW // 2 - r.get_width() // 2, y))
         y += fnt.size('A')[1] + 8
+
+
+def draw_spotlight(surf, mouse_x, mouse_y, ambient):
+    """Cone of light from the towboat bow toward the mouse cursor.
+
+    The apex is always at the towboat's fixed screen position (SW//2, VREF_Y).
+    The beam sweeps as the operator moves the mouse, illuminating obstacles and
+    buoys ahead.  Outside the cone everything darkens with night.
+    """
+    if ambient >= 0.90:
+        return
+    darkness = max(0.0, min(1.0, (0.90 - ambient) / 0.75))
+    max_dark  = int(darkness * 225)
+    if max_dark < 2:
+        return
+
+    # Towboat is always at this fixed screen position (cam tracks vessel exactly)
+    bx, by = SW // 2, VREF_Y
+
+    mx, my = int(mouse_x), int(mouse_y)
+    dx, dy = mx - bx, my - by
+    dist   = math.hypot(dx, dy)
+    if dist < 1:
+        # Mouse on top of boat — illuminate a full circle so it's never blacked out
+        dx, dy, dist = 0, 1, 1
+
+    angle    = math.atan2(dy, dx)
+    beam_len = 1500         # pixels — exceeds screen diagonal so cone covers the full map
+    HALF     = math.radians(22)   # half-angle of bright core
+
+    def fan_poly(half_a, length, steps=28):
+        pts = [(bx, by)]
+        for i in range(steps + 1):
+            a = angle - half_a + 2 * half_a * i / steps
+            pts.append((int(bx + math.cos(a) * length),
+                        int(by + math.sin(a) * length)))
+        return pts
+
+    overlay = pygame.Surface((SW, SH), pygame.SRCALPHA)
+    overlay.fill((0, 2, 20, max_dark))
+
+    # Penumbra: draw from outermost (darkest) to innermost (transparent).
+    # Each layer overwrites the previous in the overlap region, so the
+    # final pixel alpha falls from max_dark at the edge to 0 at the core.
+    PENUMBRA = 14
+    for k in range(PENUMBRA, -1, -1):
+        t      = k / PENUMBRA               # 1 = outermost, 0 = core
+        half_a = HALF * (1.0 + t * 0.75)   # widens by up to 75% at edge
+        alph   = int(max_dark * (t ** 0.55))
+        pygame.draw.polygon(overlay, (0, 2, 20, alph), fan_poly(half_a, beam_len))
+
+    surf.blit(overlay, (0, 0))
 
 
 # ── AI river traffic vessel ────────────────────────────────────────────────────
@@ -1211,8 +1270,9 @@ class PilotGame:
         self.incident_count     = 0    # hull hits
 
         # Docking state
-        self.active_dock  = None
-        self.unload_timer = 0.0
+        self.active_dock   = None
+        self.unload_timer  = 0.0
+        self.tied_to_dock  = False   # True while lines are out at a dock
 
         self.wave_t = 0.0
 
@@ -1697,11 +1757,11 @@ class PilotGame:
         if self.game_over or self.show_intro:
             return
 
-        self.vessel.update(keys)
-        if any(b.tied for b in self.vessel.barges):
-            self.vessel.speed    = 0.0
-            self.vessel.throttle = 0.0
-            self.vessel.yaw_vel  = 0.0
+        if self.tied_to_dock or any(b.tied for b in self.vessel.barges):
+            # Lines out — skip physics entirely so current can't drift the vessel
+            pass
+        else:
+            self.vessel.update(keys)
         self.wave_t += dt
 
         # Advance game time and shift clock
@@ -1750,21 +1810,17 @@ class PilotGame:
         if self.active_dock:
             self.unload_timer -= dt
             if self.unload_timer <= 0:
+                # Unloading complete — cast off automatically
                 tied = sum(1 for b in self.vessel.barges if b.tied)
                 bonus = self.DOCK_BONUS + tied * 45.0
-                self.earnings        += bonus
-                self._reward_msg      = f'+${bonus:.0f}  DOCK COMPLETE'
-                self._reward_timer    = 3.5
-                self.active_dock.visited = True
-                self.active_dock  = None
-                self.unload_timer = 0.0
-                self.score       += 1
-        else:
-            dist, nearest = self._nearest_dock_dist()
-            if nearest and dist is not None and dist < DOCK_RADIUS:
-                if abs(self.vessel.speed) < DOCK_SLOW:
-                    self.active_dock  = nearest
-                    self.unload_timer = UNLOAD_TIME
+                self.earnings             += bonus
+                self._reward_msg           = f'+${bonus:.0f}  DOCK COMPLETE'
+                self._reward_timer         = 3.5
+                self.active_dock.visited   = True
+                self.active_dock           = None
+                self.unload_timer          = 0.0
+                self.tied_to_dock          = False
+                self.score                += 1
 
     # ── Draw ────────────────────────────────────────────────────────────────────
     def draw(self, surf, font, font_sm, font_lg):
@@ -1786,7 +1842,8 @@ class PilotGame:
 
         dock_dist_val, nearest_d = self._nearest_dock_dist()
         draw_docks(surf, self.docks, self.cam_x, self.cam_y,
-                   ambient, self.active_dock, self.unload_timer, self.game_time)
+                   ambient, self.active_dock, self.unload_timer, self.game_time,
+                   tied_to_dock=self.tied_to_dock)
 
         draw_buoys(surf, self.buoys, self.cam_x, self.cam_y,
                    ambient, self.wave_t)
@@ -1799,12 +1856,8 @@ class PilotGame:
         # Vessel (drawn on top of everything so it is always visible)
         self.vessel.draw(surf, self.cam_x, self.cam_y, ambient)
 
-        # Night overlay — darkens the whole view
-        if ambient < 0.95:
-            dark_a = int((1.0 - ambient) * 160)
-            night_ov = pygame.Surface((SW, SH), pygame.SRCALPHA)
-            night_ov.fill((0, 0, 15, dark_a))
-            surf.blit(night_ov, (0, 0))
+        # Night darkness with spotlight following mouse
+        draw_spotlight(surf, *pygame.mouse.get_pos(), ambient)
 
         # HUD
         draw_hud(surf, self.vessel, self.game_time, self.score,
@@ -1866,6 +1919,23 @@ class PilotGame:
                             start_cx = self.river.cx(self.vessel.y + 50)
                             self.vessel  = Vessel(start_cx, self.vessel.y + 50)
                             self.game_over = False
+                    elif event.key == pygame.K_t:
+                        # Tie off / cast off at dock
+                        if self.tied_to_dock:
+                            # Cast off manually (unloading cancelled)
+                            self.tied_to_dock = False
+                            self.active_dock  = None
+                            self.unload_timer = 0.0
+                        else:
+                            dist, nearest = self._nearest_dock_dist()
+                            if nearest and dist is not None and dist < DOCK_RADIUS:
+                                if abs(self.vessel.speed) < DOCK_SLOW:
+                                    self.tied_to_dock = True
+                                    self.active_dock  = nearest
+                                    self.unload_timer = UNLOAD_TIME
+                                    self.vessel.speed    = 0.0
+                                    self.vessel.throttle = 0.0
+                                    self.vessel.yaw_vel  = 0.0
                     elif event.key == pygame.K_SPACE:
                         if self.show_intro:
                             self.show_intro = False
