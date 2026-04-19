@@ -1148,7 +1148,7 @@ def draw_spotlight(surf, mouse_x, mouse_y, ambient):
 
     angle    = math.atan2(dy, dx)
     beam_len = 1500         # pixels — exceeds screen diagonal so cone covers the full map
-    HALF     = math.radians(22)   # half-angle of bright core
+    HALF     = math.radians(11)   # half-angle of bright core (narrow beam)
 
     def fan_poly(half_a, length, steps=28):
         pts = [(bx, by)]
@@ -1172,6 +1172,27 @@ def draw_spotlight(surf, mouse_x, mouse_y, ambient):
         pygame.draw.polygon(overlay, (0, 2, 20, alph), fan_poly(half_a, beam_len))
 
     surf.blit(overlay, (0, 0))
+
+
+def draw_dock_nav_lights(surf, docks, cam_x, cam_y, ambient):
+    """Re-draw dock light glows on top of the night overlay so they stay visible."""
+    if ambient >= 0.70:
+        return
+    # Brightness scales with how dark it is; lights are bright even far away
+    glow_a = int((1.0 - ambient / 0.70) * 200) + 55
+    for d in docks:
+        sx = int(d.wx - cam_x + SW // 2)
+        sy = int(d.wy - cam_y + VREF_Y)
+        if not (-120 < sx < SW + 120 and -120 < sy < SH + 120):
+            continue
+        # Larger halo — visible from distance through the darkness
+        for lx in (sx - 18, sx + 18):
+            gsurf = pygame.Surface((48, 48), pygame.SRCALPHA)
+            pygame.draw.circle(gsurf, (*DOCK_LIT, min(glow_a, 255)), (24, 24), 24)
+            surf.blit(gsurf, (lx - 24, sy - 40))
+        # Bright point on top
+        pygame.draw.circle(surf, DOCK_LIT, (sx - 18, sy - 16), 4)
+        pygame.draw.circle(surf, DOCK_LIT, (sx + 18, sy - 16), 4)
 
 
 # ── AI river traffic vessel ────────────────────────────────────────────────────
@@ -1858,6 +1879,9 @@ class PilotGame:
 
         # Night darkness with spotlight following mouse
         draw_spotlight(surf, *pygame.mouse.get_pos(), ambient)
+
+        # Dock nav lights drawn on top of night overlay so they pierce the darkness
+        draw_dock_nav_lights(surf, self.docks, self.cam_x, self.cam_y, ambient)
 
         # HUD
         draw_hud(surf, self.vessel, self.game_time, self.score,
