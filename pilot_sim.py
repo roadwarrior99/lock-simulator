@@ -1130,44 +1130,47 @@ def draw_road_traffic(surf, road_cars, rail_trains, river, cam_x, cam_y, ambient
 
     # ── Trains ────────────────────────────────────────────────────────────────
     for train in rail_trains:
-        tfx, tfy, tpx, tpy = _orient(train.wy)
         hw = RailTrain.CAR_W / 2
         d  = train.direction
 
-        # Locomotive
+        # Locomotive — orient at its own centre, keep nose orient for headlights
         loco_front = train.wy
         loco_cy    = loco_front - d * RailTrain.LOCO_L / 2
         loco_sy    = int(loco_cy - cam_y + VREF_Y)
         if -60 < loco_sy < SH + 60:
+            ltfx, ltfy, ltpx, ltpy = _orient(loco_cy)
             cx  = river.cx(loco_cy)
             lsx = int(cx - cam_x + SW // 2) + train.side * RAIL_LAT
             pts = _rect(lsx, loco_sy, hw + 1, RailTrain.LOCO_L / 2,
-                        tpx, tpy, tfx, tfy)
+                        ltpx, ltpy, ltfx, ltfy)
             pygame.draw.polygon(surf, dim3(train.loco_col, max(0.35, ambient)), pts)
             pygame.draw.polygon(surf, dim3((200, 200, 200), ambient * 0.5 + 0.3), pts, 1)
 
             if is_dark:
+                # Headlights use nose position orientation
+                ntfx, ntfy, ntpx, ntpy = _orient(loco_front)
                 nose_sy = int(loco_front - cam_y + VREF_Y)
                 nose_cx = river.cx(loco_front)
                 nose_sx = int(nose_cx - cam_x + SW // 2) + train.side * RAIL_LAT
-                fnx = nose_sx + int(tfx * RailTrain.LOCO_L / 2 * d)
-                fny = nose_sy + int(tfy * RailTrain.LOCO_L / 2 * d)
-                for lx, ly in [(fnx + int(tpx * 3), fny + int(tpy * 3)),
-                               (fnx - int(tpx * 3), fny - int(tpy * 3))]:
+                fnx = nose_sx + int(ntfx * RailTrain.LOCO_L / 2 * d)
+                fny = nose_sy + int(ntfy * RailTrain.LOCO_L / 2 * d)
+                for lx, ly in [(fnx + int(ntpx * 3), fny + int(ntpy * 3)),
+                               (fnx - int(ntpx * 3), fny - int(ntpy * 3))]:
                     pygame.draw.circle(surf, (255, 252, 210), (lx, ly), 4)
                     pygame.draw.circle(surf, (220, 210, 140), (lx, ly), 7, 1)
 
-        # Cars (trailing behind locomotive)
+        # Cars — each car orients itself to the track at its own position
         offset = RailTrain.LOCO_L + RailTrain.GAP
         for i, car_col in enumerate(train.car_cols):
             car_wy = train.wy - d * (offset + i * (RailTrain.CAR_L + RailTrain.GAP)
                                      + RailTrain.CAR_L / 2)
             car_sy = int(car_wy - cam_y + VREF_Y)
             if -40 < car_sy < SH + 40:
+                ctfx, ctfy, ctpx, ctpy = _orient(car_wy)
                 cx  = river.cx(car_wy)
                 csx = int(cx - cam_x + SW // 2) + train.side * RAIL_LAT
                 pts = _rect(csx, car_sy, hw, RailTrain.CAR_L / 2,
-                            tpx, tpy, tfx, tfy)
+                            ctpx, ctpy, ctfx, ctfy)
                 pygame.draw.polygon(surf, dim3(car_col, max(0.35, ambient)), pts)
                 pygame.draw.polygon(surf, dim3((160, 155, 148), ambient * 0.4 + 0.3), pts, 1)
 
