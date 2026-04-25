@@ -1542,33 +1542,42 @@ def draw_night_overlay(surf, mouse_x, mouse_y,
             punch_cone(lx, ly, ang, math.radians(22), 160)
             warm_cones.append((lx, ly, ang, math.radians(20), 155, (255, 252, 215)))
 
-    # ── Dock lamps — cone toward the river ────────────────────────────────────
+    # ── Dock lamps — radial 360° illumination ────────────────────────────────
+    dock_lights = []   # (lx, ly) for warm tint pass
     for d in docks:
         dsx = int(d.wx - cam_x + SW // 2)
         dsy = int(d.wy - cam_y + VREF_Y)
         if not (-130 < dsx < SW + 130 and -130 < dsy < SH + 130):
             continue
-        river_ang = math.atan2(0.0, river.cx(d.wy) - d.wx)
         for lx in (dsx - 18, dsx + 18):
-            punch_cone(lx, dsy - 16, river_ang, math.radians(55), 90, n_passes=6)
-            warm_cones.append((lx, dsy - 16, river_ang,
-                               math.radians(50), 85, (255, 242, 175)))
+            ly = dsy - 16
+            # Concentric circles from outer (dark) to inner (transparent) —
+            # same replace-alpha technique as punch_cone but radial.
+            RADIUS = 88
+            N = 8
+            for k in range(N, -1, -1):
+                t    = k / N
+                alph = int(max_dark * (t ** 0.55))
+                r    = max(1, int(RADIUS * (1.0 - (1.0 - t) * 0.12)))
+                pygame.draw.circle(overlay, (0, 2, 20, alph), (lx, ly), r)
+            dock_lights.append((lx, ly))
 
     # Blit darkness overlay — transparent holes now show the underlying scene
     surf.blit(overlay, (0, 0))
 
-    # Warm tint pass: alpha-composited cone tints the revealed areas with lamp colour
-    if warm_cones:
-        tint_a    = int(darkness * 50)
-        warm_surf = pygame.Surface((SW, SH), pygame.SRCALPHA)
-        for (ax, ay, ang, ha, ln, col) in warm_cones:
-            pts = [(ax, ay)]
-            for i in range(11):
-                a = ang - ha + 2 * ha * i / 10
-                pts.append((int(ax + math.cos(a) * ln),
-                             int(ay + math.sin(a) * ln)))
-            pygame.draw.polygon(warm_surf, (*col, tint_a), pts)
-        surf.blit(warm_surf, (0, 0))
+    # Warm tint pass: alpha-composited shapes tint the revealed areas with lamp colour
+    tint_a    = int(darkness * 50)
+    warm_surf = pygame.Surface((SW, SH), pygame.SRCALPHA)
+    for (ax, ay, ang, ha, ln, col) in warm_cones:
+        pts = [(ax, ay)]
+        for i in range(11):
+            a = ang - ha + 2 * ha * i / 10
+            pts.append((int(ax + math.cos(a) * ln),
+                         int(ay + math.sin(a) * ln)))
+        pygame.draw.polygon(warm_surf, (*col, tint_a), pts)
+    for (lx, ly) in dock_lights:
+        pygame.draw.circle(warm_surf, (255, 242, 175, tint_a), (lx, ly), 80)
+    surf.blit(warm_surf, (0, 0))
 
 
 def draw_dock_nav_lights(surf, docks, cam_x, cam_y, ambient):
