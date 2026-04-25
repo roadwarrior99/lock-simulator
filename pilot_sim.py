@@ -127,6 +127,48 @@ _FALLBACK_DOCK_NAMES = [
     {'name': 'Bayou Freight',      'accepts': 'gravel,corn', 'produces': 'grain'},
 ]
 
+# ── Road / rail bankside vehicles ─────────────────────────────────────────────
+_CAR_COLORS = [
+    (185,  40,  35), ( 35,  70, 185), (215, 200,  50),
+    ( 40, 155,  55), (185, 185, 185), ( 28,  28,  28),
+    (200, 130,  40), (155,  50, 155),
+]
+
+class RoadCar:
+    W = 7    # world units across road
+    L = 14   # world units along road
+    def __init__(self, wy, side, direction):
+        self.wy        = float(wy)
+        self.side      = side        # -1 left bank  +1 right bank
+        self.direction = direction   # +1 downstream  -1 upstream
+        self.speed     = random.uniform(1.6, 2.8)
+        self.color     = random.choice(_CAR_COLORS)
+    def update(self):
+        self.wy += self.speed * self.direction
+
+
+class RailTrain:
+    CAR_W = 9
+    CAR_L = 38
+    LOCO_L = 50
+    GAP    = 4
+    def __init__(self, wy, side, direction):
+        self.wy        = float(wy)   # front tip of locomotive
+        self.side      = side
+        self.direction = direction
+        self.speed     = random.uniform(0.65, 1.0)
+        self.n_cars    = random.randint(6, 14)
+        self.loco_col  = random.choice([(148, 32, 32), (32, 78, 162), (32, 102, 38)])
+        self.car_cols  = [random.choice([(60, 65, 72), (75, 50, 38), (56, 56, 56)])
+                          for _ in range(self.n_cars)]
+    def total_len(self):
+        return self.LOCO_L + self.n_cars * (self.CAR_L + self.GAP)
+    def tail_wy(self):
+        return self.wy - self.direction * self.total_len()
+    def update(self):
+        self.wy += self.speed * self.direction
+
+
 # ── Game time ──────────────────────────────────────────────────────────────────
 MINS_PER_SEC = 2.5    # game-minutes per real second
 START_HOUR   = 9.0    # 9:00 AM  — full daylight to ease the player in
@@ -1039,6 +1081,97 @@ def draw_bridges(surf, river, cam_x, cam_y, ambient):
             pygame.draw.line(surf, mark, p1, p2, 2)
 
 
+def draw_road_traffic(surf, road_cars, rail_trains, river, cam_x, cam_y, ambient):
+    """Draw cars on roads and trains on tracks along both river banks."""
+    is_dark = ambient < 0.55
+
+    ROAD_LAT = RIVER_HALF + 10   # lateral offset from river centre to road centre
+    RAIL_LAT  = RIVER_HALF + 31  # lateral offset to rail centre
+
+    def _orient(wy):
+        """Return (tfx, tfy, tpx, tpy) tangent & perpendicular at world-Y wy."""
+        dc = river.dcx(wy)
+        Lv = math.sqrt(1.0 + dc * dc)
+        return dc / Lv, 1.0 / Lv, 1.0 / Lv, -dc / Lv
+
+    def _rect(sx, sy, hw, hl, tpx, tpy, tfx, tfy):
+        return [
+            (int(sx + tpx * hw + tfx * hl), int(sy + tpy * hw + tfy * hl)),
+            (int(sx - tpx * hw + tfx * hl), int(sy - tpy * hw + tfy * hl)),
+            (int(sx - tpx * hw - tfx * hl), int(sy - tpy * hw - tfy * hl)),
+            (int(sx + tpx * hw - tfx * hl), int(sy + tpy * hw - tfy * hl)),
+        ]
+
+    # ── Cars ──────────────────────────────────────────────────────────────────
+    for car in road_cars:
+        sy = int(car.wy - cam_y + VREF_Y)
+        if sy < -30 or sy > SH + 30:
+            continue
+        cx  = river.cx(car.wy)
+        sx  = int(cx - cam_x + SW // 2) + car.side * ROAD_LAT
+        tfx, tfy, tpx, tpy = _orient(car.wy)
+        hw, hl = RoadCar.W / 2, RoadCar.L / 2
+        col = dim3(car.color, max(0.35, ambient))
+        pygame.draw.polygon(surf, col, _rect(sx, sy, hw, hl, tpx, tpy, tfx, tfy))
+
+        if is_dark:
+            # Headlights at front, taillights at rear
+            fnx = sx + int(tfx * hl * car.direction)
+            fny = sy + int(tfy * hl * car.direction)
+            rnx = sx - int(tfx * hl * car.direction)
+            rny = sy - int(tfy * hl * car.direction)
+            for lx, ly in [(fnx + int(tpx * 2), fny + int(tpy * 2)),
+                           (fnx - int(tpx * 2), fny - int(tpy * 2))]:
+                pygame.draw.circle(surf, (255, 250, 190), (lx, ly), 3)
+                pygame.draw.circle(surf, (200, 200, 100), (lx, ly), 5, 1)
+            for lx, ly in [(rnx + int(tpx * 2), rny + int(tpy * 2)),
+                           (rnx - int(tpx * 2), rny - int(tpy * 2))]:
+                pygame.draw.circle(surf, (210, 38, 38), (lx, ly), 2)
+
+    # ── Trains ────────────────────────────────────────────────────────────────
+    for train in rail_trains:
+        tfx, tfy, tpx, tpy = _orient(train.wy)
+        hw = RailTrain.CAR_W / 2
+        d  = train.direction
+
+        # Locomotive
+        loco_front = train.wy
+        loco_cy    = loco_front - d * RailTrain.LOCO_L / 2
+        loco_sy    = int(loco_cy - cam_y + VREF_Y)
+        if -60 < loco_sy < SH + 60:
+            cx  = river.cx(loco_cy)
+            lsx = int(cx - cam_x + SW // 2) + train.side * RAIL_LAT
+            pts = _rect(lsx, loco_sy, hw + 1, RailTrain.LOCO_L / 2,
+                        tpx, tpy, tfx, tfy)
+            pygame.draw.polygon(surf, dim3(train.loco_col, max(0.35, ambient)), pts)
+            pygame.draw.polygon(surf, dim3((200, 200, 200), ambient * 0.5 + 0.3), pts, 1)
+
+            if is_dark:
+                nose_sy = int(loco_front - cam_y + VREF_Y)
+                nose_cx = river.cx(loco_front)
+                nose_sx = int(nose_cx - cam_x + SW // 2) + train.side * RAIL_LAT
+                fnx = nose_sx + int(tfx * RailTrain.LOCO_L / 2 * d)
+                fny = nose_sy + int(tfy * RailTrain.LOCO_L / 2 * d)
+                for lx, ly in [(fnx + int(tpx * 3), fny + int(tpy * 3)),
+                               (fnx - int(tpx * 3), fny - int(tpy * 3))]:
+                    pygame.draw.circle(surf, (255, 252, 210), (lx, ly), 4)
+                    pygame.draw.circle(surf, (220, 210, 140), (lx, ly), 7, 1)
+
+        # Cars (trailing behind locomotive)
+        offset = RailTrain.LOCO_L + RailTrain.GAP
+        for i, car_col in enumerate(train.car_cols):
+            car_wy = train.wy - d * (offset + i * (RailTrain.CAR_L + RailTrain.GAP)
+                                     + RailTrain.CAR_L / 2)
+            car_sy = int(car_wy - cam_y + VREF_Y)
+            if -40 < car_sy < SH + 40:
+                cx  = river.cx(car_wy)
+                csx = int(cx - cam_x + SW // 2) + train.side * RAIL_LAT
+                pts = _rect(csx, car_sy, hw, RailTrain.CAR_L / 2,
+                            tpx, tpy, tfx, tfy)
+                pygame.draw.polygon(surf, dim3(car_col, max(0.35, ambient)), pts)
+                pygame.draw.polygon(surf, dim3((160, 155, 148), ambient * 0.4 + 0.3), pts, 1)
+
+
 # ── Object rendering ───────────────────────────────────────────────────────────
 def draw_buoys(surf, buoys, cam_x, cam_y, ambient, wave_t):
     for b in buoys:
@@ -1312,13 +1445,11 @@ def draw_intro(surf, font_lg, font):
         y += fnt.size('A')[1] + 8
 
 
-def draw_spotlight(surf, mouse_x, mouse_y, ambient):
-    """Cone of light from the towboat bow toward the mouse cursor.
-
-    The apex is always at the towboat's fixed screen position (SW//2, VREF_Y).
-    The beam sweeps as the operator moves the mouse, illuminating obstacles and
-    buoys ahead.  Outside the cone everything darkens with night.
-    """
+def draw_night_overlay(surf, mouse_x, mouse_y,
+                       road_cars, rail_trains, docks, river, cam_x, cam_y, ambient):
+    """Single darkness overlay with every light source punching a transparent cone
+    through it — player spotlight, car/train headlights, and dock lamps all reveal
+    the underlying scene geometry rather than merely adding color on top of black."""
     if ambient >= 0.90:
         return
     darkness = max(0.0, min(1.0, (0.90 - ambient) / 0.75))
@@ -1326,42 +1457,115 @@ def draw_spotlight(surf, mouse_x, mouse_y, ambient):
     if max_dark < 2:
         return
 
-    # Towboat is always at this fixed screen position (cam tracks vessel exactly)
-    bx, by = SW // 2, VREF_Y
-
-    mx, my = int(mouse_x), int(mouse_y)
-    dx, dy = mx - bx, my - by
-    dist   = math.hypot(dx, dy)
-    if dist < 1:
-        # Mouse on top of boat — illuminate a full circle so it's never blacked out
-        dx, dy, dist = 0, 1, 1
-
-    angle    = math.atan2(dy, dx)
-    beam_len = 1500         # pixels — exceeds screen diagonal so cone covers the full map
-    HALF     = math.radians(11)   # half-angle of bright core (narrow beam)
-
-    def fan_poly(half_a, length, steps=28):
-        pts = [(bx, by)]
-        for i in range(steps + 1):
-            a = angle - half_a + 2 * half_a * i / steps
-            pts.append((int(bx + math.cos(a) * length),
-                        int(by + math.sin(a) * length)))
-        return pts
-
     overlay = pygame.Surface((SW, SH), pygame.SRCALPHA)
     overlay.fill((0, 2, 20, max_dark))
 
-    # Penumbra: draw from outermost (darkest) to innermost (transparent).
-    # Each layer overwrites the previous in the overlap region, so the
-    # final pixel alpha falls from max_dark at the edge to 0 at the core.
-    PENUMBRA = 14
-    for k in range(PENUMBRA, -1, -1):
-        t      = k / PENUMBRA               # 1 = outermost, 0 = core
-        half_a = HALF * (1.0 + t * 0.75)   # widens by up to 75% at edge
-        alph   = int(max_dark * (t ** 0.55))
-        pygame.draw.polygon(overlay, (0, 2, 20, alph), fan_poly(half_a, beam_len))
+    # punch_cone: draws fan polygons with DECREASING alpha toward the cone centre.
+    # pygame.draw on SRCALPHA surfaces REPLACES pixel alpha, so inner passes
+    # overwrite outer ones — core ends at alpha=0 (fully transparent hole).
+    def punch_cone(apex_x, apex_y, cone_angle, half_a, length, n_passes=8, steps=14):
+        for k in range(n_passes, -1, -1):
+            t    = k / n_passes          # 1 = outermost, 0 = core
+            ha   = half_a * (1.0 + t * 0.55)
+            alph = int(max_dark * (t ** 0.55))
+            r    = length * (1.0 - t * 0.05)
+            pts  = [(apex_x, apex_y)]
+            for i in range(steps + 1):
+                a = cone_angle - ha + 2 * ha * i / steps
+                pts.append((int(apex_x + math.cos(a) * r),
+                             int(apex_y + math.sin(a) * r)))
+            pygame.draw.polygon(overlay, (0, 2, 20, alph), pts)
 
+    # ── Player spotlight ──────────────────────────────────────────────────────
+    bx, by = SW // 2, VREF_Y
+    dx, dy = int(mouse_x) - bx, int(mouse_y) - by
+    if math.hypot(dx, dy) < 1:
+        dx, dy = 0, 1
+    spot_angle = math.atan2(dy, dx)
+    # Preserve original spotlight penumbra (14 passes, widens 75% at edge)
+    SPOT_HALF = math.radians(11)
+    for k in range(14, -1, -1):
+        t      = k / 14
+        ha     = SPOT_HALF * (1.0 + t * 0.75)
+        alph   = int(max_dark * (t ** 0.55))
+        pts    = [(bx, by)]
+        for i in range(29):
+            a = spot_angle - ha + 2 * ha * i / 28
+            pts.append((int(bx + math.cos(a) * 1500),
+                         int(by + math.sin(a) * 1500)))
+        pygame.draw.polygon(overlay, (0, 2, 20, alph), pts)
+
+    ROAD_LAT = RIVER_HALF + 10
+    RAIL_LAT  = RIVER_HALF + 31
+    warm_cones = []   # (apex_x, apex_y, angle, half_a, length, col) for tint pass
+
+    # ── Car headlights ────────────────────────────────────────────────────────
+    for car in road_cars:
+        sy = int(car.wy - cam_y + VREF_Y)
+        if sy < -90 or sy > SH + 90:
+            continue
+        cx  = river.cx(car.wy)
+        sx  = int(cx - cam_x + SW // 2) + car.side * ROAD_LAT
+        dc  = river.dcx(car.wy)
+        Lv  = math.sqrt(1.0 + dc * dc)
+        tfx, tfy = dc / Lv, 1.0 / Lv
+        tpx, tpy = 1.0 / Lv, -dc / Lv
+        nsx = sx + int(tfx * RoadCar.L / 2 * car.direction)
+        nsy = sy + int(tfy * RoadCar.L / 2 * car.direction)
+        ang = math.atan2(tfy * car.direction, tfx * car.direction)
+        for sign in (-1, +1):
+            lx = nsx + int(tpx * RoadCar.W * 0.38 * sign)
+            ly = nsy + int(tpy * RoadCar.W * 0.38 * sign)
+            punch_cone(lx, ly, ang, math.radians(16), 95)
+            warm_cones.append((lx, ly, ang, math.radians(14), 90, (255, 248, 200)))
+
+    # ── Train headlights ──────────────────────────────────────────────────────
+    for train in rail_trains:
+        sy = int(train.wy - cam_y + VREF_Y)
+        if sy < -90 or sy > SH + 90:
+            continue
+        cx  = river.cx(train.wy)
+        sx  = int(cx - cam_x + SW // 2) + train.side * RAIL_LAT
+        dc  = river.dcx(train.wy)
+        Lv  = math.sqrt(1.0 + dc * dc)
+        tfx, tfy = dc / Lv, 1.0 / Lv
+        tpx, tpy = 1.0 / Lv, -dc / Lv
+        nsx = sx + int(tfx * RailTrain.LOCO_L / 2 * train.direction)
+        nsy = sy + int(tfy * RailTrain.LOCO_L / 2 * train.direction)
+        ang = math.atan2(tfy * train.direction, tfx * train.direction)
+        for sign in (-1, +1):
+            lx = nsx + int(tpx * 3.5 * sign)
+            ly = nsy + int(tpy * 3.5 * sign)
+            punch_cone(lx, ly, ang, math.radians(22), 160)
+            warm_cones.append((lx, ly, ang, math.radians(20), 155, (255, 252, 215)))
+
+    # ── Dock lamps — cone toward the river ────────────────────────────────────
+    for d in docks:
+        dsx = int(d.wx - cam_x + SW // 2)
+        dsy = int(d.wy - cam_y + VREF_Y)
+        if not (-130 < dsx < SW + 130 and -130 < dsy < SH + 130):
+            continue
+        river_ang = math.atan2(0.0, river.cx(d.wy) - d.wx)
+        for lx in (dsx - 18, dsx + 18):
+            punch_cone(lx, dsy - 16, river_ang, math.radians(55), 90, n_passes=6)
+            warm_cones.append((lx, dsy - 16, river_ang,
+                               math.radians(50), 85, (255, 242, 175)))
+
+    # Blit darkness overlay — transparent holes now show the underlying scene
     surf.blit(overlay, (0, 0))
+
+    # Warm tint pass: alpha-composited cone tints the revealed areas with lamp colour
+    if warm_cones:
+        tint_a    = int(darkness * 50)
+        warm_surf = pygame.Surface((SW, SH), pygame.SRCALPHA)
+        for (ax, ay, ang, ha, ln, col) in warm_cones:
+            pts = [(ax, ay)]
+            for i in range(11):
+                a = ang - ha + 2 * ha * i / 10
+                pts.append((int(ax + math.cos(a) * ln),
+                             int(ay + math.sin(a) * ln)))
+            pygame.draw.polygon(warm_surf, (*col, tint_a), pts)
+        surf.blit(warm_surf, (0, 0))
 
 
 def draw_dock_nav_lights(surf, docks, cam_x, cam_y, ambient):
@@ -1539,6 +1743,12 @@ class PilotGame:
         self.earnings       = 0.0
         self._reward_msg    = ''
         self._reward_timer  = 0.0
+
+        # Road / rail bankside traffic
+        self.road_cars    = []
+        self.rail_trains  = []
+        self._car_timer   = random.uniform(1.0, 3.0)
+        self._train_timer = random.uniform(12.0, 30.0)
 
         # Populate available barges from dock slots into the world
         for dock in self.docks:
@@ -2040,6 +2250,19 @@ class PilotGame:
 
         return hit
 
+    # ── Road / rail traffic spawning ───────────────────────────────────────────
+    def _spawn_road_car(self):
+        side      = random.choice((-1, 1))
+        direction = random.choice((-1, 1))
+        wy = (self.cam_y - VREF_Y - 60) if direction == 1 else (self.cam_y + (SH - VREF_Y) + 60)
+        self.road_cars.append(RoadCar(wy, side, direction))
+
+    def _spawn_rail_train(self):
+        side      = random.choice((-1, 1))
+        direction = random.choice((-1, 1))
+        wy = (self.cam_y - VREF_Y - 60) if direction == 1 else (self.cam_y + (SH - VREF_Y) + 60)
+        self.rail_trains.append(RailTrain(wy, side, direction))
+
     # ── Update ─────────────────────────────────────────────────────────────────
     def update(self, keys, dt):
         if self.game_over or self.show_intro:
@@ -2089,6 +2312,27 @@ class PilotGame:
             if (av.wy - self.vessel.y) * av.direction > -TRAFFIC_CULL_DIST
         ]
 
+        # Road / rail bankside traffic
+        self._car_timer -= dt
+        if self._car_timer <= 0:
+            self._spawn_road_car()
+            self._car_timer = random.uniform(1.5, 4.0)
+        self._train_timer -= dt
+        if self._train_timer <= 0:
+            self._spawn_rail_train()
+            self._train_timer = random.uniform(20.0, 50.0)
+        for c in self.road_cars:
+            c.update()
+        for t in self.rail_trains:
+            t.update()
+        view_top = self.cam_y - VREF_Y - 400
+        view_bot = self.cam_y + (SH - VREF_Y) + 400
+        self.road_cars   = [c for c in self.road_cars
+                            if view_top < c.wy < view_bot]
+        self.rail_trains = [t for t in self.rail_trains
+                            if view_top < t.wy < view_bot
+                            or view_top < t.tail_wy() < view_bot]
+
         # Earnings: hourly wage
         self.earnings += self.HOURLY_WAGE * game_dt
         if self._reward_timer > 0:
@@ -2129,6 +2373,10 @@ class PilotGame:
         # Roads, railroads, and bankside buildings
         draw_bankside_features(surf, self.river, self.cam_x, self.cam_y, ambient)
 
+        # Cars and trains on roads / tracks
+        draw_road_traffic(surf, self.road_cars, self.rail_trains,
+                          self.river, self.cam_x, self.cam_y, ambient)
+
         # Objects
         draw_obstacles(surf, self.obstacles, self.cam_x, self.cam_y, ambient)
         draw_docked_barges(surf, self.docked_barges, self.cam_x, self.cam_y, ambient)
@@ -2154,8 +2402,10 @@ class PilotGame:
         # Bridges drawn over vessels so the towboat appears to pass underneath
         draw_bridges(surf, self.river, self.cam_x, self.cam_y, ambient)
 
-        # Night darkness with spotlight following mouse
-        draw_spotlight(surf, *pygame.mouse.get_pos(), ambient)
+        # Single darkness overlay — spotlight + all other lights punch through together
+        draw_night_overlay(surf, *pygame.mouse.get_pos(),
+                           self.road_cars, self.rail_trains, self.docks,
+                           self.river, self.cam_x, self.cam_y, ambient)
 
         # Dock nav lights drawn on top of night overlay so they pierce the darkness
         draw_dock_nav_lights(surf, self.docks, self.cam_x, self.cam_y, ambient)
