@@ -227,26 +227,57 @@ NAV_WHITE = (230, 230, 195)
 
 # ── River curve ────────────────────────────────────────────────────────────────
 class RiverCurve:
-    """Smooth procedural river centreline: sum of three sinusoids.
+    """Procedural river centreline using Catmull-Rom spline through random control points.
+
+    Control points are placed every KNOT_STEP world-Y units via a biased random walk
+    that mixes dramatic bends, moderate curves, and straight runs.
 
     cx(y)  – X coordinate of the river centre at world-Y y
     dcx(y) – slope dx/dy (used to draw banks perpendicular to the flow)
     """
+    KNOT_STEP = 1400
 
     def __init__(self, seed=None):
-        rng = random.Random(seed)
-        # (amplitude wu, angular-frequency 1/wu, phase rad)
-        self._comp = [
-            (rng.uniform( 55, 100), rng.uniform(0.0018, 0.0027), rng.uniform(0, 6.28)),
-            (rng.uniform( 20,  45), rng.uniform(0.0065, 0.012 ), rng.uniform(0, 6.28)),
-            (rng.uniform(  6,  16), rng.uniform(0.022,  0.040 ), rng.uniform(0, 6.28)),
-        ]
+        rng  = random.Random(seed)
+        n    = GEN_LIMIT // self.KNOT_STEP + 10   # enough knots + Catmull-Rom lookahead
+        knots = [0.0]
+        straight = 0
+        for _ in range(n):
+            prev = knots[-1]
+            if straight > 0:
+                delta = rng.uniform(-22, 22)
+                straight -= 1
+            else:
+                r = rng.random()
+                if r < 0.22:                                        # dramatic bend
+                    delta = rng.choice([-1, 1]) * rng.uniform(360, 540)
+                elif r < 0.58:                                      # moderate curve
+                    delta = rng.choice([-1, 1]) * rng.uniform(100, 360)
+                else:                                               # gentle; go straight a while
+                    delta = rng.choice([-1, 1]) * rng.uniform(25, 100)
+                    straight = rng.randint(1, 4)
+            new_x = prev + delta - prev * 0.07   # centre-bias keeps river on screen
+            knots.append(max(-660, min(660, new_x)))
+        self._knots = knots
+
+    @staticmethod
+    def _cr(p0, p1, p2, p3, t):
+        return 0.5 * (2*p1 + (-p0+p2)*t + (2*p0-5*p1+4*p2-p3)*t*t
+                      + (-p0+3*p1-3*p2+p3)*t*t*t)
 
     def cx(self, y: float) -> float:
-        return sum(A * math.sin(w * y + p) for A, w, p in self._comp)
+        if y <= 0:
+            return self._knots[0]
+        tf = y / self.KNOT_STEP
+        i  = int(tf)
+        t  = tf - i
+        n  = len(self._knots)
+        k  = [self._knots[max(0, min(j, n-1))] for j in (i-1, i, i+1, i+2)]
+        return self._cr(*k, t)
 
     def dcx(self, y: float) -> float:
-        return sum(A * w * math.cos(w * y + p) for A, w, p in self._comp)
+        h = 2.0
+        return (self.cx(y + h) - self.cx(y - h)) / (2 * h)
 
 
 # ── World objects ──────────────────────────────────────────────────────────────
@@ -338,6 +369,29 @@ class Dock:
         self.accepts        = accepts or []   # cargo types this dock receives
         self.produces       = produces or []  # cargo types available to load here
         self.available_barge= None            # DockedBarge waiting for pickup, or None
+
+
+class Tributary:
+    """A narrow river channel branching off one bank into the surrounding land."""
+    __slots__ = ('wy', 'side', 'angle_deg', 'half_width', 'length')
+    def __init__(self, wy, side, angle_deg, half_width=72, length=520):
+        self.wy         = wy
+        self.side       = side        # -1 left bank, +1 right bank
+        self.angle_deg  = angle_deg   # degrees off perpendicular (toward downstream)
+        self.half_width = half_width
+        self.length     = length
+
+
+class Marina:
+    """A sheltered rectangular harbour inlet with finger piers."""
+    __slots__ = ('wy', 'side', 'half_width', 'depth', 'n_slips', 'slip_len')
+    def __init__(self, wy, side, half_width=155, depth=340, n_slips=5, slip_len=90):
+        self.wy         = wy
+        self.side       = side
+        self.half_width = half_width
+        self.depth      = depth
+        self.n_slips    = n_slips
+        self.slip_len   = slip_len
 
 
 # ── Barge unit ────────────────────────────────────────────────────────────────
@@ -719,8 +773,8 @@ class DailyGoal:
 
 # ── World generation ───────────────────────────────────────────────────────────
 def generate_world(river: RiverCurve, dock_name_pool=None):
-    """Pre-generate buoys, obstacles and docks for the full GEN_LIMIT range."""
-    buoys, obstacles, docks = [], [], []
+    """Pre-generate buoys, obstacles, docks, tributaries, and marinas."""
+    buoys, obstacles, docks, tributaries, marinas = [], [], [], [], []
     if dock_name_pool is None:
         dock_name_pool = list(_FALLBACK_DOCK_NAMES)
     rng_dock = random.Random(42)   # stable names across restarts within a session
@@ -793,7 +847,37 @@ def generate_world(river: RiverCurve, dock_name_pool=None):
         docks.append(dock)
         y += DOCK_INTERVAL
 
-    return buoys, obstacles, docks
+    # Tributaries — branch off alternating banks
+    rng_t    = random.Random(7)
+    trib_y   = rng_t.randint(4000, 8000)
+    trib_side = 1
+    while trib_y < GEN_LIMIT:
+        tributaries.append(Tributary(
+            wy         = trib_y,
+            side       = trib_side,
+            angle_deg  = rng_t.uniform(0, 15) if rng_t.random() < 0.35
+                         else rng_t.uniform(35, 72),
+            half_width = rng_t.uniform(52, 88),
+            length     = rng_t.uniform(360, 680),
+        ))
+        trib_side *= -1
+        trib_y   += rng_t.randint(6500, 13000)
+
+    # Marinas — occasional wide harbour inlets
+    rng_m   = random.Random(13)
+    marina_y = rng_m.randint(8000, 16000)
+    while marina_y < GEN_LIMIT:
+        marinas.append(Marina(
+            wy         = marina_y,
+            side       = rng_m.choice((-1, 1)),
+            half_width = rng_m.uniform(125, 175),
+            depth      = rng_m.uniform(270, 420),
+            n_slips    = rng_m.randint(4, 7),
+            slip_len   = rng_m.uniform(72, 105),
+        ))
+        marina_y += rng_m.randint(16000, 28000)
+
+    return buoys, obstacles, docks, tributaries, marinas
 
 
 # ── Ambient / sky ──────────────────────────────────────────────────────────────
@@ -908,6 +992,174 @@ def draw_river(surf, river: RiverCurve, cam_x, cam_y, ambient, wave_t):
             if 0 <= tx < SW and 0 <= ty < SH:
                 pygame.draw.line(surf, trunk_col, (tx, ty + 8), (tx, ty - 2), 2)
                 pygame.draw.circle(surf, tree_col, (tx, ty - 4), 8)
+
+
+# ── Tributaries & Marinas ────────────────────────────────────────────────────
+
+def draw_tributaries_marinas(surf, tributaries, marinas, river, cam_x, cam_y, ambient):
+    """Draw snaking tributary inlets and marina basins.
+    Called AFTER draw_bankside_features so tributary water overwrites roads at crossings,
+    then bridge decks are drawn on top of the water."""
+    water_col       = lerp3(WATER_DAY, WATER_NIGHT, 1.0 - ambient)
+    mud_col         = dim3((110, 90, 60), ambient)
+    pier_col        = dim3((90, 70, 45), ambient)
+    bridge_road_col = dim3((145, 138, 125), ambient)
+    bridge_rail_col = dim3((72, 76, 82), ambient)
+    rail_col        = dim3((140, 134, 126), ambient)
+
+    top_y = int(cam_y - VREF_Y - 300)
+    bot_y = int(cam_y + (SH - VREF_Y) + 300)
+
+    def w2s(wx, wy):
+        return int(wx - cam_x + SW // 2), int(wy - cam_y + VREF_Y)
+
+    def river_basis(wy):
+        dc = river.dcx(wy)
+        L  = math.sqrt(1.0 + dc * dc)
+        return dc / L, 1.0 / L, 1.0 / L, -dc / L  # tfx, tfy, tpx, tpy
+
+    # ── Tributaries ──────────────────────────────────────────────────────────
+    for trib in tributaries:
+        wy = trib.wy
+        if not (top_y - trib.length <= wy <= bot_y + trib.length):
+            continue
+        cx = river.cx(wy)
+        tfx, tfy, tpx, tpy = river_basis(wy)
+
+        # Bank attachment point
+        bx = cx + trib.side * tpx * RIVER_HALF
+        by = wy + trib.side * tpy * RIVER_HALF
+
+        # Main outward direction (perpendicular to bank, angled toward downstream)
+        angle_rad = math.radians(trib.angle_deg)
+        sin_a = math.sin(angle_rad)
+        ox_raw = trib.side * tpx + sin_a * tfx
+        oy_raw = trib.side * tpy + sin_a * tfy
+        L_ox = math.sqrt(ox_raw * ox_raw + oy_raw * oy_raw)
+        ox = ox_raw / L_ox
+        oy = oy_raw / L_ox
+        # Perpendicular to tributary axis (left-of-flow side)
+        sx_t = -oy;  sy_t = ox
+
+        # Smooth sinusoidal meander — anchored at 0 at the mouth, sine forced
+        # to start at 0 so the tributary exits the bank cleanly.
+        rng_s  = random.Random(int(trib.wy * 1.7 + trib.side * 999))
+        N      = 16
+        amp    = rng_s.uniform(0.12, 0.26) * trib.half_width
+        freq   = rng_s.uniform(0.8, 2.2)   # half-cycles across full length
+        drifts = [amp * math.sin(freq * math.pi * (i / N)) for i in range(N + 1)]
+
+        # Build left/right edge polylines along the snaking centreline
+        left_pts  = []
+        right_pts = []
+        for i in range(N + 1):
+            t = i / N
+            dist = t * trib.length
+            # Width tapers from full at mouth to ~22% at tip
+            w = trib.half_width * (1.0 - t * 0.78) + trib.half_width * 0.22
+            drift = drifts[i]
+            mcx = bx + ox * dist + sx_t * drift
+            mcy = by + oy * dist + sy_t * drift
+            left_pts .append(w2s(mcx + sx_t * w, mcy + sy_t * w))
+            right_pts.append(w2s(mcx - sx_t * w, mcy - sy_t * w))
+
+        poly = left_pts + list(reversed(right_pts))
+        if len(poly) >= 3:
+            pygame.draw.polygon(surf, water_col, poly)
+            pygame.draw.polygon(surf, mud_col, poly, 2)
+
+        # ── Bridge decks at road & rail crossings ─────────────────────────────
+        # The lateral distance from bank to road midpoint is 10 wu, rail is 31 wu.
+        # Distance along tributary axis to reach those lateral offsets = offset * L_ox.
+        for lat_off, deck_hw, bridge_col, is_rail in [
+            (10.0, 7,  bridge_road_col, False),
+            (31.0, 5,  bridge_rail_col, True),
+        ]:
+            cross_dist = lat_off * L_ox
+            if cross_dist >= trib.length:
+                continue
+            tc = cross_dist / trib.length
+            w_cross = trib.half_width * (1.0 - tc * 0.78) + trib.half_width * 0.22
+            # Interpolate drift at crossing
+            fi = tc * N
+            di = min(int(fi), N - 1)
+            drift_cross = drifts[di] + (drifts[di + 1] - drifts[di]) * (fi - di)
+            cx_c = bx + ox * cross_dist + sx_t * drift_cross
+            cy_c = by + oy * cross_dist + sy_t * drift_cross
+            # Bridge runs parallel to the road (tfx,tfy direction), spanning the
+            # tributary.  half_span = tributary half-width projected onto the road
+            # axis (how far the road section sits over water).  half_deck = road
+            # half-width in the perpendicular (tpx,tpy) direction.
+            dot_sxt_tf = (-oy) * tfx + ox * tfy   # sx_t · river-flow unit
+            half_span  = max(10.0, abs(dot_sxt_tf) * w_cross)
+            half_deck  = float(deck_hw)
+            bpts = [
+                w2s(cx_c + tpx * half_deck + tfx * half_span,
+                    cy_c + tpy * half_deck + tfy * half_span),
+                w2s(cx_c - tpx * half_deck + tfx * half_span,
+                    cy_c - tpy * half_deck + tfy * half_span),
+                w2s(cx_c - tpx * half_deck - tfx * half_span,
+                    cy_c - tpy * half_deck - tfy * half_span),
+                w2s(cx_c + tpx * half_deck - tfx * half_span,
+                    cy_c + tpy * half_deck - tfy * half_span),
+            ]
+            pygame.draw.polygon(surf, bridge_col, bpts)
+            if is_rail:
+                # Rail lines run along the bridge (road direction), offset ±3 in tpx.
+                for sign in (+1, -1):
+                    r1 = w2s(cx_c + tpx * sign * 3 + tfx * half_span,
+                              cy_c + tpy * sign * 3 + tfy * half_span)
+                    r2 = w2s(cx_c + tpx * sign * 3 - tfx * half_span,
+                              cy_c + tpy * sign * 3 - tfy * half_span)
+                    pygame.draw.line(surf, rail_col, r1, r2, 2)
+            else:
+                # Road edge lines run along the bridge at ±(half_deck-1) in tpx.
+                edge_col = dim3(bridge_road_col, 0.72)
+                for sign in (+1, -1):
+                    e1 = w2s(cx_c + tpx * sign * (half_deck - 1) + tfx * half_span,
+                              cy_c + tpy * sign * (half_deck - 1) + tfy * half_span)
+                    e2 = w2s(cx_c + tpx * sign * (half_deck - 1) - tfx * half_span,
+                              cy_c + tpy * sign * (half_deck - 1) - tfy * half_span)
+                    pygame.draw.line(surf, edge_col, e1, e2, 1)
+
+    # ── Marinas ──────────────────────────────────────────────────────────────
+    for marina in marinas:
+        wy = marina.wy
+        if not (top_y <= wy <= bot_y):
+            continue
+        cx = river.cx(wy)
+        tfx, tfy, tpx, tpy = river_basis(wy)
+
+        bx = cx + marina.side * tpx * RIVER_HALF
+        by = wy + marina.side * tpy * RIVER_HALF
+
+        hw = marina.half_width
+        dp = marina.depth
+        ox, oy = marina.side * tpx, marina.side * tpy
+
+        basin = [
+            w2s(bx + tfx * hw - ox * 4,  by + tfy * hw - oy * 4),
+            w2s(bx + ox * dp + tfx * hw, by + oy * dp + tfy * hw),
+            w2s(bx + ox * dp - tfx * hw, by + oy * dp - tfy * hw),
+            w2s(bx - tfx * hw - ox * 4,  by - tfy * hw - oy * 4),
+        ]
+        if len(basin) >= 3:
+            pygame.draw.polygon(surf, water_col, basin)
+
+        seawall_col = dim3((130, 120, 100), ambient)
+        pygame.draw.polygon(surf, seawall_col, basin, 3)
+
+        n = marina.n_slips
+        sl = marina.slip_len
+        for i in range(n + 1):
+            t_f = -hw + (2 * hw) * i / n
+            pb_x = bx + tfx * t_f + ox * 8
+            pb_y = by + tfy * t_f + oy * 8
+            pt_x = pb_x + ox * sl
+            pt_y = pb_y + oy * sl
+            sx1, sy1 = w2s(pb_x, pb_y)
+            sx2, sy2 = w2s(pt_x, pt_y)
+            pygame.draw.line(surf, pier_col, (sx1, sy1), (sx2, sy2), 3)
 
 
 # ── Bankside infrastructure ────────────────────────────────────────────────────
@@ -1708,7 +1960,7 @@ class PilotGame:
         seed = random.randint(0, 99999)
         self.river          = RiverCurve(seed)
         self._dock_name_pool = self._load_dock_name_pool()
-        self.buoys, self.obstacles, self.docks = generate_world(
+        self.buoys, self.obstacles, self.docks, self.tributaries, self.marinas = generate_world(
             self.river, self._dock_name_pool)
 
         start_cx = self.river.cx(0)
@@ -2384,6 +2636,11 @@ class PilotGame:
 
         # Roads, railroads, and bankside buildings
         draw_bankside_features(surf, self.river, self.cam_x, self.cam_y, ambient)
+
+        # Tributaries and marinas — drawn after roads so water covers road at crossings,
+        # then bridge decks drawn on top of the water to complete the crossing.
+        draw_tributaries_marinas(surf, self.tributaries, self.marinas,
+                                 self.river, self.cam_x, self.cam_y, ambient)
 
         # Cars and trains on roads / tracks
         draw_road_traffic(surf, self.road_cars, self.rail_trains,

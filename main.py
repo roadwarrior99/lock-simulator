@@ -328,21 +328,21 @@ class GameEngine:
         wy2 = water_y - wh
         wc  = (32, 38, 48)
         # Walls
-        pygame.draw.rect(self.screen, wc, (lx,          wy2, 30, wh + 55))
-        pygame.draw.rect(self.screen, wc, (lx + lw - 30, wy2, 30, wh + 55))
+        #pygame.draw.rect(self.screen, wc, (lx,          wy2, 30, wh + 55))
+        #pygame.draw.rect(self.screen, wc, (lx + lw - 30, wy2, 30, wh + 55))
         # Chamber water
-        pygame.draw.rect(self.screen, (14, 52, 105), (lx + 30, water_y, lw - 60, 55))
-        pygame.draw.line(self.screen, (35, 78, 148),
-                         (lx + 30, water_y), (lx + lw - 30, water_y), 2)
+        #pygame.draw.rect(self.screen, (14, 52, 105), (lx + 30, water_y, lw - 60, 55))
+        #pygame.draw.line(self.screen, (35, 78, 148),
+        #                 (lx + 30, water_y), (lx + lw - 30, water_y), 2)
         # Miter gate silhouettes
         gc = (50, 58, 72)
         for gx in (lx + 30, lx + lw - 30):
             sign = 1 if gx == lx + 30 else -1
             mid  = water_y
-            pygame.draw.polygon(self.screen, gc,
-                                [(gx, wy2), (gx + sign * 16, mid - 12), (gx, mid)])
-            pygame.draw.polygon(self.screen, gc,
-                                [(gx, mid), (gx + sign * 16, mid + 12), (gx, mid + 50)])
+        #    pygame.draw.polygon(self.screen, gc,
+        #                        [(gx, wy2), (gx + sign * 16, mid - 12), (gx, mid)])
+        #    pygame.draw.polygon(self.screen, gc,
+        #                        [(gx, mid), (gx + sign * 16, mid + 12), (gx, mid + 50)])
         # Reflection ripple
         refl = pygame.Surface((lw, 70), pygame.SRCALPHA)
         pygame.draw.rect(refl, (28, 50, 88, 70), (0, 0, 30, 70))

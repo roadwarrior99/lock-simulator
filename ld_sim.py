@@ -175,10 +175,6 @@ class LockDamVisualizer:
         # ── Infrastructure ────────────────────────────────────────────────────
         # Bridges crossing the river at fixed sim-space positions
         self.bridges = [
-            {'x':  85, 'btype': 'road'},
-            {'x': 225, 'btype': 'rail'},
-            {'x': 735, 'btype': 'rail'},
-            {'x': 875, 'btype': 'road'},
         ]
         # Houses along the embankment road (deterministic)
         self.houses = []
