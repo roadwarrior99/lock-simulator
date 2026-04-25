@@ -781,19 +781,12 @@ def gen_crew_portraits(db, *, crew_id: int = None) -> list[dict]:
     """
     Generate a portrait for every crew member that doesn't already have one.
 
-    Images are downloaded at 1024x1024 then resized to PORTRAIT_SIZE_PX × PORTRAIT_SIZE_PX
-    (3 × 3 inches at 96 dpi) before saving.  Requires Pillow (pip install Pillow).
-
     Each portrait is registered in art_assets with category='character' and
     tags containing 'crew_id:<n>' for later lookup.
 
     Pass *crew_id* to process one member instead of the whole table.
     Returns a list of dicts: {crew_id, name, filename, filepath}.
     """
-    try:
-        from PIL import Image as _PILImage
-    except ImportError:
-        sys.exit("Pillow is required for portrait generation.  Run: pip install Pillow")
 
     if crew_id is not None:
         member = db.get_crew(crew_id)
@@ -813,8 +806,19 @@ def gen_crew_portraits(db, *, crew_id: int = None) -> list[dict]:
     }
 
     results = []
-    client  = _openai_client()
     Path(PORTRAIT_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+    local_path = "/Users/colinhayes/.lmstudio/models/jayn7/Z-Image-Turbo-GGUF/z_image_turbo-Q4_K_S.gguf"
+    transformer = ZImageTransformer2DModel.from_single_file(
+        local_path,
+        quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
+        dtype=torch.bfloat16,
+    )
+    pipe = ZImagePipeline.from_pretrained(
+        "Tongyi-MAI/Z-Image-Turbo",
+        transformer=transformer,
+        local_files_only=True,
+    ).to("mps")
 
     for member in candidates:
         cid = str(member['id'])
@@ -822,27 +826,15 @@ def gen_crew_portraits(db, *, crew_id: int = None) -> list[dict]:
             logger.info("Skipping %s — portrait already exists", member['name'])
             continue
 
-        prompt   = _portrait_prompt(member)
-        filename = f"crew_{cid}_{member['name'].lower().replace(' ', '_')}.png"
-        filepath = os.path.join(PORTRAIT_OUTPUT_DIR, filename)
+        prompt    = _portrait_prompt(member)
+        base_name = f"crew_{cid}_{member['name'].lower().replace(' ', '_')}"
+        filename  = f"{base_name}_0.png"
+        filepath  = os.path.join(PORTRAIT_OUTPUT_DIR, filename)
 
         logger.info("Generating portrait for %s (crew %s)…", member['name'], cid)
         logger.debug("image prompt [portrait  crew %s]:\n%s", cid, prompt)
 
-        response = client.images.generate(
-            model='dall-e-3',
-            prompt=prompt,
-            size='1024x1024',
-            response_format='b64_json',
-            n=1,
-        )
-        image_data = response.data[0].b64_json
-
-        # Decode, resize to 3×3 in, save
-        import io
-        raw = _PILImage.open(io.BytesIO(base64.b64decode(image_data)))
-        resized = raw.resize((PORTRAIT_SIZE_PX, PORTRAIT_SIZE_PX), _PILImage.LANCZOS)
-        resized.save(filepath)
+        local_image_gen(prompt, os.path.join(PORTRAIT_OUTPUT_DIR, base_name), 1, "zimage", "text", iterations=9, pipe=pipe)
 
         db.register_asset(
             filename,
@@ -853,7 +845,7 @@ def gen_crew_portraits(db, *, crew_id: int = None) -> list[dict]:
             height=PORTRAIT_SIZE_PX,
         )
 
-        logger.info("  Saved %dx%d px → %s", PORTRAIT_SIZE_PX, PORTRAIT_SIZE_PX, filepath)
+        logger.info("  Saved → %s", filepath)
         results.append({'crew_id': member['id'], 'name': member['name'],
                         'filename': filename, 'filepath': filepath})
 
@@ -1161,11 +1153,12 @@ def browse_assets_ui(db):
                                     prompt = _portrait_prompt(member)
                             except (ValueError, IndexError):
                                 pass
+                    prompt = "90s CARTOON " + prompt
                     if not prompt:
                         prompt = asset.get('description') or asset['filename']
 
                     regen_state = 'working'
-                    status_msg  = 'Calling DALL-E…'
+                    status_msg  = 'Generating locally…'
                     screen.fill(BG_COLOR)
                     draw_panel(asset, regen_state, status_msg)
                     draw_preview(cached_surf)
@@ -1181,28 +1174,13 @@ def browse_assets_ui(db):
                                 out_dir = os.path.dirname(os.path.abspath(candidate))
                                 break
 
-                        client = _openai_client()
                         logger.debug("image prompt [browser regen]:\n%s", prompt)
-                        response = client.images.generate(
-                            model='dall-e-3',
-                            prompt=prompt,
-                            size='1024x1024',
-                            response_format='b64_json',
-                            n=1,
-                        )
-                        raw_bytes = base64.b64decode(response.data[0].b64_json)
-
                         filepath = os.path.join(out_dir, asset['filename'])
-                        if is_portrait and _HAS_PIL:
-                            import io
-                            from PIL import Image as _PILB
-                            img = _PILB.open(io.BytesIO(raw_bytes))
-                            img.resize((PORTRAIT_SIZE_PX, PORTRAIT_SIZE_PX),
-                                       _PILB.LANCZOS).save(filepath)
-                        else:
-                            Path(out_dir).mkdir(parents=True, exist_ok=True)
-                            with open(filepath, 'wb') as fh:
-                                fh.write(raw_bytes)
+                        Path(out_dir).mkdir(parents=True, exist_ok=True)
+                        tmp_base = os.path.join(out_dir, '_regen_tmp')
+                        logger.info("prompt: %s", prompt)
+                        local_image_gen(prompt, tmp_base, 1, "zimage", "text", iterations=9)
+                        os.replace(f"{tmp_base}_0.png", filepath)
 
                         # Update DB dimensions
                         if _HAS_PIL:

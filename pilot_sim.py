@@ -35,6 +35,7 @@ OBS_STEP     = 365    # world-Y between obstacle placement tries
 OBS_CHANCE   = 0.62   # probability an obstacle slot is actually filled
 DOCK_INTERVAL= 2500   # world-Y between terminal docks
 GEN_LIMIT    = 60_000 # world-Y extent of pre-generated world
+BRIDGE_INTERVAL = 2200   # world-Y between bridges (alternating road / rail)
 
 # ── Vessel dimensions ──────────────────────────────────────────────────────────
 TW, TH   = 42, 74          # towboat width × length along heading
@@ -79,6 +80,9 @@ TRAFFIC_SPAWN_INTERVAL = 38.0   # real seconds between spawn attempts
 TRAFFIC_MAX            = 2      # max simultaneous AI vessels on screen
 TRAFFIC_SPAWN_AHEAD    = 1400   # world units ahead of player to spawn
 TRAFFIC_CULL_DIST      = 1800   # cull when this far behind the vessel's own travel direction
+AI_AVOID_LONG          = 340    # longitudinal range at which AI starts dodging the player (wu)
+AI_AVOID_LAT           = 95     # desired lateral clearance from player centre (wu)
+AI_AVOID_STR           = 2.4    # max lateral nudge speed in wu/frame at closest range
 
 _AI_DIMS = {          # (half-width, half-length) in world units — barges excluded: no self-propulsion
     'kayak':      ( 3,   6),
@@ -87,10 +91,10 @@ _AI_DIMS = {          # (half-width, half-length) in world units — barges excl
     'towboat':    (22,  45),
 }
 _AI_SPEEDS = {        # base world units/frame
-    'kayak':      1.9,
-    'yacht':      2.3,
-    'paddleboat': 1.1,
-    'towboat':    1.6,
+    'kayak':      0.2,
+    'yacht':      1.3,
+    'paddleboat': 0.5,
+    'towboat':    0.6,
 }
 _AI_COLORS = {
     'kayak':      (220, 110,  40),
@@ -425,6 +429,7 @@ class Vessel:
         self.damage     = 0
         self.hit_cd     = 0     # frames of invulnerability remaining
         self.horn_timer = 0
+        self.anchored   = False
         self.barges     = [TowBarge(r, c)
                            for r in range(B_ROWS) for c in range(B_COLS)]
         self.deckhands  = []   # populated by PilotGame
@@ -495,13 +500,11 @@ class Vessel:
         if self.hit_cd > 0:
             self.hit_cd -= 1
 
-        # Throttle
+        # Throttle — increments/decrements while held, stays put when released
         if keys[pygame.K_w] or keys[pygame.K_UP]:
             self.throttle = min(1.0, self.throttle + 0.022)
         elif keys[pygame.K_s] or keys[pygame.K_DOWN]:
             self.throttle = max(-0.5, self.throttle - 0.022)
-        else:
-            self.throttle *= 0.96
 
         # Steer
         if keys[pygame.K_a] or keys[pygame.K_LEFT]:
@@ -510,6 +513,11 @@ class Vessel:
             self.steer = +1.0
         else:
             self.steer = 0.0
+
+        if self.anchored:
+            self.speed   = 0.0
+            self.yaw_vel = 0.0
+            return
 
         # Speed
         self.speed += self.throttle * ACCEL
@@ -543,7 +551,7 @@ class Vessel:
         self.y += CURRENT_CD * vrel_y * abs(vrel_y)
 
     # ── Draw ───────────────────────────────────────────────────────────────────
-    def draw(self, surf, cam_x, cam_y, ambient):
+    def draw(self, surf, cam_x, cam_y, ambient, font_sm=None):
         def ws(wx, wy):
             return int(wx - cam_x + SW // 2), int(wy - cam_y + VREF_Y)
 
@@ -590,6 +598,12 @@ class Vessel:
                 mr = ws(bcx + fx * (hl * 0.5) + rx * (hw * 0.7),
                         bcy + fy * (hl * 0.5) + ry * (hw * 0.7))
                 pygame.draw.line(surf, be_base, mf, mr, 1)
+            # cargo label at barge centre
+            if barge.cargo and font_sm and ambient > 0.25:
+                label_txt = barge.cargo[0].upper()
+                lbl = font_sm.render(label_txt, True, (235, 228, 210))
+                bsx, bsy = ws(bcx, bcy)
+                surf.blit(lbl, (bsx - lbl.get_width() // 2, bsy - lbl.get_height() // 2))
             # tied indicator (small dot at bow edge)
             if barge.tied:
                 bp = ws(bcx + fx * hl, bcy + fy * hl)
@@ -854,6 +868,177 @@ def draw_river(surf, river: RiverCurve, cam_x, cam_y, ambient, wave_t):
                 pygame.draw.circle(surf, tree_col, (tx, ty - 4), 8)
 
 
+# ── Bankside infrastructure ────────────────────────────────────────────────────
+
+def _bridge_corners(river, cam_x, cam_y, bwy, half_span, half_deck):
+    """4 screen-space corners of a bridge rectangle rotated to follow the river."""
+    cx = river.cx(bwy)
+    dc = river.dcx(bwy)
+    L  = math.sqrt(1.0 + dc * dc)
+    px, py = 1.0 / L, -dc / L     # unit vector perpendicular to river flow
+    fx, fy = dc / L,  1.0 / L     # unit vector along flow
+    bsx = cx - cam_x + SW // 2
+    bsy = bwy - cam_y + VREF_Y
+    return [
+        (int(bsx + px * half_span + fx * half_deck), int(bsy + py * half_span + fy * half_deck)),
+        (int(bsx - px * half_span + fx * half_deck), int(bsy - py * half_span + fy * half_deck)),
+        (int(bsx - px * half_span - fx * half_deck), int(bsy - py * half_span - fy * half_deck)),
+        (int(bsx + px * half_span - fx * half_deck), int(bsy + py * half_span - fy * half_deck)),
+    ]
+
+
+def draw_bankside_features(surf, river, cam_x, cam_y, ambient):
+    """Roads, railroads, and buildings along both river banks."""
+    top_y = int(cam_y - VREF_Y - 80)
+    bot_y = int(cam_y + (SH - VREF_Y) + 80)
+    step  = 10
+
+    road_col = dim3(( 78,  80,  84), ambient)
+    dash_col = dim3((205, 188,  68), ambient)
+    tie_col  = dim3(( 80,  54,  26), ambient)
+    rail_col = dim3((140, 134, 126), ambient)
+
+    L_ri, L_ro   = [], []
+    R_ri, R_ro   = [], []
+    L_rai, L_rao = [], []
+    R_rai, R_rao = [], []
+
+    for wy in range(top_y, bot_y + step, step):
+        cx = river.cx(wy)
+        sx = int(cx - cam_x + SW // 2)
+        sy = int(wy  - cam_y + VREF_Y)
+        L_ri .append((sx - RIVER_HALF -  4, sy))
+        L_ro .append((sx - RIVER_HALF - 16, sy))
+        R_ri .append((sx + RIVER_HALF +  4, sy))
+        R_ro .append((sx + RIVER_HALF + 16, sy))
+        L_rai.append((sx - RIVER_HALF - 26, sy))
+        L_rao.append((sx - RIVER_HALF - 36, sy))
+        R_rai.append((sx + RIVER_HALF + 26, sy))
+        R_rao.append((sx + RIVER_HALF + 36, sy))
+
+    if len(L_ri) < 2:
+        return
+
+    # Road surfaces
+    pygame.draw.polygon(surf, road_col, L_ri + list(reversed(L_ro)))
+    pygame.draw.polygon(surf, road_col, R_ri + list(reversed(R_ro)))
+
+    # Dashed centre lines — anchored to world coordinates so they don't drift
+    DASH_ON     = 40
+    DASH_PERIOD = 80
+    dash_start  = top_y - (top_y % DASH_PERIOD)
+    for dwy in range(dash_start, bot_y + DASH_PERIOD, DASH_PERIOD):
+        cx1 = river.cx(dwy);          cx2 = river.cx(dwy + DASH_ON)
+        sx1 = int(cx1 - cam_x + SW // 2)
+        sx2 = int(cx2 - cam_x + SW // 2)
+        sy1 = int(dwy         - cam_y + VREF_Y)
+        sy2 = int(dwy + DASH_ON - cam_y + VREF_Y)
+        pygame.draw.line(surf, dash_col,
+                         (sx1 - RIVER_HALF - 10, sy1), (sx2 - RIVER_HALF - 10, sy2), 2)
+        pygame.draw.line(surf, dash_col,
+                         (sx1 + RIVER_HALF + 10, sy1), (sx2 + RIVER_HALF + 10, sy2), 2)
+
+    # Railroad ties — anchored to world coordinates
+    TIE_SPACING = 28
+    tie_start   = top_y - (top_y % TIE_SPACING)
+    for twy in range(tie_start, bot_y, TIE_SPACING):
+        tcx = river.cx(twy)
+        tsx = int(tcx - cam_x + SW // 2)
+        tsy = int(twy - cam_y + VREF_Y)
+        pygame.draw.line(surf, tie_col, (tsx - RIVER_HALF - 26, tsy), (tsx - RIVER_HALF - 36, tsy), 3)
+        pygame.draw.line(surf, tie_col, (tsx + RIVER_HALF + 26, tsy), (tsx + RIVER_HALF + 36, tsy), 3)
+    pygame.draw.lines(surf, rail_col, False, L_rai, 2)
+    pygame.draw.lines(surf, rail_col, False, L_rao, 2)
+    pygame.draw.lines(surf, rail_col, False, R_rai, 2)
+    pygame.draw.lines(surf, rail_col, False, R_rao, 2)
+
+    # Buildings alongside roads
+    HOUSE_STRIP = 220
+    house_start = top_y - (top_y % HOUSE_STRIP)
+    for strip_wy in range(house_start, bot_y + HOUSE_STRIP, HOUSE_STRIP):
+        rng   = random.Random(strip_wy)
+        count = rng.randint(1, 3)
+        for _ in range(count):
+            side = rng.choice((-1, 1))
+            off  = rng.uniform(RIVER_HALF + 44, RIVER_HALF + 102)
+            wy_h = strip_wy + rng.uniform(-70, 70)
+            hcx  = river.cx(wy_h)
+            hdc  = river.dcx(wy_h)
+            hl_n = math.sqrt(1.0 + hdc * hdc)
+            hpx, hpy = 1.0 / hl_n, -hdc / hl_n
+            hfx, hfy = hdc / hl_n, 1.0 / hl_n
+            hsx = int((hcx + side * off) - cam_x + SW // 2)
+            hsy = int(wy_h - cam_y + VREF_Y)
+            if -30 < hsx < SW + 30 and -30 < hsy < SH + 30:
+                hw = rng.randint(11, 18)
+                hlen = rng.randint(16, 26)
+                pts = [
+                    (int(hsx + hpx*hw/2 + hfx*hlen/2), int(hsy + hpy*hw/2 + hfy*hlen/2)),
+                    (int(hsx - hpx*hw/2 + hfx*hlen/2), int(hsy - hpy*hw/2 + hfy*hlen/2)),
+                    (int(hsx - hpx*hw/2 - hfx*hlen/2), int(hsy - hpy*hw/2 - hfy*hlen/2)),
+                    (int(hsx + hpx*hw/2 - hfx*hlen/2), int(hsy + hpy*hw/2 - hfy*hlen/2)),
+                ]
+                wall = rng.choice([
+                    (192, 176, 156), (178, 162, 142), (208, 192, 172),
+                    (182, 182, 178), (175, 158, 130),
+                ])
+                roof = rng.choice([
+                    (145, 68, 48), (78, 68, 62), (108, 92, 76), (58, 72, 88),
+                ])
+                pygame.draw.polygon(surf, dim3(wall, ambient), pts)
+                pygame.draw.polygon(surf, dim3(roof, ambient), pts, 2)
+                # Roof ridge
+                ridge1 = ((pts[0][0]+pts[1][0])//2, (pts[0][1]+pts[1][1])//2)
+                ridge2 = ((pts[2][0]+pts[3][0])//2, (pts[2][1]+pts[3][1])//2)
+                pygame.draw.line(surf, dim3(roof, min(1.0, ambient + 0.12)), ridge1, ridge2, 1)
+
+
+def draw_bridges(surf, river, cam_x, cam_y, ambient):
+    """Bridge deck structures drawn after the vessel so boats appear to pass under them."""
+    top_y = int(cam_y - VREF_Y - 60)
+    bot_y = int(cam_y + (SH - VREF_Y) + 60)
+    first = (top_y // BRIDGE_INTERVAL) * BRIDGE_INTERVAL
+
+    for bwy in range(first, bot_y + BRIDGE_INTERVAL, BRIDGE_INTERVAL):
+        sy = int(bwy - cam_y + VREF_Y)
+        if sy < -60 or sy > SH + 60:
+            continue
+        is_rail = (bwy // BRIDGE_INTERVAL) % 2 == 1
+        if is_rail:
+            body = dim3(( 62,  68,  76), ambient)
+            edge = dim3(( 98, 100, 108), ambient)
+            mark = dim3((132, 128, 120), ambient)
+        else:
+            body = dim3((132, 124, 112), ambient)
+            edge = dim3((158, 152, 142), ambient)
+            mark = dim3((215, 200,  60), ambient)
+
+        span = RIVER_HALF + 22   # reaches from road to road
+        deck = 11
+
+        poly = _bridge_corners(river, cam_x, cam_y, bwy, span, deck)
+        pygame.draw.polygon(surf, body, poly)
+        pygame.draw.polygon(surf, edge, poly, 3)
+
+        # Surface marking across the full span
+        bcx = river.cx(bwy)
+        bdc = river.dcx(bwy)
+        bL  = math.sqrt(1.0 + bdc * bdc)
+        bpx, bpy = 1.0 / bL, -bdc / bL
+        bfx, bfy = bdc / bL, 1.0 / bL
+        bsx = int(bcx - cam_x + SW // 2)
+        bsy = int(bwy - cam_y + VREF_Y)
+        if is_rail:
+            for roff in (-5, 5):
+                p1 = (int(bsx + bpx*span + bfx*roff), int(bsy + bpy*span + bfy*roff))
+                p2 = (int(bsx - bpx*span + bfx*roff), int(bsy - bpy*span + bfy*roff))
+                pygame.draw.line(surf, mark, p1, p2, 2)
+        else:
+            p1 = (int(bsx + bpx*(span-4)), int(bsy + bpy*(span-4)))
+            p2 = (int(bsx - bpx*(span-4)), int(bsy - bpy*(span-4)))
+            pygame.draw.line(surf, mark, p1, p2, 2)
+
+
 # ── Object rendering ───────────────────────────────────────────────────────────
 def draw_buoys(surf, buoys, cam_x, cam_y, ambient, wave_t):
     for b in buoys:
@@ -1023,6 +1208,11 @@ def draw_hud(surf, vessel: Vessel, game_hour, score, dock_dist,
     surf.blit(font_sm.render('THROTTLE', True, (180, 180, 180)),
               (BAR_X, BAR_Y + BAR_H + 48))
 
+    # Anchor indicator
+    if vessel.anchored:
+        anc = font_sm.render('⚓ ANCHORED', True, (255, 200, 60))
+        surf.blit(anc, (BAR_X, BAR_Y + BAR_H + 62))
+
     # Time and score (top right)
     ts = font.render(time_str, True, (230, 220, 190))
     surf.blit(ts, (SW - ts.get_width() - 16, 14))
@@ -1110,7 +1300,7 @@ def draw_intro(surf, font_lg, font):
         ('Avoid rocks, sandbars and logs outside the channel', font, (210, 210, 210)),
         ('Pull into terminals when signalled — keep speed low', font, (210, 210, 210)),
         ('', font, (0, 0, 0)),
-        ('W/S  throttle     A/D  steer     SPACE  horn     T  tie/cast off', font, (160, 200, 160)),
+        ('W/S  throttle     A/D  steer     SPACE  horn     T  tie/cast off     E  anchor', font, (160, 200, 160)),
         ('', font, (0, 0, 0)),
         ('Press  SPACE  to begin', font, (255, 220, 60)),
     ]
@@ -1211,7 +1401,7 @@ class AIVessel:
         self.vy_def    = 0.0
         self.hit_flash = 0     # frames remaining for red flash
 
-    def update(self, river: RiverCurve):
+    def update(self, river: RiverCurve, player_x: float, player_y: float):
         # Forward travel along river
         self.wy += self.speed * self.direction
 
@@ -1224,6 +1414,16 @@ class AIVessel:
         self.vy_def *= 0.88
         channel_x    = river.cx(self.wy)
         self.wx     += (channel_x - self.wx) * 0.04   # gradual return
+
+        # Steer away from the player when within range
+        long_sep = abs(player_y - self.wy)
+        if long_sep < AI_AVOID_LONG:
+            lat_diff = self.wx - player_x
+            prox     = 1.0 - long_sep / AI_AVOID_LONG
+            crowd    = max(0.0, 1.0 - abs(lat_diff) / AI_AVOID_LAT)
+            if crowd > 0:
+                side     = 1 if lat_diff >= 0 else -1
+                self.wx += side * AI_AVOID_STR * prox * crowd
 
         if self.hit_flash > 0:
             self.hit_flash -= 1
@@ -1758,20 +1958,21 @@ class PilotGame:
         return pts
 
     def _nearest_dock_dist(self):
-        """Return (distance, dock) for the nearest unvisited dock within range.
-
-        self.vessel.y is the towboat stern; barges extend ~VESSEL_L units forward.
-        We look from slightly behind the stern to well ahead of the bow so the
-        dock is findable while the formation is alongside it.
-        """
-        sample_pts = self._barge_sample_points()
-        look_behind = VESSEL_L + DOCK_RADIUS   # how far behind stern to still check
+        """Return (distance, dock) for the closest unvisited dock within range."""
+        sample_pts  = self._barge_sample_points()
+        look_behind = VESSEL_L + DOCK_RADIUS
+        look_ahead  = VESSEL_L + DOCK_RADIUS * 4
+        best_dist, best_dock = float('inf'), None
         for d in self.docks:
-            if not d.visited and d.wy > self.vessel.y - look_behind:
-                dist = min(math.hypot(px - d.wx, py - d.wy)
-                           for px, py in sample_pts) if sample_pts else float('inf')
-                return dist, d
-        return None, None
+            if d.visited:
+                continue
+            if not (self.vessel.y - look_behind < d.wy < self.vessel.y + look_ahead):
+                continue
+            dist = (min(math.hypot(px - d.wx, py - d.wy) for px, py in sample_pts)
+                    if sample_pts else float('inf'))
+            if dist < best_dist:
+                best_dist, best_dock = dist, d
+        return (best_dist, best_dock) if best_dock else (None, None)
 
     # ── Collision with banks ────────────────────────────────────────────────────
     def _bank_collision(self):
@@ -1882,7 +2083,7 @@ class PilotGame:
             self.traffic_timer = 0.0
             self._maybe_spawn_traffic()
         for av in self.ai_vessels:
-            av.update(self.river)
+            av.update(self.river, self.vessel.x, self.vessel.y)
         self.ai_vessels = [
             av for av in self.ai_vessels
             if (av.wy - self.vessel.y) * av.direction > -TRAFFIC_CULL_DIST
@@ -1897,15 +2098,16 @@ class PilotGame:
         if self.active_dock:
             self.unload_timer -= dt
             if self.unload_timer <= 0:
-                # Unloading complete — check goals for every barge, then cast off
+                # Unloading complete — set dock reward, then check goals
+                # (goal completion overwrites dock message if a goal is satisfied)
                 dock = self.active_dock
-                for b in self.vessel.barges:
-                    self._check_goals(b, dock)
                 tied  = sum(1 for b in self.vessel.barges if b.tied)
                 bonus = self.DOCK_BONUS + tied * 45.0
                 self.earnings             += bonus
                 self._reward_msg           = f'+${bonus:.0f}  DOCK COMPLETE'
                 self._reward_timer         = 3.5
+                for b in self.vessel.barges:
+                    self._check_goals(b, dock)
                 dock.visited               = True
                 self.active_dock           = None
                 self.unload_timer          = 0.0
@@ -1923,6 +2125,9 @@ class PilotGame:
         # River background + banks
         draw_river(surf, self.river, self.cam_x, self.cam_y,
                    ambient, self.wave_t)
+
+        # Roads, railroads, and bankside buildings
+        draw_bankside_features(surf, self.river, self.cam_x, self.cam_y, ambient)
 
         # Objects
         draw_obstacles(surf, self.obstacles, self.cam_x, self.cam_y, ambient)
@@ -1944,7 +2149,10 @@ class PilotGame:
                     self.river, self.wave_t, font_sm)
 
         # Vessel (drawn on top of everything so it is always visible)
-        self.vessel.draw(surf, self.cam_x, self.cam_y, ambient)
+        self.vessel.draw(surf, self.cam_x, self.cam_y, ambient, font_sm)
+
+        # Bridges drawn over vessels so the towboat appears to pass underneath
+        draw_bridges(surf, self.river, self.cam_x, self.cam_y, ambient)
 
         # Night darkness with spotlight following mouse
         draw_spotlight(surf, *pygame.mouse.get_pos(), ambient)
@@ -2029,6 +2237,16 @@ class PilotGame:
                                     self.vessel.speed    = 0.0
                                     self.vessel.throttle = 0.0
                                     self.vessel.yaw_vel  = 0.0
+                    elif event.key == pygame.K_e:
+                        self.vessel.anchored = not self.vessel.anchored
+                        if self.vessel.anchored:
+                            self.vessel.speed   = 0.0
+                            self.vessel.yaw_vel = 0.0
+                            self._reward_msg   = 'ANCHOR DOWN'
+                            self._reward_timer = 2.0
+                        else:
+                            self._reward_msg   = 'ANCHOR UP'
+                            self._reward_timer = 2.0
                     elif event.key == pygame.K_SPACE:
                         if self.show_intro:
                             self.show_intro = False

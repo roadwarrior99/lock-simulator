@@ -172,6 +172,27 @@ class LockDamVisualizer:
                 'wing_phase': random.uniform(0, math.pi * 2)
             })
 
+        # ── Infrastructure ────────────────────────────────────────────────────
+        # Bridges crossing the river at fixed sim-space positions
+        self.bridges = [
+            {'x':  85, 'btype': 'road'},
+            {'x': 225, 'btype': 'rail'},
+            {'x': 735, 'btype': 'rail'},
+            {'x': 875, 'btype': 'road'},
+        ]
+        # Houses along the embankment road (deterministic)
+        self.houses = []
+        for x in range(45, 330, 50):
+            self.houses.append({'x': x,
+                                'w': 18 + (x * 7) % 13,
+                                'h': 13 + (x * 5) % 9,
+                                'style': (x * 3 + 1) % 3})
+        for x in range(668, 955, 53):
+            self.houses.append({'x': x,
+                                'w': 18 + (x * 7) % 13,
+                                'h': 13 + (x * 5) % 9,
+                                'style': (x * 3 + 1) % 3})
+
         # ── Operator & Views ──────────────────────────────────────────────────
         self.view_mode = "shore" # "shore" or "operator"
         self.operator = {
@@ -456,6 +477,10 @@ class LockDamVisualizer:
         pygame.draw.rect(self.screen, self._dim(self.DIRT, mult),       (x, top_y - 12, w, 12))
         pygame.draw.rect(self.screen, self._dim(self.GRASS, mult),      (x, top_y - 26, w, 14))
         pygame.draw.rect(self.screen, self._dim(self.GRASS_DARK, mult), (x, top_y - 38, w, 12))
+        # Road running along the near bank
+        pygame.draw.rect(self.screen, self._dim((88, 90, 94), mult), (x, top_y - 23, w, 6))
+        for mx in range(x + 8, x + w - 4, 20):
+            pygame.draw.rect(self.screen, self._dim((210, 195, 75), mult), (mx, top_y - 21, 9, 2))
 
     def _draw_ground_strip(self, lk_sx, lk_ex):
         """Fill the full ground area below _water_bot_y with layered earth and grass."""
@@ -485,6 +510,25 @@ class LockDamVisualizer:
                 pygame.draw.line(self.screen, self._dim((68, 148, 58), mult),
                                  (tx + 3, gy + 2), (tx + 5, gy + 2 - th + 1), 1)
 
+            # Road running along far bank
+            road_y = gy + 46
+            pygame.draw.rect(self.screen, self._dim((82, 84, 88), mult), (gx, road_y, gw, 10))
+            for mx in range(gx + 6, gx + gw - 4, 20):
+                pygame.draw.rect(self.screen, self._dim((215, 200, 78), mult), (mx, road_y + 4, 9, 2))
+
+            # Houses alongside the road
+            for house in self.houses:
+                hsx = self._sx(house['x'])
+                if gx <= hsx < gx + gw:
+                    self._draw_house(hsx, road_y, house['w'], house['h'], house['style'], mult)
+
+            # Railroad (farther from waterfront)
+            rail_y = gy + 76
+            for tx in range(gx + 2, gx + gw - 2, 11):
+                pygame.draw.rect(self.screen, self._dim((88, 60, 34), mult), (tx, rail_y, 7, 8))
+            pygame.draw.rect(self.screen, self._dim((155, 150, 140), mult), (gx, rail_y + 1, gw, 2))
+            pygame.draw.rect(self.screen, self._dim((155, 150, 140), mult), (gx, rail_y + 5, gw, 2))
+
             # Ground-level trees at the same sim-space positions as the sky trees
             for tree in self.trees:
                 sx = self._sx(tree['x'])
@@ -504,6 +548,74 @@ class LockDamVisualizer:
         pygame.draw.circle(self.screen, leaf2, (sx - 13,  ground_y + 10), 14)
         pygame.draw.circle(self.screen, leaf2, (sx + 13,  ground_y + 10), 14)
         pygame.draw.circle(self.screen, leaf1, (sx,       ground_y + 16), 15)
+
+    def _draw_house(self, sx, road_y, w, h, style, mult):
+        top_y = road_y - h
+        wall    = self._dim((192, 176, 158), mult)
+        roof    = self._dim((148, 72, 50), mult)
+        window  = self._dim((152, 196, 232), mult)
+        outline = self._dim((80, 65, 55), mult)
+        pygame.draw.rect(self.screen, wall, (sx - w // 2, top_y, w, h))
+        pygame.draw.rect(self.screen, outline, (sx - w // 2, top_y, w, h), 1)
+        pygame.draw.rect(self.screen, window, (sx - w // 2 + 3, top_y + 3, 5, 4))
+        if w >= 24:
+            pygame.draw.rect(self.screen, window, (sx + w // 2 - 8, top_y + 3, 5, 4))
+        pygame.draw.rect(self.screen, outline, (sx - 2, road_y - 5, 4, 5))
+        if style == 0:  # peaked
+            pygame.draw.polygon(self.screen, roof,
+                                [(sx - w // 2 - 1, top_y), (sx, top_y - 9), (sx + w // 2 + 1, top_y)])
+        elif style == 1:  # hip
+            pygame.draw.polygon(self.screen, roof,
+                                [(sx - w // 2 - 1, top_y), (sx - w // 4, top_y - 7),
+                                 (sx + w // 4, top_y - 7), (sx + w // 2 + 1, top_y)])
+        else:  # flat parapet
+            pygame.draw.rect(self.screen, self._dim((128, 122, 116), mult),
+                             (sx - w // 2 - 1, top_y - 3, w + 2, 4))
+
+    def _draw_bridges(self, up_y, dn_y):
+        mult = self._get_ambient_mult()
+        gy   = self._water_bot_y
+        for bridge in self.bridges:
+            bx      = self._sx(bridge['x'])
+            is_rail = bridge['btype'] == 'rail'
+            surf_y  = up_y if bridge['x'] < self.lock_start else dn_y
+            bank_top = surf_y - 40  # top of visible near-bank area
+
+            dw = 18          # bridge column width (side profile depth)
+            dx = bx - dw // 2
+
+            if is_rail:
+                body  = self._dim(( 68,  74,  80), mult)
+                deck  = self._dim(( 58,  64,  70), mult)
+                trim  = self._dim((108, 108, 114), mult)
+                surf  = self._dim((150, 145, 136), mult)
+            else:
+                body  = self._dim((148, 140, 126), mult)
+                deck  = self._dim((130, 122, 110), mult)
+                trim  = self._dim((166, 160, 148), mult)
+                surf  = self._dim((200, 196, 185), mult)
+
+            # Pillar spanning water (below deck to far bank ground level)
+            deck_bot = bank_top + 12
+            pygame.draw.rect(self.screen, body, (dx + 3, deck_bot, dw - 6, gy + 50 - deck_bot))
+
+            # Deck slab at near-bank level
+            pygame.draw.rect(self.screen, deck, (dx, bank_top, dw, 12))
+            pygame.draw.rect(self.screen, surf, (dx, bank_top, dw, 2))
+
+            # Guard rail posts + top rail
+            for px in (dx, dx + dw - 2):
+                pygame.draw.line(self.screen, trim, (px + 1, bank_top - 10), (px + 1, bank_top), 2)
+            pygame.draw.line(self.screen, trim, (dx + 1, bank_top - 10), (dx + dw - 1, bank_top - 10), 1)
+
+            if is_rail:
+                # Two rail lines as seen from side (horizontal top-of-rail profile)
+                for ry in (bank_top + 3, bank_top + 7):
+                    pygame.draw.line(self.screen, surf, (dx + 2, ry), (dx + dw - 2, ry), 1)
+            else:
+                # Edge stripe on road surface
+                pygame.draw.line(self.screen, surf, (dx + 2, bank_top + 4), (dx + 2, bank_top + 10), 1)
+                pygame.draw.line(self.screen, surf, (dx + dw - 2, bank_top + 4), (dx + dw - 2, bank_top + 10), 1)
 
     # ── Shore view ────────────────────────────────────────────────────────────
 
@@ -617,6 +729,9 @@ class LockDamVisualizer:
         for ag in self.agents:
             if ag.state != "done":
                 self._draw_boat_shore(ag, up_y, dn_y, lk_y, lk_sx, lk_ex)
+
+        # Bridges drawn over boats so vessels appear to pass underneath
+        self._draw_bridges(up_y, dn_y)
 
         # Water level labels
         self._wl_label((self._sx_offset + lk_sx) // 2, up_y, "Upstream", self.lock_dam.upstream_level)
