@@ -377,7 +377,7 @@ class Tributary:
     def __init__(self, wy, side, angle_deg, half_width=72, length=520):
         self.wy         = wy
         self.side       = side        # -1 left bank, +1 right bank
-        self.angle_deg  = angle_deg   # degrees off perpendicular (toward downstream)
+        self.angle_deg  = angle_deg   # degrees off perpendicular (toward upstream — body extends upstream into land)
         self.half_width = half_width
         self.length     = length
 
@@ -1030,11 +1030,13 @@ def draw_tributaries_marinas(surf, tributaries, marinas, river, cam_x, cam_y, am
         bx = cx + trib.side * tpx * RIVER_HALF
         by = wy + trib.side * tpy * RIVER_HALF
 
-        # Main outward direction (perpendicular to bank, angled toward downstream)
+        # Main outward direction: perpendicular to bank, biased upstream so the
+        # tributary body extends upstream into the land and the mouth faces
+        # the approaching vessel (downstream).
         angle_rad = math.radians(trib.angle_deg)
         sin_a = math.sin(angle_rad)
-        ox_raw = trib.side * tpx + sin_a * tfx
-        oy_raw = trib.side * tpy + sin_a * tfy
+        ox_raw = trib.side * tpx - sin_a * tfx
+        oy_raw = trib.side * tpy - sin_a * tfy
         L_ox = math.sqrt(ox_raw * ox_raw + oy_raw * oy_raw)
         ox = ox_raw / L_ox
         oy = oy_raw / L_ox
