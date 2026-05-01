@@ -49,7 +49,7 @@ FORM_L = B_ROWS * BH + (B_ROWS - 1) * BGAP    # 157  fore-aft
 VESSEL_L = TH + PUSH + FORM_L                  # 223  stern-to-bow
 
 # ── Physics ────────────────────────────────────────────────────────────────────
-MAX_FWD  = 3.0    # world units/frame at full forward throttle
+MAX_FWD  = 1.8    # world units/frame at full forward throttle
 MAX_REV  = 0.7    # world units/frame at full reverse
 ACCEL    = 0.055  # speed change per frame while key held
 DRAG     = 0.988  # speed multiplied each frame (water resistance)
@@ -80,9 +80,10 @@ TRAFFIC_SPAWN_INTERVAL = 38.0   # real seconds between spawn attempts
 TRAFFIC_MAX            = 2      # max simultaneous AI vessels on screen
 TRAFFIC_SPAWN_AHEAD    = 1400   # world units ahead of player to spawn
 TRAFFIC_CULL_DIST      = 1800   # cull when this far behind the vessel's own travel direction
-AI_AVOID_LONG          = 340    # longitudinal range at which AI starts dodging the player (wu)
-AI_AVOID_LAT           = 95     # desired lateral clearance from player centre (wu)
-AI_AVOID_STR           = 2.4    # max lateral nudge speed in wu/frame at closest range
+AI_LOOK_AHEAD          = 220    # wu ahead to scan for vessels to follow/avoid
+AI_LAT_CLEAR           = 55     # desired lateral clearance between vessel edges (wu)
+AI_LAT_STR             = 1.8    # max lateral nudge per frame at zero clearance
+AI_SPEED_MATCH_DIST    = 160    # wu ahead at which same-lane vessel triggers speed match
 
 _AI_DIMS = {          # (half-width, half-length) in world units — barges excluded: no self-propulsion
     'kayak':      ( 3,   6),
@@ -1001,7 +1002,6 @@ def draw_tributaries_marinas(surf, tributaries, marinas, river, cam_x, cam_y, am
     Called AFTER draw_bankside_features so tributary water overwrites roads at crossings,
     then bridge decks are drawn on top of the water."""
     water_col       = lerp3(WATER_DAY, WATER_NIGHT, 1.0 - ambient)
-    mud_col         = dim3((110, 90, 60), ambient)
     pier_col        = dim3((90, 70, 45), ambient)
     bridge_road_col = dim3((145, 138, 125), ambient)
     bridge_rail_col = dim3((72, 76, 82), ambient)
@@ -1026,9 +1026,10 @@ def draw_tributaries_marinas(surf, tributaries, marinas, river, cam_x, cam_y, am
         cx = river.cx(wy)
         tfx, tfy, tpx, tpy = river_basis(wy)
 
-        # Bank attachment point
-        bx = cx + trib.side * tpx * RIVER_HALF
-        by = wy + trib.side * tpy * RIVER_HALF
+        # Bank attachment point — pushed 60 wu into the river so the mouth
+        # visibly cuts into the water rather than sitting flush at the bank edge.
+        bx = cx + trib.side * tpx * (RIVER_HALF - 60)
+        by = wy + trib.side * tpy * (RIVER_HALF - 60)
 
         # Main outward direction: perpendicular to bank, biased upstream so the
         # tributary body extends upstream into the land and the mouth faces
@@ -1068,14 +1069,14 @@ def draw_tributaries_marinas(surf, tributaries, marinas, river, cam_x, cam_y, am
         poly = left_pts + list(reversed(right_pts))
         if len(poly) >= 3:
             pygame.draw.polygon(surf, water_col, poly)
-            pygame.draw.polygon(surf, mud_col, poly, 2)
 
         # ── Bridge decks at road & rail crossings ─────────────────────────────
-        # The lateral distance from bank to road midpoint is 10 wu, rail is 31 wu.
-        # Distance along tributary axis to reach those lateral offsets = offset * L_ox.
+        # Bank attachment is at RIVER_HALF - 60 from centre.
+        # Road midpoint is at RIVER_HALF + 10 → 70 wu outward from attachment.
+        # Rail midpoint is at RIVER_HALF + 31 → 91 wu outward from attachment.
         for lat_off, deck_hw, bridge_col, is_rail in [
-            (10.0, 7,  bridge_road_col, False),
-            (31.0, 5,  bridge_rail_col, True),
+            (70.0, 7,  bridge_road_col, False),
+            (91.0, 5,  bridge_rail_col, True),
         ]:
             cross_dist = lat_off * L_ox
             if cross_dist >= trib.length:
@@ -1092,8 +1093,11 @@ def draw_tributaries_marinas(surf, tributaries, marinas, river, cam_x, cam_y, am
             # tributary.  half_span = tributary half-width projected onto the road
             # axis (how far the road section sits over water).  half_deck = road
             # half-width in the perpendicular (tpx,tpy) direction.
-            dot_sxt_tf = (-oy) * tfx + ox * tfy   # sx_t · river-flow unit
-            half_span  = max(10.0, abs(dot_sxt_tf) * w_cross)
+            # sin of angle between road direction and tributary cross-direction.
+            # Bridge span = w_cross / sin(angle): angled crossings need longer bridges.
+            dot_sxt_tf = (-oy) * tfx + ox * tfy
+            sin_angle  = max(abs(dot_sxt_tf), 0.20)
+            half_span  = max(10.0, w_cross / sin_angle + 6.0)
             half_deck  = float(deck_hw)
             bpts = [
                 w2s(cx_c + tpx * half_deck + tfx * half_span,
@@ -1255,9 +1259,20 @@ def draw_bankside_features(surf, river, cam_x, cam_y, ambient):
         rng   = random.Random(strip_wy)
         count = rng.randint(1, 3)
         for _ in range(count):
+            # Consume ALL rng values unconditionally so the sequence is stable
+            # regardless of which houses are currently on-screen.
             side = rng.choice((-1, 1))
             off  = rng.uniform(RIVER_HALF + 44, RIVER_HALF + 102)
             wy_h = strip_wy + rng.uniform(-70, 70)
+            hw   = rng.randint(11, 18)
+            hlen = rng.randint(16, 26)
+            wall = rng.choice([
+                (192, 176, 156), (178, 162, 142), (208, 192, 172),
+                (182, 182, 178), (175, 158, 130),
+            ])
+            roof = rng.choice([
+                (145, 68, 48), (78, 68, 62), (108, 92, 76), (58, 72, 88),
+            ])
             hcx  = river.cx(wy_h)
             hdc  = river.dcx(wy_h)
             hl_n = math.sqrt(1.0 + hdc * hdc)
@@ -1266,24 +1281,14 @@ def draw_bankside_features(surf, river, cam_x, cam_y, ambient):
             hsx = int((hcx + side * off) - cam_x + SW // 2)
             hsy = int(wy_h - cam_y + VREF_Y)
             if -30 < hsx < SW + 30 and -30 < hsy < SH + 30:
-                hw = rng.randint(11, 18)
-                hlen = rng.randint(16, 26)
                 pts = [
                     (int(hsx + hpx*hw/2 + hfx*hlen/2), int(hsy + hpy*hw/2 + hfy*hlen/2)),
                     (int(hsx - hpx*hw/2 + hfx*hlen/2), int(hsy - hpy*hw/2 + hfy*hlen/2)),
                     (int(hsx - hpx*hw/2 - hfx*hlen/2), int(hsy - hpy*hw/2 - hfy*hlen/2)),
                     (int(hsx + hpx*hw/2 - hfx*hlen/2), int(hsy + hpy*hw/2 - hfy*hlen/2)),
                 ]
-                wall = rng.choice([
-                    (192, 176, 156), (178, 162, 142), (208, 192, 172),
-                    (182, 182, 178), (175, 158, 130),
-                ])
-                roof = rng.choice([
-                    (145, 68, 48), (78, 68, 62), (108, 92, 76), (58, 72, 88),
-                ])
                 pygame.draw.polygon(surf, dim3(wall, ambient), pts)
                 pygame.draw.polygon(surf, dim3(roof, ambient), pts, 2)
-                # Roof ridge
                 ridge1 = ((pts[0][0]+pts[1][0])//2, (pts[0][1]+pts[1][1])//2)
                 ridge2 = ((pts[2][0]+pts[3][0])//2, (pts[2][1]+pts[3][1])//2)
                 pygame.draw.line(surf, dim3(roof, min(1.0, ambient + 0.12)), ridge1, ridge2, 1)
@@ -1335,9 +1340,21 @@ def draw_bridges(surf, river, cam_x, cam_y, ambient):
             pygame.draw.line(surf, mark, p1, p2, 2)
 
 
-def draw_road_traffic(surf, road_cars, rail_trains, river, cam_x, cam_y, ambient):
+def draw_road_traffic(surf, road_cars, rail_trains, river, cam_x, cam_y, ambient,
+                      marinas=None):
     """Draw cars on roads and trains on tracks along both river banks."""
     is_dark = ambient < 0.55
+
+    # Pre-build marina skip zones: (side, wy_min, wy_max)
+    skip_zones = []
+    for m in (marinas or []):
+        skip_zones.append((m.side, m.wy - m.half_width, m.wy + m.half_width))
+
+    def in_marina(wy, side):
+        for zs, zlo, zhi in skip_zones:
+            if zs == side and zlo <= wy <= zhi:
+                return True
+        return False
 
     ROAD_LAT = RIVER_HALF + 10   # lateral offset from river centre to road centre
     RAIL_LAT  = RIVER_HALF + 31  # lateral offset to rail centre
@@ -1360,6 +1377,8 @@ def draw_road_traffic(surf, road_cars, rail_trains, river, cam_x, cam_y, ambient
     for car in road_cars:
         sy = int(car.wy - cam_y + VREF_Y)
         if sy < -30 or sy > SH + 30:
+            continue
+        if in_marina(car.wy, car.side):
             continue
         cx  = river.cx(car.wy)
         sx  = int(cx - cam_x + SW // 2) + car.side * ROAD_LAT
@@ -1391,7 +1410,7 @@ def draw_road_traffic(surf, road_cars, rail_trains, river, cam_x, cam_y, ambient
         loco_front = train.wy
         loco_cy    = loco_front - d * RailTrain.LOCO_L / 2
         loco_sy    = int(loco_cy - cam_y + VREF_Y)
-        if -60 < loco_sy < SH + 60:
+        if -60 < loco_sy < SH + 60 and not in_marina(loco_cy, train.side):
             ltfx, ltfy, ltpx, ltpy = _orient(loco_cy)
             cx  = river.cx(loco_cy)
             lsx = int(cx - cam_x + SW // 2) + train.side * RAIL_LAT
@@ -1419,7 +1438,7 @@ def draw_road_traffic(surf, road_cars, rail_trains, river, cam_x, cam_y, ambient
             car_wy = train.wy - d * (offset + i * (RailTrain.CAR_L + RailTrain.GAP)
                                      + RailTrain.CAR_L / 2)
             car_sy = int(car_wy - cam_y + VREF_Y)
-            if -40 < car_sy < SH + 40:
+            if -40 < car_sy < SH + 40 and not in_marina(car_wy, train.side):
                 ctfx, ctfy, ctpx, ctpy = _orient(car_wy)
                 cx  = river.cx(car_wy)
                 csx = int(cx - cam_x + SW // 2) + train.side * RAIL_LAT
@@ -1864,36 +1883,84 @@ class AIVessel:
         self.vessel_type = vessel_type
         self.name        = name
         self.captain     = captain
-        self.speed       = (_AI_SPEEDS.get(vessel_type, 1.5)
+        self.base_speed  = (_AI_SPEEDS.get(vessel_type, 1.5)
                             * random.uniform(0.85, 1.15))
+        self.speed       = self.base_speed
         # Collision physics
         self.vx_def    = 0.0   # lateral/longitudinal deflection velocity (wu/frame)
         self.vy_def    = 0.0
         self.hit_flash = 0     # frames remaining for red flash
 
-    def update(self, river: RiverCurve, player_x: float, player_y: float):
-        # Forward travel along river
+    def update(self, river: RiverCurve, player_vessel, others: list):
+        # Use the bow of the barge formation as the player's leading edge,
+        # and form_half_width for lateral extent — both account for however
+        # many barges are currently attached.
+        pl_bow_x, pl_bow_y = player_vessel.bow_pos
+        pl_hw = player_vessel.form_half_width + 8   # small buffer
+        my_hw = _AI_DIMS.get(self.vessel_type, (10, 30))[0]
+
+        # ── Speed matching: slow behind same-direction vessels ahead ────────
+        obstacles = []
+        for ov in others:
+            if ov is self:
+                continue
+            ahead = (ov.wy - self.wy) * self.direction
+            if 0 < ahead <= AI_SPEED_MATCH_DIST:
+                ov_hw = _AI_DIMS.get(ov.vessel_type, (10, 30))[0]
+                if abs(self.wx - ov.wx) < my_hw + ov_hw + AI_LAT_CLEAR:
+                    obstacles.append((ahead, ov.speed))
+        # Player: measure ahead distance from bow, not towboat centre
+        pl_ahead = (pl_bow_y - self.wy) * self.direction
+        if 0 < pl_ahead <= AI_SPEED_MATCH_DIST:
+            if abs(self.wx - pl_bow_x) < my_hw + pl_hw:
+                player_fwd = max(0.0, player_vessel.speed)
+                obstacles.append((pl_ahead, player_fwd))
+
+        if obstacles:
+            closest = min(obstacles, key=lambda t: t[0])
+            self.speed = min(self.speed, closest[1] * 0.92)
+            self.speed = max(0.0, self.speed)
+        else:
+            self.speed = min(self.base_speed,
+                             self.speed + self.base_speed * 0.02)
+
+        # ── Forward travel ──────────────────────────────────────────────────
         self.wy += self.speed * self.direction
 
-        # Apply deflection from collision impulse
+        # Apply and decay deflection impulse from hard collisions
         self.wx += self.vx_def
         self.wy += self.vy_def
-
-        # Decay deflection and drift back toward the channel centreline
         self.vx_def *= 0.88
         self.vy_def *= 0.88
-        channel_x    = river.cx(self.wy)
-        self.wx     += (channel_x - self.wx) * 0.04   # gradual return
 
-        # Steer away from the player when within range
-        long_sep = abs(player_y - self.wy)
-        if long_sep < AI_AVOID_LONG:
-            lat_diff = self.wx - player_x
-            prox     = 1.0 - long_sep / AI_AVOID_LONG
-            crowd    = max(0.0, 1.0 - abs(lat_diff) / AI_AVOID_LAT)
-            if crowd > 0:
-                side     = 1 if lat_diff >= 0 else -1
-                self.wx += side * AI_AVOID_STR * prox * crowd
+        # ── Lateral avoidance: repel from all nearby vessels ────────────────
+        nudge = 0.0
+        # Player represented by bow position + formation half-width
+        all_vessels = [(pl_bow_x, pl_bow_y, pl_hw)]
+        for ov in others:
+            if ov is self:
+                continue
+            ov_hw = _AI_DIMS.get(ov.vessel_type, (10, 30))[0]
+            all_vessels.append((ov.wx, ov.wy, ov_hw))
+
+        for ox, oy, ohw in all_vessels:
+            long_sep = abs(oy - self.wy)
+            if long_sep > AI_LOOK_AHEAD:
+                continue
+            lat_diff = self.wx - ox
+            needed   = my_hw + ohw + AI_LAT_CLEAR
+            if abs(lat_diff) < needed:
+                # How deep into the clearance zone we are (0=just touching, 1=fully overlapping)
+                overlap = 1.0 - abs(lat_diff) / needed
+                long_fac = 1.0 - long_sep / AI_LOOK_AHEAD
+                side = 1 if lat_diff >= 0 else -1
+                nudge += side * AI_LAT_STR * overlap * long_fac
+
+        self.wx += nudge
+
+        # Drift back toward river centreline
+        channel_x = river.cx(self.wy)
+        self.wx  += (channel_x - self.wx) * 0.03
 
         if self.hit_flash > 0:
             self.hit_flash -= 1
@@ -2572,7 +2639,7 @@ class PilotGame:
             self.traffic_timer = 0.0
             self._maybe_spawn_traffic()
         for av in self.ai_vessels:
-            av.update(self.river, self.vessel.x, self.vessel.y)
+            av.update(self.river, self.vessel, self.ai_vessels)
         self.ai_vessels = [
             av for av in self.ai_vessels
             if (av.wy - self.vessel.y) * av.direction > -TRAFFIC_CULL_DIST
@@ -2646,7 +2713,8 @@ class PilotGame:
 
         # Cars and trains on roads / tracks
         draw_road_traffic(surf, self.road_cars, self.rail_trains,
-                          self.river, self.cam_x, self.cam_y, ambient)
+                          self.river, self.cam_x, self.cam_y, ambient,
+                          marinas=self.marinas)
 
         # Objects
         draw_obstacles(surf, self.obstacles, self.cam_x, self.cam_y, ambient)
