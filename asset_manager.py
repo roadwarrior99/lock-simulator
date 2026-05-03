@@ -33,6 +33,9 @@ Usage examples
 
     # Browse and regenerate art_assets in a windowed UI
     python asset_manager.py browse
+
+    # CRUD editor for crew_messages (context, stage_id dropdowns; search by id/name)
+    python asset_manager.py crew-messages
 """
 
 import argparse
@@ -1214,6 +1217,529 @@ def browse_assets_ui(db):
     pygame.quit()
 
 
+# ── Crew-messages editor UI ──────────────────────────────────────────────────
+
+_CM_WIN_W, _CM_WIN_H = 1100, 700
+_CM_BG      = (14, 16, 20)
+_CM_PANEL   = (24, 27, 33)
+_CM_ACCENT  = (80, 160, 220)
+_CM_TEXT    = (210, 212, 218)
+_CM_DIM     = (100, 104, 114)
+_CM_SEL     = (40,  80, 130)
+_CM_ERR     = (200,  60,  60)
+_CM_OK      = (60,  180,  80)
+_CM_INPUT   = (30,  34,  42)
+_CM_BORDER  = (55,  60,  70)
+
+
+def crew_messages_ui(db):
+    """
+    Pygame CRUD editor for the crew_messages table.
+
+    Layout
+    ------
+    Left pane  — search bar (crew id or name), results list
+    Right pane — form: context (free-form dropdown), stage_id (free-form
+                 dropdown), message textarea, crew picker; New / Save / Delete
+    """
+    try:
+        import pygame
+    except ImportError:
+        sys.exit("pygame is required.  Run: pip install pygame")
+
+    pygame.init()
+    screen = pygame.display.set_mode((_CM_WIN_W, _CM_WIN_H))
+    pygame.display.set_caption("Crew Messages — Albatross")
+    clock = pygame.time.Clock()
+
+    fnt_lg = pygame.font.SysFont('monospace', 14, bold=True)
+    fnt_md = pygame.font.SysFont('monospace', 13)
+    fnt_sm = pygame.font.SysFont('monospace', 12)
+
+    LIST_W   = 340
+    FORM_X   = LIST_W + 12
+    FORM_W   = _CM_WIN_W - FORM_X - 10
+
+    # ── known option pools (free-form — user can still type anything) ──────────
+    KNOWN_CONTEXTS  = sorted(DIALOG_CONTEXT_HINTS.keys()) + ['other']
+    KNOWN_STAGES    = ['operator', 'deckhand', 'engineer', 'captain', 'pilot']
+
+    STAGE_CONTEXTS = {
+        'operator':  ['gate_open', 'gate_close', 'lock_entering', 'lock_exiting',
+                      'shift_start', 'shift_end', 'idle'],
+        'deckhand':  ['moor', 'unmoor', 'connect', 'tension', 'paint', 'lookout', 'working'],
+        'engineer':  ['engine_trouble', 'bilge_alarm', 'shift_start', 'shift_end', 'idle'],
+        'captain':   ['lock_entering', 'lock_exiting', 'engine_trouble',
+                      'shift_start', 'shift_end', 'idle'],
+        'pilot':     ['lock_entering', 'lock_exiting', 'shift_start', 'shift_end', 'idle'],
+    }
+
+    # ── state ─────────────────────────────────────────────────────────────────
+    search_text   = ''
+    search_active = False
+    all_crew      = db.crew_list()
+    crew_by_id    = {c['id']: c for c in all_crew}
+    crew_by_name  = {}
+    for c in all_crew:
+        crew_by_name.setdefault(c['name'].lower(), []).append(c)
+
+    messages      = []   # currently displayed rows
+    sel_idx       = -1   # index into messages
+    status_msg    = ''
+    status_ok     = True
+
+    # Form fields
+    f_crew_id     = ''
+    f_context     = ''
+    f_stage_id    = ''
+    f_message     = ''
+    f_role        = ''
+    editing_id    = None   # None = new record
+
+    # Which field has keyboard focus
+    FIELDS = ['search', 'crew_id', 'role', 'stage_id', 'context', 'message']
+    focus  = 'search'
+
+    # Dropdown state
+    dd_context_open  = False
+    dd_stage_open    = False
+    dd_ctx_filter    = ''
+    dd_stg_filter    = ''
+
+    def _reload(query=''):
+        nonlocal messages, sel_idx
+        q = query.strip().lower()
+        if not q:
+            messages = []
+            sel_idx  = -1
+            return
+        else:
+            # Try numeric crew_id first, then name substring
+            try:
+                cid = int(q)
+                messages = db.crew_messages(crew_id=cid, limit=200)
+            except ValueError:
+                # name match — collect crew_ids then fetch
+                matched_ids = [
+                    c['id'] for name, crew in crew_by_name.items()
+                    if q in name
+                    for c in crew
+                ]
+                if matched_ids:
+                    rows = []
+                    seen = set()
+                    for cid in matched_ids:
+                        for row in db.crew_messages(crew_id=cid, limit=200):
+                            if row['id'] not in seen:
+                                seen.add(row['id'])
+                                rows.append(row)
+                    rows.sort(key=lambda r: r['id'], reverse=True)
+                    messages = rows
+                else:
+                    messages = []
+        sel_idx = 0 if messages else -1
+
+    def _load_form(row):
+        nonlocal f_crew_id, f_context, f_stage_id, f_message, f_role, editing_id
+        editing_id = row['id']
+        f_crew_id  = str(row['crew_id'] or '')
+        f_context  = row['context']  or ''
+        f_stage_id = row['stage_id'] or ''
+        f_message  = row['message']  or ''
+        f_role     = row['role']     or ''
+
+    def _clear_form():
+        nonlocal f_crew_id, f_context, f_stage_id, f_message, f_role, editing_id
+        editing_id = None
+        f_crew_id  = ''
+        f_context  = ''
+        f_stage_id = ''
+        f_message  = ''
+        f_role     = ''
+
+    def _set_status(msg, ok=True):
+        nonlocal status_msg, status_ok
+        status_msg = msg
+        status_ok  = ok
+
+    def _save():
+        cid = int(f_crew_id) if f_crew_id.strip().isdigit() else None
+        if editing_id is None:
+            new_id = db.add_crew_message(
+                crew_id=cid, message=f_message or None,
+                role=f_role or None, context=f_context or None,
+                stage_id=f_stage_id or None,
+            )
+            _set_status(f'Created id={new_id}')
+        else:
+            db.update_crew_message(
+                editing_id,
+                crew_id=cid, message=f_message or None,
+                role=f_role or None, context=f_context or None,
+                stage_id=f_stage_id or None,
+            )
+            _set_status(f'Saved id={editing_id}')
+        _reload(search_text)
+
+    def _delete():
+        if editing_id is None:
+            _set_status('Nothing selected', ok=False)
+            return
+        db.delete_crew_message(editing_id)
+        _set_status(f'Deleted id={editing_id}')
+        _clear_form()
+        _reload(search_text)
+
+    def _input_box(rect, text, active, label='', multiline=False):
+        """Draw a labelled input box; return (inner_rect)."""
+        if label:
+            lbl = fnt_sm.render(label, True, _CM_DIM)
+            screen.blit(lbl, (rect.x, rect.y - 16))
+        col = _CM_ACCENT if active else _CM_BORDER
+        pygame.draw.rect(screen, _CM_INPUT, rect, border_radius=3)
+        pygame.draw.rect(screen, col, rect, 1, border_radius=3)
+        inner = rect.inflate(-6, -4)
+        if multiline:
+            # Word-wrap text to fit inner width, then show last N visible lines
+            def _wrap(raw, max_w):
+                wrapped = []
+                for paragraph in raw.split('\n'):
+                    words = paragraph.split(' ') if paragraph else ['']
+                    line = ''
+                    for word in words:
+                        test = (line + ' ' + word).strip() if line else word
+                        if fnt_md.size(test)[0] <= max_w:
+                            line = test
+                        else:
+                            if line:
+                                wrapped.append(line)
+                            line = word
+                    wrapped.append(line)
+                return wrapped
+
+            line_h   = 16
+            max_vis  = inner.height // line_h
+            wrapped  = _wrap(text, inner.width)
+            visible  = wrapped[-max_vis:]
+            for i, ln in enumerate(visible):
+                s = fnt_md.render(ln, True, _CM_TEXT)
+                screen.blit(s, (inner.x, inner.y + i * line_h))
+        else:
+            s = fnt_md.render(text, True, _CM_TEXT)
+            screen.blit(s, (inner.x, inner.y))
+        if active:
+            if multiline:
+                wrapped  = _wrap(text, inner.width) if text else ['']
+                max_vis  = inner.height // 16
+                last_vis = wrapped[-max_vis:]
+                last_ln  = last_vis[-1]
+                cx = inner.x + fnt_md.size(last_ln)[0]
+                cy = inner.y + (len(last_vis) - 1) * 16
+            else:
+                cx = inner.x + fnt_md.size(text)[0]
+                cy = inner.y
+            if (pygame.time.get_ticks() // 500) % 2 == 0:
+                pygame.draw.line(screen, _CM_ACCENT, (cx, cy), (cx, cy + 14), 1)
+
+    def _dropdown_base(rect, value, open_flag, label=''):
+        """Draw the closed part of a dropdown (box + current value + arrow)."""
+        if label:
+            lbl = fnt_sm.render(label, True, _CM_DIM)
+            screen.blit(lbl, (rect.x, rect.y - 16))
+        pygame.draw.rect(screen, _CM_INPUT, rect, border_radius=3)
+        pygame.draw.rect(screen, _CM_BORDER, rect, 1, border_radius=3)
+        sv = fnt_md.render(value or '—', True, _CM_TEXT if value else _CM_DIM)
+        screen.blit(sv, (rect.x + 4, rect.y + 4))
+        arrow = '▲' if open_flag else '▼'
+        ar = fnt_sm.render(arrow, True, _CM_ACCENT)
+        screen.blit(ar, (rect.right - 18, rect.y + 4))
+
+    def _dropdown_overlay(rect, options):
+        """Draw the open dropdown list on top of everything else."""
+        item_h  = 18
+        n_show  = min(len(options), 8)
+        dd_rect = pygame.Rect(rect.x, rect.bottom, rect.width, n_show * item_h + 4)
+        pygame.draw.rect(screen, (20, 24, 30), dd_rect)
+        pygame.draw.rect(screen, _CM_ACCENT,   dd_rect, 1)
+        mouse_pos = pygame.mouse.get_pos()
+        for i, opt in enumerate(options[:8]):
+            iy = dd_rect.y + 2 + i * item_h
+            hs = pygame.Rect(rect.x, iy, rect.width, item_h)
+            if hs.collidepoint(mouse_pos):
+                pygame.draw.rect(screen, _CM_SEL, hs)
+            s = fnt_sm.render(opt, True, _CM_TEXT)
+            screen.blit(s, (rect.x + 6, iy + 2))
+
+    def _button(rect, label, color=_CM_ACCENT):
+        mx, my = pygame.mouse.get_pos()
+        hover  = rect.collidepoint(mx, my)
+        bg     = tuple(min(255, c + 20) for c in color) if hover else color
+        pygame.draw.rect(screen, bg, rect, border_radius=4)
+        s = fnt_md.render(label, True, (240, 245, 255))
+        screen.blit(s, s.get_rect(center=rect.center))
+
+    _reload()
+
+    # pre-compute rects (recalculated each frame only where needed)
+    running = True
+    while running:
+        clock.tick(30)
+        screen.fill(_CM_BG)
+
+        # ── Left pane — search + list ─────────────────────────────────────────
+        pygame.draw.rect(screen, _CM_PANEL, (0, 0, LIST_W, _CM_WIN_H))
+        pygame.draw.line(screen, _CM_BORDER, (LIST_W, 0), (LIST_W, _CM_WIN_H), 1)
+
+        hdr = fnt_lg.render('Crew Messages', True, _CM_ACCENT)
+        screen.blit(hdr, (10, 8))
+
+        # Search box
+        srect = pygame.Rect(8, 32, LIST_W - 16, 24)
+        _input_box(srect, search_text, focus == 'search', label='')
+        hint = fnt_sm.render('Search by id or name', True, _CM_DIM)
+        screen.blit(hint, (srect.x + 2, srect.y - 14))
+
+        # Message list
+        list_y = 68
+        item_h = 52
+        for i, row in enumerate(messages[:12]):
+            iy   = list_y + i * item_h
+            bg   = _CM_SEL if i == sel_idx else (32, 36, 44) if i % 2 == 0 else _CM_PANEL
+            pygame.draw.rect(screen, bg, (4, iy, LIST_W - 8, item_h - 2),
+                             border_radius=3)
+            sender = row.get('sender') or f"crew {row['crew_id']}" or '—'
+            ctx    = row.get('context') or '—'
+            stg    = row.get('stage_id') or '—'
+            msg_pre = (row.get('message') or '')[:55]
+            screen.blit(fnt_sm.render(f"#{row['id']}  {sender}", True, _CM_ACCENT),
+                        (10, iy + 3))
+            screen.blit(fnt_sm.render(f"ctx={ctx}  stage={stg}", True, _CM_DIM),
+                        (10, iy + 17))
+            screen.blit(fnt_sm.render(msg_pre, True, _CM_TEXT),
+                        (10, iy + 31))
+
+        count_s = fnt_sm.render(f'{len(messages)} record(s)', True, _CM_DIM)
+        screen.blit(count_s, (10, _CM_WIN_H - 20))
+
+        # ── Right pane — form ─────────────────────────────────────────────────
+        fy = 12
+        fx = FORM_X
+
+        title = 'Edit #' + str(editing_id) if editing_id else 'New record'
+        screen.blit(fnt_lg.render(title, True, _CM_ACCENT), (fx, fy));  fy += 24
+
+        # crew_id field
+        cr_rect = pygame.Rect(fx, fy + 16, 160, 26)
+        _input_box(cr_rect, f_crew_id, focus == 'crew_id', label='crew_id')
+        # show resolved name
+        try:
+            cid_int = int(f_crew_id)
+            cname   = crew_by_id.get(cid_int, {}).get('name', '?')
+        except (ValueError, TypeError):
+            cname = ''
+        if cname:
+            screen.blit(fnt_sm.render(cname, True, _CM_OK), (fx + 168, fy + 20))
+        fy += 52
+
+        # role field
+        ro_rect = pygame.Rect(fx, fy + 16, FORM_W, 26)
+        _input_box(ro_rect, f_role, focus == 'role', label='role')
+        fy += 52
+
+        # stage_id dropdown (base only — pick this first)
+        stg_rect = pygame.Rect(fx, fy + 16, FORM_W, 26)
+        stg_opts  = [o for o in KNOWN_STAGES if dd_stg_filter.lower() in o.lower()]
+        _dropdown_base(stg_rect, f_stage_id, dd_stage_open, label='stage_id')
+        fy += 52
+
+        # context dropdown — options filtered by selected stage_id
+        ctx_rect = pygame.Rect(fx, fy + 16, FORM_W, 26)
+        stage_pool = STAGE_CONTEXTS.get(f_stage_id, KNOWN_CONTEXTS)
+        ctx_opts   = [o for o in stage_pool if dd_ctx_filter.lower() in o.lower()]
+        _dropdown_base(ctx_rect, f_context, dd_context_open, label='context')
+        fy += 52
+
+        # message textarea
+        msg_rect = pygame.Rect(fx, fy + 16, FORM_W, 130)
+        _input_box(msg_rect, f_message, focus == 'message', label='message', multiline=True)
+        fy += 158
+
+        # buttons
+        btn_save   = pygame.Rect(fx,          fy, 90, 28)
+        btn_new    = pygame.Rect(fx + 100,    fy, 90, 28)
+        btn_delete = pygame.Rect(fx + 200,    fy, 90, 28)
+        _button(btn_save,   'Save',   (50, 140, 80))
+        _button(btn_new,    'New',    (60, 110, 180))
+        _button(btn_delete, 'Delete', (160, 50, 50))
+        fy += 40
+
+        # status
+        if status_msg:
+            sc = _CM_OK if status_ok else _CM_ERR
+            screen.blit(fnt_sm.render(status_msg, True, sc), (fx, fy))
+
+        # help line
+        screen.blit(fnt_sm.render('Tab=next field  Enter=save  Ctrl+N=new  Del=delete  ESC=quit',
+                                  True, _CM_DIM), (fx, _CM_WIN_H - 18))
+
+        # ── Dropdown overlays — drawn last so they sit on top of everything ───
+        if dd_context_open and ctx_opts:
+            _dropdown_overlay(ctx_rect, ctx_opts)
+        if dd_stage_open and stg_opts:
+            _dropdown_overlay(stg_rect, stg_opts)
+
+        pygame.display.flip()
+
+        # ── Events ────────────────────────────────────────────────────────────
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                mx, my = event.pos
+
+                # Search box click
+                if srect.collidepoint(mx, my):
+                    focus = 'search'
+
+                # List item click
+                elif 4 <= mx <= LIST_W - 4:
+                    i = (my - list_y) // item_h
+                    if 0 <= i < len(messages):
+                        sel_idx = i
+                        _load_form(messages[i])
+                        dd_context_open = False
+                        dd_stage_open   = False
+                        focus = 'message'
+
+                # ── Open dropdown clicks handled first (overlays cover other rects) ──
+                elif dd_stage_open:
+                    item_h_dd = 18
+                    dd_top = stg_rect.bottom + 2
+                    i = (my - dd_top) // item_h_dd
+                    if stg_rect.collidepoint(mx, my):
+                        dd_stage_open = not dd_stage_open  # click on box itself — toggle
+                    else:
+                        if 0 <= i < len(stg_opts):
+                            f_stage_id    = stg_opts[i]
+                            f_context     = ''             # clear context when stage changes
+                            dd_ctx_filter = ''
+                            dd_stg_filter = ''
+                        dd_stage_open = False
+
+                elif dd_context_open:
+                    item_h_dd = 18
+                    dd_top = ctx_rect.bottom + 2
+                    i = (my - dd_top) // item_h_dd
+                    if ctx_rect.collidepoint(mx, my):
+                        dd_context_open = not dd_context_open
+                    else:
+                        if 0 <= i < len(ctx_opts):
+                            f_context       = ctx_opts[i]
+                        dd_context_open = False
+
+                # ── Normal field clicks (no dropdown open) ────────────────────
+                elif cr_rect.collidepoint(mx, my):
+                    focus = 'crew_id'
+                elif ro_rect.collidepoint(mx, my):
+                    focus = 'role'
+                elif stg_rect.collidepoint(mx, my):
+                    dd_stage_open   = True
+                    dd_context_open = False
+                    focus = 'stage_id'
+                elif ctx_rect.collidepoint(mx, my):
+                    dd_context_open = True
+                    dd_stage_open   = False
+                    focus = 'context'
+                elif msg_rect.collidepoint(mx, my):
+                    focus = 'message'
+
+                # Button clicks
+                elif btn_save.collidepoint(mx, my):
+                    _save()
+                elif btn_new.collidepoint(mx, my):
+                    _clear_form()
+                    focus = 'crew_id'
+                elif btn_delete.collidepoint(mx, my):
+                    _delete()
+
+            elif event.type == pygame.KEYDOWN:
+                mods = pygame.key.get_mods()
+                ctrl = mods & pygame.KMOD_CTRL
+
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+
+                elif event.key == pygame.K_TAB:
+                    # Cycle focus through form fields (skip search)
+                    form_fields = ['crew_id', 'role', 'stage_id', 'context', 'message']
+                    if focus in form_fields:
+                        i = (form_fields.index(focus) + 1) % len(form_fields)
+                        focus = form_fields[i]
+                    else:
+                        focus = 'crew_id'
+                    dd_context_open = False
+                    dd_stage_open   = False
+
+                elif event.key == pygame.K_RETURN:
+                    if ctrl:
+                        # Ctrl+Enter = newline in message
+                        if focus == 'message':
+                            f_message += '\n'
+                    else:
+                        if focus == 'search':
+                            _reload(search_text)
+                        else:
+                            _save()
+
+                elif ctrl and event.key == pygame.K_n:
+                    _clear_form()
+                    focus = 'crew_id'
+
+                elif event.key == pygame.K_DELETE and ctrl:
+                    _delete()
+
+                elif event.key == pygame.K_BACKSPACE:
+                    if focus == 'search':
+                        search_text = search_text[:-1]
+                        _reload(search_text)
+                    elif focus == 'crew_id':
+                        f_crew_id = f_crew_id[:-1]
+                    elif focus == 'role':
+                        f_role = f_role[:-1]
+                    elif focus == 'context':
+                        f_context = f_context[:-1]
+                        dd_ctx_filter = f_context
+                    elif focus == 'stage_id':
+                        f_stage_id = f_stage_id[:-1]
+                        dd_stg_filter = f_stage_id
+                    elif focus == 'message':
+                        f_message = f_message[:-1]
+
+                elif event.unicode and event.unicode.isprintable():
+                    ch = event.unicode
+                    if focus == 'search':
+                        search_text += ch
+                        _reload(search_text)
+                    elif focus == 'crew_id':
+                        if ch.isdigit():
+                            f_crew_id += ch
+                    elif focus == 'role':
+                        f_role += ch
+                    elif focus == 'context':
+                        f_context += ch
+                        dd_ctx_filter = f_context
+                        dd_context_open = True
+                    elif focus == 'stage_id':
+                        f_stage_id += ch
+                        dd_stg_filter = f_stage_id
+                        dd_stage_open = True
+                    elif focus == 'message':
+                        f_message += ch
+
+    pygame.quit()
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def build_parser():
@@ -1295,6 +1821,10 @@ def build_parser():
 
     # -- browse
     sub.add_parser('browse', help='Open the art_assets browser UI')
+
+    # -- crew-messages
+    sub.add_parser('crew-messages',
+                   help='Open the crew_messages CRUD editor UI')
 
     # -- gen-portraits
     gp = sub.add_parser('gen-portraits',
@@ -1648,6 +2178,9 @@ def main():
 
         elif args.cmd == 'browse':
             browse_assets_ui(db)
+
+        elif args.cmd == 'crew-messages':
+            crew_messages_ui(db)
 
         elif args.cmd == 'gen-portraits':
             if args.dry_run:

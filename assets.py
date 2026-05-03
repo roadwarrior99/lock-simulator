@@ -252,6 +252,21 @@ class GameDatabase:
                      crew_id, stage_id, role, len(rows))
         return rows
 
+    def update_crew_message(self, msg_id: int, **fields):
+        """Update any subset of crew_message fields by keyword argument."""
+        allowed = {'crew_id', 'message', 'role', 'context', 'stage_id'}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        self._run(
+            f"UPDATE crew_messages SET {set_clause} WHERE id = ?",
+            (*updates.values(), msg_id),
+        )
+
+    def delete_crew_message(self, msg_id: int):
+        self._run("DELETE FROM crew_messages WHERE id = ?", (msg_id,))
+
     # ── Ships ─────────────────────────────────────────────────────────────────
 
     def add_ship(

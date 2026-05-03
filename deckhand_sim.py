@@ -473,12 +473,21 @@ class DeckHandSimulation:
         # Walk animation
         self._walk_t = 0.0
 
+        self._first_shift      = first_shift
+
         # Docking state — mooring tasks only available while docked
-        self._docking          = False
-        self._dock_timer       = random.uniform(40.0, 80.0)   # seconds until first dock
+        if first_shift:
+            # Start shift at dock; depart after all cables are connected
+            self._docking          = True
+            self._dock_approach    = 1.0
+            self._moored           = True
+            self._dock_timer       = 999999.0  # won't auto-expire; cable completion triggers unmoor
+        else:
+            self._docking          = False
+            self._dock_timer       = random.uniform(40.0, 80.0)
+            self._moored           = False
+            self._dock_approach    = 0.0
         self._dock_duration    = 0.0
-        self._dock_approach    = 0.0   # 0=far, 1=fully alongside; animates on approach
-        self._moored           = False  # True once all port lines are secured
         self._dock_moor_needed = 0      # port mooring tasks spawned this cycle
         self._dock_moor_done   = 0      # port mooring tasks completed this cycle
         self._unmooring        = False  # True when stay is over, casting off
@@ -688,12 +697,12 @@ class DeckHandSimulation:
         self.mooring_positions = []
         for row in range(self.TOW_ROWS):
             cy = self.tow_origin_y + row * (self.BARGE_H + self.BARGE_GAP_Y) + self.BARGE_H // 2
-            self.mooring_positions.append((self.tow_origin_x - 22, cy))          # port
-            self.mooring_positions.append((self.tow_origin_x + tow_w + 22, cy))  # starboard
+            self.mooring_positions.append((self.tow_origin_x + 10, cy))           # port
+            self.mooring_positions.append((self.tow_origin_x + tow_w - 10, cy))  # starboard
         # Towboat cleats — midship on each side
         tb_cy = self.tow_origin_y + tow_h + 3 + 80 // 2   # towboat_rect.centery
-        self.mooring_positions.append((self.tow_origin_x - 22, tb_cy))           # port
-        self.mooring_positions.append((self.tow_origin_x + tow_w + 22, tb_cy))   # starboard
+        self.mooring_positions.append((self.tow_origin_x + 10, tb_cy))           # port
+        self.mooring_positions.append((self.tow_origin_x + tow_w - 10, tb_cy))   # starboard
 
         # Maintenance spots — centre of each barge deck
         self.maintenance_positions = [b.rect.center for b in self.barges]
@@ -761,7 +770,7 @@ class DeckHandSimulation:
         )
         # Port-side mooring positions (left side of tow — facing the dock)
         self._port_mooring_pos = [
-            p for p in self.mooring_positions if p[0] < self.tow_origin_x
+            p for p in self.mooring_positions if p[0] < self.tow_origin_x + tow_w // 2
         ]
 
     def _barge_at(self, row: int, col: int):
@@ -803,6 +812,11 @@ class DeckHandSimulation:
         task.complete = True
         if task.task_type == 'connect' and task.payload:
             task.payload.connected = True
+            if self._first_shift and self._moored and not self._unmooring:
+                remaining = [t for t in self.active_tasks
+                             if t.task_type == 'connect' and t is not task]
+                if not remaining:
+                    self._trigger_unmoor_sequence()
         elif task.task_type == 'tension' and task.payload:
             task.payload.tensioned = True
         elif task.task_type == 'barge_doors':
@@ -829,6 +843,20 @@ class DeckHandSimulation:
                 return   # skip generic notify
         if scored:
             self._notify(f'+${self.TASK_BONUS:.0f}  {task.label} done')
+
+    def _trigger_unmoor_sequence(self):
+        """Begin casting-off: spawn unmoor tasks and flip unmooring state."""
+        self._unmooring   = True
+        self._unmoor_done = 0
+        self._notify("All cables rigged — cast off the lines!")
+        self._trigger_crew_bubble('leaving_dock')
+        occupied      = {t.position for t in self.active_tasks}
+        unmoor_spawned = 0
+        for pos in self._port_mooring_pos:
+            if pos not in occupied:
+                self.active_tasks.append(Task('unmoor', pos))
+                unmoor_spawned += 1
+        self._unmoor_needed = unmoor_spawned
 
     def _notify(self, msg: str):
         self.notif       = msg
@@ -964,9 +992,17 @@ class DeckHandSimulation:
                 return True
         if self.towboat_rect.inflate(4, 4).collidepoint(px, py):
             return True
-        # Dock platform — walkable once fully alongside
+        # Dock platform + shore bank — walkable once fully alongside
         if self._docking and self._dock_approach >= 1.0:
             if self._dock_rect.collidepoint(px, py):
+                return True
+            tow_h   = (self.TOW_ROWS * self.BARGE_H +
+                       (self.TOW_ROWS - 1) * self.BARGE_GAP_Y)
+            dock_x  = self.tow_origin_x - 4 - 68   # dock_face - dock_w, gap=0
+            dock_y  = self.tow_origin_y - 10
+            dock_h  = tow_h + 20
+            shore   = pygame.Rect(0, dock_y - 8, dock_x, dock_h + 16)
+            if shore.collidepoint(px, py):
                 return True
         for pos in self.mooring_positions:
             if math.hypot(x - pos[0], y - pos[1]) < 18:
@@ -1775,22 +1811,13 @@ class DeckHandSimulation:
                     moor_spawned += 1
             self._dock_moor_needed = moor_spawned
             for pos in self.door_positions:
-                if pos not in occupied:
+                if pos not in occupied and self._barge_door_open.get(pos, 0.0) < 1.0:
                     self.active_tasks.append(Task('barge_doors', pos))
 
         elif self._dock_timer <= 0 and self._moored and not self._unmooring and not self._departing:
             # Stay timer expired — begin unmooring
-            self._trigger_crew_bubble('leaving_dock')
-            self._unmooring     = True
-            self._unmoor_done   = 0
             self._notify("Stay complete — cast off the mooring lines!")
-            occupied = {t.position for t in self.active_tasks}
-            unmoor_spawned = 0
-            for pos in self._port_mooring_pos:
-                if pos not in occupied:
-                    self.active_tasks.append(Task('unmoor', pos))
-                    unmoor_spawned += 1
-            self._unmoor_needed = unmoor_spawned
+            self._trigger_unmoor_sequence()
 
         # Dock approach / departure animation
         if self._docking and not self._departing:
@@ -1892,6 +1919,12 @@ class DeckHandSimulation:
                          (self.TOW_ROWS - 1) * self.BARGE_GAP_Y)
             dock_y    = self.tow_origin_y - 10
             dock_h    = tow_h + 20
+
+            # Shore bank — land mass the dock is attached to (left edge to dock left)
+            pygame.draw.rect(self.screen, (72, 98, 54),
+                             (0, dock_y - 8, dock_x, dock_h + 16))
+            pygame.draw.rect(self.screen, (55, 78, 38),
+                             (0, dock_y - 8, dock_x, 6))  # darker top edge / grass line
 
             # Dock body
             pygame.draw.rect(self.screen, (58, 50, 36),
