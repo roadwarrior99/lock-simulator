@@ -6,6 +6,7 @@ import json
 import glob
 import argparse
 import logging
+import random
 
 from ld_sim import LockDamVisualizer
 from deckhand_sim import DeckHandSimulation
@@ -791,12 +792,20 @@ class GameEngine:
         prog     = self.progressions['deckhand']
         is_night = prog['phase'] == 'nights'
         start    = 20.0 if is_night else 6.0
+
+        # 50 % chance to carry over open-door / empty-barge state from last shift
+        carry = prog.get('_cargo_state')
+        cargo_start = None
+        if carry and random.random() < 0.5:
+            cargo_start = carry
+
         vis = DeckHandSimulation(
             shift_duration=12.0,
             shift_start_time=start,
             cfg_time_scale=2.0,
             dev_mode=self.dev_mode,
             first_shift=(prog['shift_num'] == 1),
+            cargo_start_state=cargo_start,
         )
         vis._shift_phase_label = "Night" if is_night else "Day"
         vis._shift_num_label   = f"{prog['shift_num']}"
@@ -806,6 +815,13 @@ class GameEngine:
 
         if result == 'quit':
             return 'quit'
+
+        # Persist cargo state if any barge ended with doors open and empty
+        end_state = vis.cargo_end_state
+        if any(e['door_open'] >= 1.0 and e['empty'] for e in end_state):
+            prog['_cargo_state'] = end_state
+        else:
+            prog['_cargo_state'] = None
 
         wages   = DeckHandSimulation.HOURLY_WAGE * vis.shift_hours_elapsed
         bonuses = DeckHandSimulation.TASK_BONUS  * vis.score

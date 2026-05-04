@@ -67,6 +67,8 @@ class Task:
         'paint':       4.0,
         'lookout':     5.0,
         'barge_doors': 0.0,   # launches sub-game, not hold-E
+        'unload':      0.0,   # launches endloader mini-game
+        'load':        0.0,   # launches loading mini-game
     }
     LABELS = {
         'connect':     'Connect cable',
@@ -76,6 +78,8 @@ class Task:
         'paint':       'Maintenance',
         'lookout':     'Stand watch',
         'barge_doors': 'Open cargo doors',
+        'unload':      'Unload cargo',
+        'load':        'Load cargo',
     }
 
     def __init__(self, task_type: str, position: tuple, payload=None):
@@ -150,8 +154,7 @@ class AICrewHand:
 
     SPEED       = 62.0   # px / real-second  (~65 % of player speed)
     REACH       = 38.0   # px; close-enough radius to start working
-    # Task types AI will handle; barge_doors needs the panel mini-game so skip
-    VALID_TASKS = {'connect', 'tension', 'moor', 'unmoor', 'paint', 'lookout'}
+    VALID_TASKS = {'connect', 'tension', 'moor', 'unmoor', 'paint', 'lookout', 'barge_doors'}
 
     BUBBLE_INTERVAL_MIN = 14.0   # seconds between spontaneous lines
     BUBBLE_INTERVAL_MAX = 30.0
@@ -310,7 +313,8 @@ class DeckHandSimulation:
     C_HUD_BG      = ( 18,  26,  42)
 
     def __init__(self, shift_duration=None, shift_start_time=6.0,
-                 cfg_time_scale=2.0, dev_mode=False, first_shift=True):
+                 cfg_time_scale=2.0, dev_mode=False, first_shift=True,
+                 cargo_start_state=None):
         pygame.init()
         self.width  = 1200
         self.height = 800
@@ -436,6 +440,14 @@ class DeckHandSimulation:
         # Layout & objects
         self._build_tow()
 
+        # Apply persisted cargo state from previous shift (doors open + empty barges)
+        if cargo_start_state:
+            for i, pos in enumerate(self.door_positions):
+                if i < len(cargo_start_state):
+                    entry = cargo_start_state[i]
+                    self._barge_door_open[pos]   = entry.get('door_open', 0.0)
+                    self._barge_cargo_empty[pos] = entry.get('empty', False)
+
         # Task state
         self.active_tasks = []
         if first_shift:
@@ -525,6 +537,49 @@ class DeckHandSimulation:
         # Constants
         self._BDOOR_AMP_LIMIT  = 0.78
         self._BDOOR_TRIP_DELAY = 0.55
+
+        # Coal loading mini-game state
+        self._load_active    = False
+        self._load_task      = None
+        self._load_hold_rect = None   # pygame.Rect for the hold cross-section
+        self._load_chute_x   = 0.5   # normalised 0–1 across hold width
+        self._load_heights   = []    # height map (px from floor), one entry per column
+        self._load_particles = []    # [{x, y, vy}, …] — coal in flight
+        self._load_spawn_t   = 0.0   # accumulator for particle spawning
+        self._load_fill      = 0.0   # 0–1 current fill fraction
+        self._load_trim      = 0.0   # -1 (left-heavy) to +1 (right-heavy)
+        self._load_phase     = 'loading'   # 'loading' | 'complete'
+        self._load_done_t    = 0.0
+
+        # Endloader unload mini-game state
+        self._unload_active      = False
+        self._unload_task        = None
+        self._unload_hold        = None   # pygame.Rect — play area
+        self._unload_zone        = None   # pygame.Rect — crane pickup zone
+        self._unload_lx          = 0.0   # loader centre x
+        self._unload_ly          = 0.0   # loader centre y
+        self._unload_angle       = 0.0   # radians, 0 = facing right
+        self._unload_speed       = 0.0   # px/s (+forward, −reverse)
+        self._unload_piles       = []    # [{x,y,r,vx,vy}, …]
+        self._unload_total       = 0
+        self._unload_lifted      = 0
+        self._unload_bucket_up   = False  # True when scoop is raised (carrying coal)
+        self._unload_in_bucket   = []     # pile dicts currently held in bucket
+        self._unload_crane_x     = 0.0
+        self._unload_crane_y     = 0.0
+        self._unload_crane_phase = 'moving'   # 'moving'|'descending'|'ascending'
+        self._unload_crane_hold_t = 0.0
+        self._unload_phase       = 'playing'  # 'playing'|'complete'
+        self._unload_done_t      = 0.0
+
+    @property
+    def cargo_end_state(self) -> list[dict]:
+        """Return per-barge cargo state for hand-off to the next shift."""
+        return [
+            {'door_open': self._barge_door_open.get(pos, 0.0),
+             'empty':     self._barge_cargo_empty.get(pos, False)}
+            for pos in self.door_positions
+        ]
 
     # ── Crew dialog bubbles ───────────────────────────────────────────────────
 
@@ -713,7 +768,9 @@ class DeckHandSimulation:
             for b in self.barges
         ]
         # Persistent open-fraction for each bow barge door (0=closed, 1=open)
-        self._barge_door_open = {pos: 0.0 for pos in self.door_positions}
+        self._barge_door_open   = {pos: 0.0   for pos in self.door_positions}
+        # True once that barge's cargo has been unloaded this trip
+        self._barge_cargo_empty = {pos: False  for pos in self.door_positions}
 
         # Inter-barge gap rects (water — falling in triggers overboard)
         self._gap_rects = []
@@ -822,6 +879,25 @@ class DeckHandSimulation:
         elif task.task_type == 'barge_doors':
             self._barge_door_open[task.position] = 1.0
             self._bdoor_barge_pos = None
+            occupied = {t.position for t in self.active_tasks if t is not task}
+            if task.position not in occupied:
+                if self._barge_cargo_empty.get(task.position, False):
+                    self.active_tasks.append(Task('load', task.position))
+                else:
+                    self.active_tasks.append(Task('unload', task.position))
+        elif task.task_type == 'unload':
+            # Mark every barge empty and cancel any other pending unload tasks
+            for pos in self.door_positions:
+                self._barge_cargo_empty[pos] = True
+            self.active_tasks = [t for t in self.active_tasks
+                                 if t.task_type != 'unload' or t is task]
+        elif task.task_type == 'load':
+            # Mark every barge loaded and cancel any other pending load tasks
+            for pos in self.door_positions:
+                self._barge_cargo_empty[pos] = False
+                self._barge_door_open[pos]   = 1.0
+            self.active_tasks = [t for t in self.active_tasks
+                                 if t.task_type != 'load' or t is task]
         elif task.task_type == 'moor' and self._docking and not self._moored:
             self._dock_moor_done += 1
             if self._dock_moor_done >= self._dock_moor_needed:
@@ -1379,6 +1455,601 @@ class DeckHandSimulation:
         title = self.fnt_md.render("WINCH STATION", True, (152, 138, 104))
         self.screen.blit(title, (cx - title.get_width() // 2, 12))
 
+    # ── Coal loading mini-game (side view) ──────────────────────────────────
+
+    _LOAD_N_COLS    = 64     # height-map resolution
+    _LOAD_FILL_TGT  = 0.88   # fraction required to complete
+    _LOAD_PART_RATE = 22.0   # particles per second from chute
+    _LOAD_GRAV      = 900.0  # px/s²
+    _LOAD_CHUTE_SPD = 280.0  # px/s lateral chute speed
+
+    def _start_load(self, task: Task):
+        self._load_active  = True
+        self._load_task    = task
+        self._load_phase   = 'loading'
+        self._load_done_t  = 0.0
+        self._load_spawn_t = 0.0
+        self._load_fill    = 0.0
+        self._load_trim    = 0.0
+
+        # Hold cross-section rect (centred, leaving room for conveyor at top + HUD)
+        hold_w = 660
+        hold_h = 460
+        self._load_hold_rect = pygame.Rect(
+            (self.width  - hold_w) // 2,
+            80,
+            hold_w, hold_h,
+        )
+        self._load_chute_x  = 0.5          # starts centred
+        self._load_heights  = [0.0] * self._LOAD_N_COLS
+        self._load_particles = []
+
+    def _update_load(self, dt: float):
+        if self._load_phase == 'complete':
+            self._load_done_t -= dt
+            if self._load_done_t <= 0:
+                task = self._load_task
+                self._complete_task(task)
+                if task in self.active_tasks:
+                    self.active_tasks.remove(task)
+                self._load_active = False
+                self._load_task   = None
+            return
+
+        keys  = pygame.key.get_pressed()
+        hold  = self._load_hold_rect
+        N     = self._LOAD_N_COLS
+        col_w = hold.width / N
+        max_h = float(hold.height - 10)
+
+        boosting = bool(keys[pygame.K_SPACE])
+
+        # ── Move chute ───────────────────────────────────────────────────────
+        move = ((keys[pygame.K_d] or keys[pygame.K_RIGHT])
+                - (keys[pygame.K_a] or keys[pygame.K_LEFT]))
+        self._load_chute_x = max(0.0, min(1.0,
+            self._load_chute_x + move * self._LOAD_CHUTE_SPD / hold.width * dt))
+
+        # ── Trim (left/right balance) ─────────────────────────────────────────
+        total_h = sum(self._load_heights)
+        if total_h > 0:
+            com = sum(c * h for c, h in enumerate(self._load_heights)) / (total_h * (N - 1))
+            self._load_trim = (com - 0.5) * 2.0   # -1..+1
+        else:
+            self._load_trim = 0.0
+        trim_ok = abs(self._load_trim) < 0.55
+
+        # ── Spawn particles ──────────────────────────────────────────────────
+        rate   = self._LOAD_PART_RATE * (3.0 if boosting else 1.0)
+        rate  *= (1.0 if trim_ok else 0.35)   # flow reduced when badly out of trim
+        self._load_spawn_t += dt
+        interval = 1.0 / rate
+        while self._load_spawn_t >= interval:
+            self._load_spawn_t -= interval
+            chute_screen_x = hold.left + self._load_chute_x * hold.width
+            spread = col_w * (3.5 if boosting else 1.5)
+            px = chute_screen_x + random.uniform(-spread, spread)
+            self._load_particles.append({'x': px, 'y': float(hold.top + 2), 'vy': 60.0})
+
+        # ── Update particles ─────────────────────────────────────────────────
+        settled = []
+        live    = []
+        for p in self._load_particles:
+            p['vy'] += self._LOAD_GRAV * dt
+            p['y']  += p['vy'] * dt
+
+            # Which column?
+            col = int((p['x'] - hold.left) / col_w)
+            col = max(0, min(N - 1, col))
+
+            # Floor level for this column = hold.bottom - current height
+            floor_y = hold.bottom - self._load_heights[col]
+
+            if p['y'] >= floor_y:
+                # Settle: add height to this column
+                pile_gain = col_w * 0.55   # volume deposited per particle
+                self._load_heights[col] = min(max_h, self._load_heights[col] + pile_gain)
+                settled.append(col)
+            elif hold.left <= p['x'] <= hold.right:
+                live.append(p)
+            # else discard (out of bounds)
+        self._load_particles = live
+
+        # ── Equalize adjacent columns (coal spreading) ────────────────────────
+        for _ in range(2):
+            for c in range(N):
+                if c > 0:
+                    diff = self._load_heights[c] - self._load_heights[c - 1]
+                    if abs(diff) > col_w * 0.6:
+                        transfer = diff * 0.08
+                        self._load_heights[c]     -= transfer
+                        self._load_heights[c - 1] += transfer
+                if c < N - 1:
+                    diff = self._load_heights[c] - self._load_heights[c + 1]
+                    if abs(diff) > col_w * 0.6:
+                        transfer = diff * 0.08
+                        self._load_heights[c]     -= transfer
+                        self._load_heights[c + 1] += transfer
+
+        # ── Fill fraction ─────────────────────────────────────────────────────
+        self._load_fill = sum(self._load_heights) / (N * max_h)
+
+        if self._load_fill >= self._LOAD_FILL_TGT:
+            self._load_phase  = 'complete'
+            self._load_done_t = 2.5
+            self._notify("Barge loaded!")
+
+    def _draw_load(self):
+        sw, sh = self.width, self.height
+        hold   = self._load_hold_rect
+        N      = self._LOAD_N_COLS
+        col_w  = hold.width / N
+
+        # Sky / dock backdrop
+        self.screen.fill((28, 32, 40))
+
+        # Conveyor / loading structure above the hold
+        conv_y = 20
+        conv_h = hold.top - conv_y - 4
+        pygame.draw.rect(self.screen, (55, 58, 68), (0, conv_y, sw, conv_h))
+        # Belt lines
+        belt_x = (self.width - 260) // 2
+        pygame.draw.rect(self.screen, (40, 42, 50), (belt_x, conv_y + 4, 260, conv_h - 8))
+        for bx in range(belt_x, belt_x + 260, 18):
+            pygame.draw.line(self.screen, (60, 62, 72), (bx, conv_y + 4), (bx, conv_y + conv_h - 8), 1)
+        # Chute arm (hangs from conveyor down to hold opening)
+        chute_sx = int(hold.left + self._load_chute_x * hold.width)
+        arm_top  = conv_y + conv_h
+        arm_bot  = hold.top
+        pygame.draw.line(self.screen, (100, 105, 118), (chute_sx, arm_top), (chute_sx, arm_bot), 4)
+        # Chute tip funnel
+        tip_w = 22
+        tip_pts = [(chute_sx - tip_w, arm_bot - 18),
+                   (chute_sx + tip_w, arm_bot - 18),
+                   (chute_sx + 8,     arm_bot),
+                   (chute_sx - 8,     arm_bot)]
+        pygame.draw.polygon(self.screen, (88, 94, 108), tip_pts)
+        pygame.draw.polygon(self.screen, (120, 128, 145), tip_pts, 2)
+        # Chute position indicator (small arrow above)
+        pygame.draw.polygon(self.screen, (180, 200, 220),
+                            [(chute_sx, arm_bot - 28),
+                             (chute_sx - 7, arm_bot - 38),
+                             (chute_sx + 7, arm_bot - 38)])
+
+        # ── Hold walls ───────────────────────────────────────────────────────
+        # Steel plate background
+        pygame.draw.rect(self.screen, (36, 34, 32), hold)
+        # Riveted wall panels (left and right)
+        for wall_x, wall_w in [(hold.left, 18), (hold.right - 18, 18)]:
+            pygame.draw.rect(self.screen, (48, 46, 44), (wall_x, hold.top, wall_w, hold.height))
+            for ry in range(hold.top + 12, hold.bottom, 28):
+                pygame.draw.circle(self.screen, (62, 58, 54), (wall_x + 9, ry), 3)
+        # Floor
+        pygame.draw.rect(self.screen, (54, 50, 44), (hold.left, hold.bottom - 8, hold.width, 8))
+        # Hold top lip (opening frame)
+        pygame.draw.rect(self.screen, (70, 68, 60), (hold.left - 4, hold.top - 6, hold.width + 8, 8))
+
+        # ── Coal pile (height map) ────────────────────────────────────────────
+        for c in range(N):
+            h  = self._load_heights[c]
+            if h < 1:
+                continue
+            cx = int(hold.left + c * col_w)
+            cy = int(hold.bottom - h)
+            cw = max(1, int(col_w) + 1)   # +1 avoids gaps between columns
+            # Main coal colour
+            pygame.draw.rect(self.screen, (28, 26, 24), (cx, cy, cw, int(h)))
+            # Surface sheen (top 3px lighter)
+            pygame.draw.rect(self.screen, (48, 45, 42), (cx, cy, cw, min(3, int(h))))
+
+        # ── Particles in flight ───────────────────────────────────────────────
+        for p in self._load_particles:
+            pygame.draw.circle(self.screen, (50, 46, 42), (int(p['x']), int(p['y'])), 3)
+
+        # ── Fill bar (right side of screen) ──────────────────────────────────
+        bar_x  = hold.right + 22
+        bar_y  = hold.top
+        bar_h  = hold.height
+        bar_w  = 18
+        fill_h = int(bar_h * self._load_fill)
+        tgt_y  = int(bar_y + bar_h * (1.0 - self._LOAD_FILL_TGT))
+        pygame.draw.rect(self.screen, (38, 42, 48), (bar_x, bar_y, bar_w, bar_h))
+        pygame.draw.rect(self.screen, (38, 80, 38),
+                         (bar_x, bar_y + bar_h - fill_h, bar_w, fill_h))
+        pygame.draw.line(self.screen, (90, 200, 90),
+                         (bar_x - 4, tgt_y), (bar_x + bar_w + 4, tgt_y), 2)
+        pygame.draw.rect(self.screen, (70, 80, 90), (bar_x, bar_y, bar_w, bar_h), 1)
+        pct_s = self.fnt_sm.render(f'{int(self._load_fill * 100)}%', True, (180, 190, 200))
+        self.screen.blit(pct_s, (bar_x, bar_y - 18))
+
+        # ── Trim indicator (bubble level below hold) ─────────────────────────
+        trim     = self._load_trim
+        tlev_y   = hold.bottom + 10
+        tlev_w   = 160
+        tlev_h   = 14
+        tlev_x   = hold.left + (hold.width - tlev_w) // 2
+        trim_ok  = abs(trim) < 0.55
+        bg_col   = (38, 42, 48) if trim_ok else (80, 30, 30)
+        pygame.draw.rect(self.screen, bg_col, (tlev_x, tlev_y, tlev_w, tlev_h), border_radius=7)
+        # Green safe zone
+        safe_l = tlev_x + tlev_w // 2 - 22
+        pygame.draw.rect(self.screen, (30, 70, 30), (safe_l, tlev_y + 2, 44, tlev_h - 4), border_radius=4)
+        # Bubble
+        bubble_cx = int(tlev_x + tlev_w // 2 + trim * (tlev_w // 2 - 8))
+        bubble_col = (80, 220, 80) if trim_ok else (240, 80, 60)
+        pygame.draw.circle(self.screen, bubble_col, (bubble_cx, tlev_y + tlev_h // 2), 6)
+        pygame.draw.rect(self.screen, (70, 80, 90), (tlev_x, tlev_y, tlev_w, tlev_h), 1, border_radius=7)
+        trim_lbl = self.fnt_sm.render('TRIM', True, (120, 125, 135))
+        self.screen.blit(trim_lbl, (tlev_x - trim_lbl.get_width() - 6, tlev_y))
+
+        # ── HUD ──────────────────────────────────────────────────────────────
+        keys     = pygame.key.get_pressed()
+        boosting = bool(keys[pygame.K_SPACE])
+        boost_col = (255, 200, 50) if boosting else (160, 155, 140)
+        hud_s = self.fnt_sm.render(
+            'A/D = move chute   SPACE = boost flow   ESC = exit',
+            True, boost_col)
+        self.screen.blit(hud_s, (hold.left, hold.bottom + 30))
+
+        # ── Completion overlay ────────────────────────────────────────────────
+        if self._load_phase == 'complete':
+            ov = pygame.Surface((sw, sh), pygame.SRCALPHA)
+            ov.fill((0, 0, 0, 110))
+            self.screen.blit(ov, (0, 0))
+            done_s = self.fnt_sm.render('BARGE LOADED!', True, (90, 220, 90))
+            self.screen.blit(done_s, done_s.get_rect(center=(sw // 2, sh // 2)))
+
+    # ── Endloader unload mini-game ───────────────────────────────────────────
+
+    def _start_unload(self, task: Task):
+        self._unload_active = True
+        self._unload_task   = task
+        self._unload_phase  = 'playing'
+        self._unload_done_t = 0.0
+
+        pad    = 32
+        arm_h  = 28          # crane arm strip at top
+        hud_h  = 48
+        hold_x = pad
+        hold_y = pad + arm_h
+        hold_w = self.width  - 2 * pad
+        hold_h = self.height - 2 * pad - arm_h - hud_h
+        self._unload_hold = pygame.Rect(hold_x, hold_y, hold_w, hold_h)
+        hold = self._unload_hold
+
+        zone_w = max(140, hold_w // 5)
+        zone_h = hold_h // 2
+        self._unload_zone = pygame.Rect(
+            hold.right - zone_w - 12,
+            hold.centery - zone_h // 2,
+            zone_w, zone_h,
+        )
+
+        self._unload_lx    = float(hold.left  + 70)
+        self._unload_ly    = float(hold.bottom - 80)
+        self._unload_angle = 0.0
+        self._unload_speed = 0.0
+
+        self._unload_bucket_up = False
+        self._unload_in_bucket = []
+
+        n_piles = 6
+        self._unload_piles = []
+        attempts = 0
+        while len(self._unload_piles) < n_piles and attempts < 400:
+            attempts += 1
+            r  = random.randint(18, 26)
+            x  = float(random.randint(hold.left + r + 20,
+                                      self._unload_zone.left - r - 20))
+            y  = float(random.randint(hold.top + r + 10, hold.bottom - r - 10))
+            if math.hypot(x - self._unload_lx, y - self._unload_ly) < 80:
+                continue
+            if any(math.hypot(x - p['x'], y - p['y']) < r + p['r'] + 6
+                   for p in self._unload_piles):
+                continue
+            self._unload_piles.append({'x': x, 'y': y, 'r': r, 'vx': 0.0, 'vy': 0.0})
+
+        self._unload_total       = len(self._unload_piles)
+        self._unload_lifted      = 0
+        self._unload_crane_x     = float(hold.left)
+        self._unload_crane_y     = float(hold.top)
+        self._unload_crane_phase = 'moving'
+        self._unload_crane_hold_t = 0.0
+
+    def _update_unload(self, dt: float):
+        hold = self._unload_hold
+        zone = self._unload_zone
+
+        if self._unload_phase == 'complete':
+            self._unload_done_t -= dt
+            if self._unload_done_t <= 0:
+                task = self._unload_task
+                self._complete_task(task)
+                if task in self.active_tasks:
+                    self.active_tasks.remove(task)
+                self._unload_active = False
+                self._unload_task   = None
+            return
+
+        keys = pygame.key.get_pressed()
+
+        # ── Loader controls ──────────────────────────────────────────────────
+        MAX_FWD = 150.0;  MAX_REV = -70.0
+        ACCEL   = 130.0;  BRAKE   = 220.0
+        TURN_R  = 1.7     # rad/s
+
+        throttle = ((keys[pygame.K_w] or keys[pygame.K_UP])
+                    - (keys[pygame.K_s] or keys[pygame.K_DOWN]))
+        steer    = ((keys[pygame.K_d] or keys[pygame.K_RIGHT])
+                    - (keys[pygame.K_a] or keys[pygame.K_LEFT]))
+
+        if throttle > 0:
+            self._unload_speed = min(MAX_FWD, self._unload_speed + ACCEL * dt)
+        elif throttle < 0:
+            self._unload_speed = max(MAX_REV, self._unload_speed - ACCEL * dt)
+        else:
+            decel = BRAKE * dt
+            if abs(self._unload_speed) <= decel:
+                self._unload_speed = 0.0
+            else:
+                self._unload_speed -= math.copysign(decel, self._unload_speed)
+
+        if abs(self._unload_speed) > 5:
+            sign = 1 if self._unload_speed > 0 else -1
+            self._unload_angle += steer * TURN_R * sign * dt
+
+        cos_a = math.cos(self._unload_angle)
+        sin_a = math.sin(self._unload_angle)
+        self._unload_lx += cos_a * self._unload_speed * dt
+        self._unload_ly += sin_a * self._unload_speed * dt
+        margin = 24
+        self._unload_lx = max(hold.left + margin, min(hold.right  - margin, self._unload_lx))
+        self._unload_ly = max(hold.top  + margin, min(hold.bottom - margin, self._unload_ly))
+
+        # ── Coal pile physics ────────────────────────────────────────────────
+        LOADER_R    = 22.0
+        scoop_reach = 32.0
+        scoop_x = self._unload_lx + cos_a * scoop_reach
+        scoop_y = self._unload_ly + sin_a * scoop_reach
+        lx, ly  = self._unload_lx, self._unload_ly
+
+        bucket_ids = {id(p) for p in self._unload_in_bucket}
+
+        for pile in self._unload_piles:
+            if id(pile) in bucket_ids:
+                # Bucket piles: follow scoop position at their recorded local offset
+                lox = pile.get('_blx', 32.0)
+                loy = pile.get('_bly', 0.0)
+                pile['x'] = lx + lox * cos_a - loy * sin_a
+                pile['y'] = ly + lox * sin_a + loy * cos_a
+                pile['vx'] = 0.0
+                pile['vy'] = 0.0
+                continue
+
+            pile['vx'] *= 0.78 ** (dt * 60)
+            pile['vy'] *= 0.78 ** (dt * 60)
+
+            # Scoop push (forward only, bucket must be down)
+            if self._unload_speed > 15 and not self._unload_bucket_up:
+                dx   = pile['x'] - scoop_x
+                dy   = pile['y'] - scoop_y
+                dist = math.hypot(dx, dy)
+                if dist < pile['r'] + 28:
+                    push = self._unload_speed * 1.1
+                    if dist > 1:
+                        pile['vx'] += (dx / dist) * push * dt
+                        pile['vy'] += (dy / dist) * push * dt
+                    else:
+                        pile['vx'] += cos_a * push * dt
+                        pile['vy'] += sin_a * push * dt
+
+            # Loader body collision
+            bdx   = pile['x'] - lx
+            bdy   = pile['y'] - ly
+            bdist = math.hypot(bdx, bdy)
+            body_sep = LOADER_R + pile['r']
+            if 0 < bdist < body_sep:
+                nx, ny  = bdx / bdist, bdy / bdist
+                overlap = body_sep - bdist
+                pile['x'] += nx * overlap
+                pile['y'] += ny * overlap
+                if self._unload_speed > 0:
+                    pile['vx'] += nx * self._unload_speed * 0.6
+                    pile['vy'] += ny * self._unload_speed * 0.6
+
+            pile['x'] += pile['vx'] * dt
+            pile['y'] += pile['vy'] * dt
+            r = pile['r']
+
+            if pile['x'] < hold.left + r:
+                pile['x'] = hold.left + r;  pile['vx'] = abs(pile['vx']) * 0.35
+            elif pile['x'] > hold.right - r:
+                pile['x'] = hold.right - r; pile['vx'] = -abs(pile['vx']) * 0.35
+            if pile['y'] < hold.top + r:
+                pile['y'] = hold.top + r;   pile['vy'] = abs(pile['vy']) * 0.35
+            elif pile['y'] > hold.bottom - r:
+                pile['y'] = hold.bottom - r; pile['vy'] = -abs(pile['vy']) * 0.35
+
+        # Pile–pile separation
+        free_piles = [p for p in self._unload_piles if id(p) not in bucket_ids]
+        for _ in range(3):
+            for i in range(len(free_piles)):
+                for j in range(i + 1, len(free_piles)):
+                    a, b = free_piles[i], free_piles[j]
+                    dx   = a['x'] - b['x'];  dy = a['y'] - b['y']
+                    dist = math.hypot(dx, dy)
+                    sep  = a['r'] + b['r']
+                    if 0 < dist < sep:
+                        nx, ny  = dx / dist, dy / dist
+                        overlap = (sep - dist) * 0.5
+                        a['x'] += nx * overlap;  a['y'] += ny * overlap
+                        b['x'] -= nx * overlap;  b['y'] -= ny * overlap
+                        a['vx'] += nx * 30 * dt;  a['vy'] += ny * 30 * dt
+                        b['vx'] -= nx * 30 * dt;  b['vy'] -= ny * 30 * dt
+                    elif dist == 0:
+                        a['x'] += 1.0;  b['x'] -= 1.0
+
+        # ── Crane ────────────────────────────────────────────────────────────
+        crane_top = float(hold.top)
+        crane_bot = float(zone.centery)
+        target_x  = float(zone.centerx)
+
+        if self._unload_crane_phase == 'moving':
+            diff = target_x - self._unload_crane_x
+            step = 110.0 * dt
+            self._unload_crane_x += math.copysign(min(abs(diff), step), diff)
+            if abs(diff) < 3:
+                in_zone = [p for p in self._unload_piles
+                           if zone.collidepoint(int(p['x']), int(p['y']))
+                           and id(p) not in bucket_ids]
+                if in_zone:
+                    self._unload_crane_phase = 'descending'
+
+        elif self._unload_crane_phase == 'descending':
+            self._unload_crane_y = min(crane_bot, self._unload_crane_y + 90 * dt)
+            if self._unload_crane_y >= crane_bot:
+                in_zone = [p for p in self._unload_piles
+                           if zone.collidepoint(int(p['x']), int(p['y']))
+                           and id(p) not in bucket_ids]
+                for p in in_zone:
+                    self._unload_piles.remove(p)
+                    self._unload_lifted += 1
+                self._unload_crane_hold_t = 0.5
+                self._unload_crane_phase  = 'ascending'
+
+        elif self._unload_crane_phase == 'ascending':
+            self._unload_crane_hold_t -= dt
+            if self._unload_crane_hold_t <= 0:
+                self._unload_crane_y = max(crane_top, self._unload_crane_y - 120 * dt)
+                if self._unload_crane_y <= crane_top:
+                    self._unload_crane_x     = float(hold.left)
+                    self._unload_crane_phase = 'moving'
+
+        # ── Completion — all piles cleared ───────────────────────────────────
+        if not self._unload_piles and self._unload_lifted > 0:
+            self._unload_phase  = 'complete'
+            self._unload_done_t = 2.5
+            self._notify("Cargo unloaded!")
+
+    def _draw_unload(self):
+        sw, sh   = self.width, self.height
+        hold     = self._unload_hold
+        zone     = self._unload_zone
+        crane_arm_y = hold.top - 4
+
+        # Background + hold floor
+        self.screen.fill((16, 14, 10))
+        pygame.draw.rect(self.screen, (52, 44, 32), hold)
+        for fy in range(hold.top + 14, hold.bottom, 22):
+            pygame.draw.line(self.screen, (44, 37, 26),
+                             (hold.left, fy), (hold.right, fy), 1)
+        pygame.draw.rect(self.screen, (78, 66, 46), hold, 3)
+
+        # Pickup zone
+        in_zone = any(zone.collidepoint(int(p['x']), int(p['y']))
+                      for p in self._unload_piles)
+        zone_fill = (48, 88, 48) if in_zone else (30, 55, 30)
+        pygame.draw.rect(self.screen, zone_fill, zone)
+        pygame.draw.rect(self.screen, (70, 160, 70), zone, 2)
+        lbl = self.fnt_sm.render('DROP ZONE', True, (90, 200, 90))
+        self.screen.blit(lbl, lbl.get_rect(centerx=zone.centerx, top=zone.top + 6))
+        # Cross-hairs
+        pygame.draw.line(self.screen, (55, 120, 55),
+                         (zone.centerx, zone.top), (zone.centerx, zone.bottom), 1)
+        pygame.draw.line(self.screen, (55, 120, 55),
+                         (zone.left, zone.centery), (zone.right, zone.centery), 1)
+
+        # Crane arm (horizontal I-beam at top of hold)
+        pygame.draw.rect(self.screen, (90, 95, 105),
+                         (hold.left, crane_arm_y - 10, hold.width, 10))
+        pygame.draw.rect(self.screen, (110, 118, 130),
+                         (hold.left, crane_arm_y - 5, hold.width, 3))
+
+        # Trolley + cable + hook
+        tx = int(self._unload_crane_x)
+        ty = int(self._unload_crane_y)
+        pygame.draw.rect(self.screen, (80, 88, 100),
+                         (tx - 12, crane_arm_y - 10, 24, 14), border_radius=2)
+        pygame.draw.line(self.screen, (140, 145, 155), (tx, crane_arm_y), (tx, ty), 2)
+        # Hook shape
+        hook_r = 7
+        pygame.draw.circle(self.screen, (160, 165, 175), (tx, ty), hook_r)
+        pygame.draw.circle(self.screen, (80, 85, 95), (tx, ty), hook_r, 2)
+        pygame.draw.arc(self.screen,
+                        (180, 185, 195),
+                        pygame.Rect(tx - hook_r - 2, ty - 3, (hook_r + 2) * 2, 12),
+                        0, math.pi, 3)
+
+        # Coal piles
+        for pile in self._unload_piles:
+            px, py_  = int(pile['x']), int(pile['y'])
+            r        = pile['r']
+            in_z     = zone.collidepoint(px, py_)
+            pygame.draw.circle(self.screen, (30, 28, 26), (px, py_), r)
+            pygame.draw.circle(self.screen, (52, 48, 44),
+                               (px - r // 4, py_ - r // 4), r // 3)
+            pygame.draw.circle(self.screen, (18, 16, 14), (px, py_), r, 2)
+            if in_z:
+                pygame.draw.circle(self.screen, (70, 180, 70), (px, py_), r + 5, 2)
+
+        # Endloader (top-down)
+        lx    = int(self._unload_lx)
+        ly_   = int(self._unload_ly)
+        cos_a = math.cos(self._unload_angle)
+        sin_a = math.sin(self._unload_angle)
+
+        def rpt(dx, dy):
+            return (lx + int(dx * cos_a - dy * sin_a),
+                    ly_ + int(dx * sin_a + dy * cos_a))
+
+        # Body
+        body = [rpt(-22, -14), rpt(22, -14), rpt(22, 14), rpt(-22, 14)]
+        pygame.draw.polygon(self.screen, (210, 145, 18), body)
+        pygame.draw.polygon(self.screen, (150, 100, 10), body, 2)
+
+        # Cab (rear raised section)
+        cab = [rpt(-22, -10), rpt(-6, -10), rpt(-6, 10), rpt(-22, 10)]
+        pygame.draw.polygon(self.screen, (175, 118, 14), cab)
+
+        # Scoop bucket (front) — raised when bucket is up
+        bucket_lift = -10 if self._unload_bucket_up else 0
+        scoop = [rpt(22, -18 + bucket_lift), rpt(38, -18 + bucket_lift),
+                 rpt(38, 18 + bucket_lift),  rpt(22, 18 + bucket_lift)]
+        scoop_col = (80, 160, 80) if self._unload_bucket_up else (130, 90, 12)
+        pygame.draw.polygon(self.screen, scoop_col, scoop)
+        pygame.draw.polygon(self.screen, (80, 55, 6), scoop, 2)
+
+        # Wheels
+        for dx, dy in [(-14, -14), (14, -14), (-14, 14), (14, 14)]:
+            wx, wy = rpt(dx, dy)
+            pygame.draw.circle(self.screen, (38, 38, 38), (wx, wy), 6)
+            pygame.draw.circle(self.screen, (62, 62, 62), (wx, wy), 6, 1)
+
+        # Headlights
+        for dy in (-8, 8):
+            hx, hy = rpt(22, dy)
+            pygame.draw.circle(self.screen, (255, 242, 140), (hx, hy), 3)
+
+        # HUD strip
+        hud_y  = hold.bottom + 8
+        bucket_lbl = 'BUCKET UP' if self._unload_bucket_up else 'bucket down'
+        bucket_col = (80, 220, 80) if self._unload_bucket_up else (160, 155, 140)
+        n_carried  = len(self._unload_in_bucket)
+        info = (f"Coal: {len(self._unload_piles)} piles  |  In bucket: {n_carried}"
+                f"   |   WASD=drive  Q=raise/lower bucket  ESC=exit")
+        hud_s = self.fnt_sm.render(info, True, (195, 188, 170))
+        self.screen.blit(hud_s, (hold.left, hud_y))
+        bl_s = self.fnt_sm.render(bucket_lbl, True, bucket_col)
+        self.screen.blit(bl_s, (hold.right - bl_s.get_width(), hud_y))
+
+        # Completion overlay
+        if self._unload_phase == 'complete':
+            ov = pygame.Surface((sw, sh), pygame.SRCALPHA)
+            ov.fill((0, 0, 0, 110))
+            self.screen.blit(ov, (0, 0))
+            done_s = self.fnt_sm.render('CARGO UNLOADED!', True, (90, 220, 90))
+            self.screen.blit(done_s, done_s.get_rect(center=(sw // 2, sh // 2)))
+
     # ── Barge door mini-game ─────────────────────────────────────────────────
 
     def _start_barge_doors(self, task: Task):
@@ -1723,6 +2394,22 @@ class DeckHandSimulation:
             self._update_barge_doors(dt)
             return
 
+        # Loading mini-game takes over completely
+        if self._load_active:
+            if self.notif_timer > 0:
+                self.notif_timer -= dt
+            self.game_time = (self.game_time + game_dt) % 24
+            self._update_load(dt)
+            return
+
+        # Endloader mini-game takes over completely
+        if self._unload_active:
+            if self.notif_timer > 0:
+                self.notif_timer -= dt
+            self.game_time = (self.game_time + game_dt) % 24
+            self._update_unload(dt)
+            return
+
         if self._overboard:
             self._overboard_t -= dt
             if self.notif_timer > 0:
@@ -1811,8 +2498,13 @@ class DeckHandSimulation:
                     moor_spawned += 1
             self._dock_moor_needed = moor_spawned
             for pos in self.door_positions:
-                if pos not in occupied and self._barge_door_open.get(pos, 0.0) < 1.0:
-                    self.active_tasks.append(Task('barge_doors', pos))
+                if pos not in occupied:
+                    door_open   = self._barge_door_open.get(pos, 0.0) >= 1.0
+                    cargo_empty = self._barge_cargo_empty.get(pos, False)
+                    if door_open and cargo_empty:
+                        self.active_tasks.append(Task('load', pos))
+                    elif not door_open:
+                        self.active_tasks.append(Task('barge_doors', pos))
 
         elif self._dock_timer <= 0 and self._moored and not self._unmooring and not self._departing:
             # Stay timer expired — begin unmooring
@@ -1858,6 +2550,20 @@ class DeckHandSimulation:
                 if self.player.near(task.position) and e_held:
                     self._start_barge_doors(task)
                     break
+
+            # Load tasks launch the coal loading mini-game
+            if task.task_type == 'load':
+                if self.player.near(task.position) and e_held:
+                    self._start_load(task)
+                    break
+                continue
+
+            # Unload tasks launch the endloader mini-game
+            if task.task_type == 'unload':
+                if self.player.near(task.position) and e_held:
+                    self._start_unload(task)
+                    break
+                continue
                 continue
 
             if self.player.near(task.position):
@@ -1893,6 +2599,14 @@ class DeckHandSimulation:
 
         if self._bdoor_active:
             self._draw_barge_doors()
+            return
+
+        if self._load_active:
+            self._draw_load()
+            return
+
+        if self._unload_active:
+            self._draw_unload()
             return
 
         play_w = self.width - 225
@@ -2315,10 +3029,13 @@ class DeckHandSimulation:
             self.screen.blit(ls, (hud_x + 8, y)); y += 20
 
         if self.dev_mode:
-            ds = self.fnt_sm.render(
-                f'[DEV] {self.time_scale:.1f}x  [/] ]] spd  End=skip',
-                True, (255, 100, 255))
-            self.screen.blit(ds, (hud_x + 8, y))
+            for line in [
+                f'[DEV] {self.time_scale:.1f}x  [ ] ] spd  End=skip',
+                'F1=doors  F2=unload  F3=load',
+            ]:
+                ds = self.fnt_sm.render(line, True, (255, 100, 255))
+                self.screen.blit(ds, (hud_x + 8, y))
+                y += 16
 
     # ── Input ────────────────────────────────────────────────────────────────
 
@@ -2343,12 +3060,49 @@ class DeckHandSimulation:
                         self._bdoor_phase     = 'control'
                         self._bdoor_amps      = 0.0
                         self._bdoor_barge_pos = None
+                    elif self._load_active:
+                        self._load_active = False
+                        self._load_task   = None
+                    elif self._unload_active:
+                        # Cancel endloader, leave task for retry
+                        self._unload_active    = False
+                        self._unload_task      = None
+                        self._unload_in_bucket = []
+                        self._unload_bucket_up = False
                     else:
                         return 'menu'
+                elif self._unload_active and event.key == pygame.K_q:
+                    if not self._unload_bucket_up:
+                        # Raise bucket: capture piles near the scoop tip
+                        cos_a   = math.cos(self._unload_angle)
+                        sin_a   = math.sin(self._unload_angle)
+                        scoop_x = self._unload_lx + cos_a * 32
+                        scoop_y = self._unload_ly + sin_a * 32
+                        captured = []
+                        for pile in self._unload_piles:
+                            if math.hypot(pile['x'] - scoop_x,
+                                          pile['y'] - scoop_y) < pile['r'] + 36:
+                                # Store offset in loader-local coords
+                                wx = pile['x'] - self._unload_lx
+                                wy = pile['y'] - self._unload_ly
+                                pile['_blx'] = wx * cos_a + wy * sin_a
+                                pile['_bly'] = -wx * sin_a + wy * cos_a
+                                captured.append(pile)
+                        if captured:
+                            self._unload_in_bucket = captured
+                            self._unload_bucket_up = True
+                    else:
+                        # Lower bucket: release piles
+                        for pile in self._unload_in_bucket:
+                            pile['vx'] = 0.0
+                            pile['vy'] = 0.0
+                        self._unload_in_bucket = []
+                        self._unload_bucket_up = False
                 elif event.key == pygame.K_SPACE:
                     if self._winch_active and self._winch_phase == 'lock_window':
                         self._winch_space_flag = True
                     elif (not self._winch_active and not self._bdoor_active
+                          and not self._load_active and not self._unload_active
                           and not self._overboard
                           and self.player.state == 'grounded'
                           and self._is_safe_zone(self.player.x, self.player.y)):
@@ -2363,6 +3117,24 @@ class DeckHandSimulation:
                     elif event.key == pygame.K_END:
                         if self._cfg_shift_duration is not None:
                             self.shift_hours_elapsed = self._cfg_shift_duration
+                    elif event.key == pygame.K_F1:
+                        if not any(a for a in [self._winch_active, self._bdoor_active,
+                                               self._load_active, self._unload_active]):
+                            pos = self.door_positions[0] if self.door_positions else (400, 300)
+                            t = Task('barge_doors', pos)
+                            self._start_barge_doors(t)
+                    elif event.key == pygame.K_F2:
+                        if not any(a for a in [self._winch_active, self._bdoor_active,
+                                               self._load_active, self._unload_active]):
+                            pos = self.door_positions[0] if self.door_positions else (400, 300)
+                            t = Task('unload', pos)
+                            self._start_unload(t)
+                    elif event.key == pygame.K_F3:
+                        if not any(a for a in [self._winch_active, self._bdoor_active,
+                                               self._load_active, self._unload_active]):
+                            pos = self.door_positions[0] if self.door_positions else (400, 300)
+                            t = Task('load', pos)
+                            self._start_load(t)
         return 'continue'
 
     # ── Main loop ────────────────────────────────────────────────────────────
