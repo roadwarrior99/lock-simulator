@@ -29,6 +29,7 @@ class Agent:
         self.ttl       = None        # frames until removal after crash
         # Kayaks enter freely; all other vessels wait for operator clearance.
         self.cleared_to_enter = (boat.vessel_type == 'kayak')
+        self.reversing = False       # backing out of the lock on operator order
 
 
 # ── Visualizer ────────────────────────────────────────────────────────────────
@@ -1477,6 +1478,12 @@ class LockDamVisualizer:
                     self.lock_dam.drain_chamber()
                 elif event.key == pygame.K_v:
                     self.view_mode = "operator" if self.view_mode == "shore" else "shore"
+                elif event.key == pygame.K_t:
+                    self._player_tie_action()
+                elif event.key == pygame.K_e:
+                    self._player_radio_entry()
+                elif event.key == pygame.K_b:
+                    self._player_radio_reverse()
                 # Developer controls
                 elif self.dev_mode:
                     if event.key == pygame.K_RIGHTBRACKET:
@@ -1488,8 +1495,22 @@ class LockDamVisualizer:
                             self.shift_hours_elapsed = self._cfg_shift_duration
         return 'continue'
 
+    def _boat_in_gate(self, gate_x):
+        """Return True if any active boat is currently straddling gate_x."""
+        for ag in self.agents:
+            if ag.state != 'active':
+                continue
+            b = ag.boat
+            if b.position < gate_x < b.position + b.length:
+                return True
+        return False
+
     def _toggle_upstream_gate(self):
-        if not self.lock_dam.upstream_gates_open:
+        if self.lock_dam.upstream_gates_open:
+            # Closing — block if a boat is in the gate opening
+            if self._boat_in_gate(self.lock_start):
+                return
+        else:
             diff = abs(self.lock_dam.lock_chamber_level - self.lock_dam.upstream_level)
             if diff > self.SURGE_THRESHOLD:
                 self._surge_incident(
@@ -1497,7 +1518,11 @@ class LockDamVisualizer:
         self.lock_dam.upstream_gates_open = not self.lock_dam.upstream_gates_open
 
     def _toggle_downstream_gate(self):
-        if not self.lock_dam.downstream_gates_open:
+        if self.lock_dam.downstream_gates_open:
+            # Closing — block if a boat is in the gate opening
+            if self._boat_in_gate(self.lock_end):
+                return
+        else:
             diff = abs(self.lock_dam.lock_chamber_level - self.lock_dam.downstream_level)
             if diff > self.SURGE_THRESHOLD:
                 self._surge_incident(
@@ -1561,8 +1586,6 @@ class LockDamVisualizer:
 
         # Advance wall-crossing animation; block other logic until complete.
         if op['state'] == 'crossing':
-            # Match the same pixel-per-frame rate used for horizontal walking
-            # (1.2 sim-units/frame × screen scale) relative to the gate height.
             walk_px_per_frame = 1.2 * self._sx_scale
             top_y_px    = self._wy(self.lock_dam.upstream_level) - 35 - 5
             bottom_y_px = self._water_bot_y + 10
@@ -1574,193 +1597,152 @@ class LockDamVisualizer:
                 op['state']          = 'idle'
             return
 
-        # 1. Identify tasks
-        tying_tasks = []
-        untying_tasks = []
-        clear_entry_tasks = []
-        for ag in self.agents:
-            if ag.state == "active":
-                # Tying: Stopped, not tied, MUST be fully inside
-                if self._fully_in_lock(ag.boat) and not ag.is_moving and not ag.tied_down:
-                    tying_tasks.append(ag)
-                # Untying: Tied, ready to go (exit gate open)
-                if ag.tied_down:
-                    ready = False
-                    if ag.direction == 1: # Downstream
-                        if self.lock_dam.downstream_gates_open:
-                            ready = True
-                    else: # Upstream
-                        if self.lock_dam.upstream_gates_open:
-                            ready = True
-                    if ready:
-                        untying_tasks.append(ag)
-                # Clear entry: non-kayak waiting outside for operator signal.
-                # Only eligible when the gate zone is empty AND there is room.
-                if not ag.cleared_to_enter:
-                    if ag.direction == 1 and self.lock_dam.upstream_gates_open:
-                        if ag.boat.position + ag.boat.length <= self.lock_start:
-                            if self._gate_zone_clear(1) and self._lock_has_room(ag.boat):
-                                clear_entry_tasks.append(ag)
-                    elif ag.direction == -1 and self.lock_dam.downstream_gates_open:
-                        if ag.boat.position >= self.lock_end:
-                            if self._gate_zone_clear(-1) and self._lock_has_room(ag.boat):
-                                clear_entry_tasks.append(ag)
+        # Player movement via held arrow keys
+        keys = pygame.key.get_pressed()
+        speed = 1.5   # sim units per frame
+        move_dx = 0
+        if keys[pygame.K_LEFT]:
+            move_dx = -speed
+        elif keys[pygame.K_RIGHT]:
+            move_dx = speed
 
-        # 2. Pick a task if none active
-        if op['target_boat'] is None:
-            if untying_tasks: # Prioritize untying so boats can leave
-                op['target_boat'] = untying_tasks[0]
-                op['task'] = 'untie'
-                op['rope_progress'] = 1.0 # Start with rope attached
-            elif tying_tasks:
-                op['target_boat'] = tying_tasks[0]
-                op['task'] = 'tie'
-                op['rope_progress'] = 0.0
-            elif clear_entry_tasks:
-                # Signal the boat closest to the gate
-                def _entry_dist(a):
-                    if a.direction == 1:
-                        return self.lock_start - (a.boat.position + a.boat.length)
-                    else:
-                        return a.boat.position - self.lock_end
-                op['target_boat'] = min(clear_entry_tasks, key=_entry_dist)
-                op['task'] = 'clear_entry'
-                op['rope_progress'] = 0.0
-            else:
-                op['task'] = None
-        
-        # 3. Execute task
-        if op['target_boat']:
-            target_ag = op['target_boat']
-            # Check if task is still valid
-            is_valid = target_ag.state == "active"
-            if is_valid:
-                if op['task'] == 'tie':
-                    # Must stay stopped and mostly inside to tie
-                    if target_ag.is_moving or not self._in_lock(target_ag.boat):
-                        is_valid = False
-                elif op['task'] == 'untie':
-                    # Must stay in lock to untie
-                    if not self._in_lock(target_ag.boat):
-                        is_valid = False
-                elif op['task'] == 'clear_entry':
-                    # Valid until the boat has already been cleared or entered
-                    if target_ag.cleared_to_enter or \
-                       (target_ag.direction == 1 and not self.lock_dam.upstream_gates_open) or \
-                       (target_ag.direction == -1 and not self.lock_dam.downstream_gates_open):
-                        is_valid = False
-            
-            if not is_valid:
-                op['target_boat'] = None
+        if move_dx != 0:
+            op['state'] = 'walking'
+            new_x = max(self.lock_start, min(self.lock_end, op['x'] + move_dx))
+
+            # Auto-cross when walking into a closed gate at the lock boundary
+            if new_x <= self.lock_start and not self.lock_dam.upstream_gates_open:
+                op['x']              = self.lock_start
+                op['state']          = 'crossing'
+                op['target_side']    = 1 - op['side']
+                op['cross_progress'] = 0.0
+                return
+            if new_x >= self.lock_end and not self.lock_dam.downstream_gates_open:
+                op['x']              = self.lock_end
+                op['state']          = 'crossing'
+                op['target_side']    = 1 - op['side']
+                op['cross_progress'] = 0.0
                 return
 
-            # Determine side for the boat: +1 downstream is top side (0), -1 upstream is bottom side (1)
-            boat_side = 0 if target_ag.direction == 1 else 1
-            
-            if op['side'] != boat_side:
-                # Need to cross to the other wall via a closed gate
-                u_open = self.lock_dam.upstream_gates_open
-                d_open = self.lock_dam.downstream_gates_open
-                u_dist = abs(op['x'] - self.lock_start)
-                d_dist = abs(op['x'] - self.lock_end)
-                
-                gate_x = None
-                if not u_open and not d_open:
-                    gate_x = self.lock_start if u_dist < d_dist else self.lock_end
-                elif not u_open:
-                    gate_x = self.lock_start
-                elif not d_open:
-                    gate_x = self.lock_end
-                
-                if gate_x is not None:
-                    dx = gate_x - op['x']
-                    if abs(dx) > 1.0:
-                        op['state'] = 'walking'
-                        op['x'] += 1.2 if dx > 0 else -1.2
-                    else:
-                        # Begin animated crossing to the other wall.
-                        op['state']          = 'crossing'
-                        op['target_side']    = boat_side
-                        op['cross_progress'] = 0.0
-                else:
-                    # Both gates open? Wait at the best spot.
-                    op['state'] = 'waiting'
-            else:
-                # On the correct side; for clear_entry walk to the gate edge,
-                # for tie/untie walk to the boat centre inside the lock.
-                if op['task'] == 'clear_entry':
-                    target_x = self.lock_start if target_ag.direction == 1 else self.lock_end
-                else:
-                    target_x = target_ag.boat.position + target_ag.boat.length / 2
-                    target_x = max(self.lock_start, min(self.lock_end, target_x))
-                dx = target_x - op['x']
-                if abs(dx) > 1.0:
-                    op['state'] = 'walking'
-                    op['x'] += 1.2 if dx > 0 else -1.2
-                else:
-                    # At position, perform task
-                    if op['task'] == 'tie':
-                        op['state'] = 'tying'
-                        if op['rope_progress'] < 1.0:
-                            op['rope_progress'] = min(1.0, op['rope_progress'] + 0.05)
-                        else:
-                            target_ag.tied_down = True
-                            target_ag.tied_side = op['side']
-                            op['target_boat'] = None # Task finished
-                    elif op['task'] == 'untie':
-                        op['state'] = 'untying'
-                        if op['rope_progress'] > 0.0:
-                            op['rope_progress'] = max(0.0, op['rope_progress'] - 0.05)
-                        else:
-                            target_ag.tied_down = False
-                            target_ag.tied_side = None
-                            self._trigger_radio_departure(target_ag)
-                            op['target_boat'] = None # Task finished
-                    elif op['task'] == 'clear_entry':
-                        # Wave the boat in — grant entry clearance immediately
-                        op['state'] = 'idle'
-                        target_ag.cleared_to_enter = True
-                        op['target_boat'] = None # Task finished
+            op['x'] = new_x
         else:
-            # No task: stand near whichever gate is open (ready for entering boats),
-            # or default to upstream side when both gates are closed.
-            u_open = self.lock_dam.upstream_gates_open
-            d_open = self.lock_dam.downstream_gates_open
+            op['state'] = 'idle'
 
-            if d_open and not u_open:
-                # Downstream gate open — ships entering from downstream use side 1
-                idle_side = 1
-                idle_x    = self.lock_end - 10
-            else:
-                # Upstream gate open or both closed — default upstream side 0
-                idle_side = 0
-                idle_x    = self.lock_start + 10
+        # Retract rope animation when idle
+        if op['rope_progress'] > 0 and op['state'] not in ('tying', 'untying'):
+            op['rope_progress'] = max(0.0, op['rope_progress'] - 0.05)
 
-            if op['side'] != idle_side:
-                # Need to cross to the idle side; find a closed gate to walk across
-                gate_x = self.lock_start if not u_open else (self.lock_end if not d_open else None)
-                if gate_x is not None:
-                    dx = gate_x - op['x']
-                    if abs(dx) > 1.0:
-                        op['state'] = 'walking'
-                        op['x'] += 1.2 if dx > 0 else -1.2
-                    else:
-                        op['state']          = 'crossing'
-                        op['target_side']    = idle_side
-                        op['cross_progress'] = 0.0
-                else:
-                    op['state'] = 'idle'
-            else:
-                dx = idle_x - op['x']
-                if abs(dx) > 1.0:
-                    op['state'] = 'walking'
-                    op['x'] += 0.8 if dx > 0 else -0.8
-                else:
-                    op['state'] = 'idle'
-            
-            # Gradually retract rope if visible
-            if op['rope_progress'] > 0:
-                op['rope_progress'] = max(0.0, op['rope_progress'] - 0.05)
+    def _player_tie_action(self):
+        """T key: tie or untie the nearest eligible boat."""
+        op = self.operator
+        if op['state'] == 'crossing':
+            return
+
+        tie_range = 60.0 / self._sx_scale   # ~60 screen-px in sim units
+        op_x = op['x']
+
+        best, best_dist = None, float('inf')
+        for ag in self.agents:
+            if ag.state != 'active' or not self._in_lock(ag.boat):
+                continue
+            boat_cx = ag.boat.position + ag.boat.length / 2
+            dist = abs(boat_cx - op_x)
+            if dist < tie_range and dist < best_dist:
+                best_dist = dist
+                best = ag
+
+        if best is None:
+            return
+
+        if best.tied_down:
+            # Untie — only allowed once the exit gate is open
+            exit_open = (self.lock_dam.downstream_gates_open if best.direction == 1
+                         else self.lock_dam.upstream_gates_open)
+            if not exit_open:
+                return
+            best.tied_down = False
+            best.tied_side = None
+            op['rope_progress'] = 0.0
+            self._trigger_radio_departure(best)
+        elif not best.is_moving and self._fully_in_lock(best.boat):
+            best.tied_down = True
+            best.tied_side = op['side']
+            op['rope_progress'] = 1.0
+
+    def _player_radio_entry(self):
+        """E key: radio the nearest waiting boat that it is clear to enter."""
+        op = self.operator
+        if op['state'] == 'crossing':
+            return
+
+        gate_range = 80.0 / self._sx_scale   # ~80 screen-px in sim units
+        op_x = op['x']
+
+        best, best_dist = None, float('inf')
+        for ag in self.agents:
+            if ag.state != 'active' or ag.cleared_to_enter:
+                continue
+            if ag.direction == 1 and self.lock_dam.upstream_gates_open:
+                if ag.boat.position + ag.boat.length <= self.lock_start:
+                    if self._gate_zone_clear(1):
+                        dist = abs(op_x - self.lock_start)
+                        if dist < gate_range and dist < best_dist:
+                            best_dist = dist
+                            best = ag
+            elif ag.direction == -1 and self.lock_dam.downstream_gates_open:
+                if ag.boat.position >= self.lock_end:
+                    if self._gate_zone_clear(-1):
+                        dist = abs(op_x - self.lock_end)
+                        if dist < gate_range and dist < best_dist:
+                            best_dist = dist
+                            best = ag
+
+        if best is None:
+            return
+
+        best.cleared_to_enter = True
+        ttl = 180
+        self._radio_bubbles.append({
+            'text':        f'Lock Control: {best.boat.name}, you are cleared to enter the chamber.',
+            'portrait':    None,
+            'ttl':         ttl,
+            'max_ttl':     ttl,
+            'is_operator': True,
+        })
+
+    def _player_radio_reverse(self):
+        """B key: radio a ship in the lock to back out."""
+        op = self.operator
+        if op['state'] == 'crossing':
+            return
+
+        reverse_range = 80.0 / self._sx_scale
+        op_x = op['x']
+
+        best, best_dist = None, float('inf')
+        for ag in self.agents:
+            if ag.state != 'active' or ag.tied_down or ag.reversing:
+                continue
+            if not self._in_lock(ag.boat):
+                continue
+            boat_cx = ag.boat.position + ag.boat.length / 2
+            dist = abs(boat_cx - op_x)
+            if dist < reverse_range and dist < best_dist:
+                best_dist = dist
+                best = ag
+
+        if best is None:
+            return
+
+        best.reversing = True
+        ttl = 180
+        self._radio_bubbles.append({
+            'text':        f'Lock Control: {best.boat.name}, back out of the chamber.',
+            'portrait':    None,
+            'ttl':         ttl,
+            'max_ttl':     ttl,
+            'is_operator': True,
+        })
 
     # ── Gate animation ────────────────────────────────────────────────────────
 
@@ -1988,7 +1970,6 @@ class LockDamVisualizer:
             'ttl':      ttl,
             'max_ttl':  ttl,
         })
-        self._queue_operator_response(vessel_name, delay=ttl // 2)
 
     def _trigger_radio_departure(self, ag):
         """Fire a departure speech bubble when the operator clears mooring lines."""
@@ -2556,6 +2537,7 @@ class LockDamVisualizer:
             for j in range(i + 1, len(active)):
                 ag1, ag2 = active[i], active[j]
                 if (ag1.state == "active" and ag2.state == "active"
+                        and not ag1.reversing and not ag2.reversing
                         and ag1.direction == ag2.direction
                         and ag1.boat.check_collision(ag2.boat)):
                     self._crash_incident(ag1, ag2)
@@ -2583,7 +2565,56 @@ class LockDamVisualizer:
 
         d    = ag.direction
         boat = ag.boat
-        
+
+        # ── Reversing out of the lock on operator order ───────────────────────
+        if ag.reversing:
+            v_mult  = self._get_speed_mult()
+            step    = ag.speed * 0.6 * v_mult
+            new_pos = boat.position - d * step
+            push_gap = 20   # gap to maintain while pushing queued boats back
+
+            if d == 1:
+                # Moving leftward — chain-push any same-direction boats behind us
+                behind = sorted(
+                    [o for o in all_active
+                     if o is not ag and o.direction == 1 and not o.reversing
+                     and o.boat.position < boat.position],
+                    key=lambda o: -(o.boat.position + o.boat.length),
+                )
+                frontier = new_pos   # left edge of whatever is being pushed
+                for other in behind:
+                    ob = other.boat
+                    if ob.position + ob.length + push_gap > frontier:
+                        ob.position = frontier - ob.length - push_gap
+                        frontier    = ob.position
+            elif d == -1:
+                # Moving rightward — chain-push same-direction boats behind us
+                behind = sorted(
+                    [o for o in all_active
+                     if o is not ag and o.direction == -1 and not o.reversing
+                     and o.boat.position + o.boat.length > boat.position + boat.length],
+                    key=lambda o: o.boat.position,
+                )
+                frontier = new_pos + boat.length  # right edge of whatever is being pushed
+                for other in behind:
+                    ob = other.boat
+                    if ob.position - push_gap < frontier:
+                        ob.position = frontier + push_gap
+                        frontier    = ob.position + ob.length
+
+            boat.position = new_pos
+
+            # Clear reversing only once the boat is behind the normal stop line so
+            # the standard gate-blocking will hold it in place next frame.
+            outer_gap = int(100 / self._sx_scale)
+            if d == 1 and boat.position + boat.length <= self.lock_start - outer_gap:
+                ag.reversing = False
+                ag.cleared_to_enter = False
+            elif d == -1 and boat.position >= self.lock_end + outer_gap:
+                ag.reversing = False
+                ag.cleared_to_enter = False
+            return
+
         # Apply night-time speed reduction
         v_mult = self._get_speed_mult()
         new_pos = boat.position + d * ag.speed * v_mult
@@ -2709,7 +2740,7 @@ class LockDamVisualizer:
 
     def draw_ui(self):
         # ── Left control panel ────────────────────────────────────────────────
-        pw, ph = 258, 256
+        pw, ph = 258, 352
         panel = pygame.Surface((pw, ph), pygame.SRCALPHA)
         panel.fill((8, 12, 28, 172))
         self.screen.blit(panel, (8, 8))
@@ -2760,6 +2791,11 @@ class LockDamVisualizer:
             ("[F]    Fill chamber",                     fill_col),
             ("[D]    Drain chamber",                    drain_col),
             ("[V]    Toggle POV View",                  (255, 255, 100)),
+            ("",                                        None),
+            ("[<][>] Walk operator",                    (200, 230, 200)),
+            ("[E]    Radio: clear to enter",            (200, 230, 200)),
+            ("[T]    Tie / Untie boat",                 (200, 230, 200)),
+            ("[B]    Radio: back out",                  (200, 230, 200)),
         ]
         for j, (txt, col) in enumerate(rows):
             if txt:
@@ -2909,6 +2945,7 @@ class LockDamVisualizer:
                     'tied_down':   ag.tied_down,
                     'tied_side':   ag.tied_side,
                     'ttl':         ag.ttl,
+                    'reversing':   ag.reversing,
                 }
                 for ag in self.agents
             ],
@@ -2978,6 +3015,7 @@ class LockDamVisualizer:
             ag.tied_down  = ad['tied_down']
             ag.tied_side  = ad['tied_side']
             ag.ttl        = ad['ttl']
+            ag.reversing  = ad.get('reversing', False)
             self.agents.append(ag)
 
         op_d = state['operator']
